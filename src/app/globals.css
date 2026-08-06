@@ -1,0 +1,179 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Trē Wellness semantic theme tokens.
+ * Light theme is the default; .dark overrides are provided for completeness.
+ * Colours map to the brand palette: olive green (#2d6a4f), deep green (#1b4332),
+ * ink (#1b2e22), light green tint (#f0f7f3), white & neutral greys.
+ */
+@layer base {
+  :root {
+    /* Hybrid theme: site teal (#246a80) as primary, warm earthy neutrals for
+       surfaces. Tuned to trewellness.in. */
+    --background: 0 0% 100%; /* white */
+    --foreground: 195 18% 14%; /* teal-tinted near-black (#141414-ish) */
+
+    --card: 0 0% 100%;
+    --card-foreground: 195 18% 14%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 195 18% 14%;
+
+    --primary: 194 56% 32%; /* #246a80 site teal */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 40 25% 95%; /* warm cream/earthy surface */
+    --secondary-foreground: 188 50% 20%; /* deep teal */
+
+    --muted: 40 24% 95%;
+    --muted-foreground: 38 8% 42%; /* warm grey */
+
+    --accent: 173 30% 86%; /* sea-green tint (#41958b family) */
+    --accent-foreground: 188 55% 18%;
+
+    --destructive: 0 72% 45%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 38 16% 88%; /* warm neutral border */
+    --input: 38 16% 88%;
+    --ring: 194 56% 32%;
+
+    /* App sidebar (deep teal rail, #103a40) */
+    --sidebar: 188 56% 15%;
+    --sidebar-foreground: 190 22% 86%;
+    --sidebar-accent: 194 56% 32%;
+
+    --radius: 0.625rem;
+  }
+
+  .dark {
+    --background: 192 32% 8%;
+    --foreground: 190 18% 92%;
+    --card: 192 28% 11%;
+    --card-foreground: 190 18% 92%;
+    --popover: 192 28% 11%;
+    --popover-foreground: 190 18% 92%;
+    --primary: 190 45% 55%;
+    --primary-foreground: 192 44% 10%;
+    --secondary: 192 18% 16%;
+    --secondary-foreground: 190 18% 92%;
+    --muted: 192 16% 18%;
+    --muted-foreground: 190 10% 64%;
+    --accent: 188 24% 22%;
+    --accent-foreground: 190 18% 92%;
+    --destructive: 0 62% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 192 16% 22%;
+    --input: 192 16% 22%;
+    --ring: 190 45% 55%;
+    --sidebar: 192 40% 9%;
+    --sidebar-foreground: 190 22% 84%;
+    --sidebar-accent: 190 45% 45%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+  /* Thin, brand-tinted scrollbars for the kanban board. Track is given a
+     visible background (not transparent) so the bar stays visible at rest —
+     not just while actively scrolling/hovering — for anyone without a
+     trackpad who needs to see it to know there's more to scroll to. */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) hsl(var(--muted));
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    height: 10px;
+    width: 10px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: hsl(var(--muted));
+    border-radius: 9999px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 9999px;
+    border: 2px solid hsl(var(--muted));
+  }
+  /* Hides the native scrollbar entirely — for a container that already has
+     its own HorizontalScrollbar/VerticalScrollbar affordance, so there's
+     only one visible bar instead of a native one plus the custom one. */
+  .scrollbar-none {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Safe-area insets (viewportFit=cover) — pad content clear of notch / home bar. */
+@layer utilities {
+  .pt-safe {
+    padding-top: env(safe-area-inset-top);
+  }
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .pl-safe {
+    padding-left: env(safe-area-inset-left);
+  }
+  .pr-safe {
+    padding-right: env(safe-area-inset-right);
+  }
+  /* Adds the bottom safe-area on top of an existing padding value. */
+  .pb-safe-plus {
+    padding-bottom: calc(env(safe-area-inset-bottom) + var(--safe-plus, 0px));
+  }
+}
+
+/* Print / Save-as-PDF — app chrome (nav/sidebar/toolbars) is marked
+   .no-print; printable content is marked .print-area so its fixed-height
+   scroll container becomes normal flow and spans multiple pages, and its
+   form fields render as plain read-only text instead of bordered inputs.
+   [data-scroll-container] is the app-wide convention for the actual
+   scrolling element (AppShell's <main>, plus per-page scroll panes like
+   Health Records' right pane) — every one of them sits between the page
+   root and .print-area, each with its own fixed height + overflow-y-auto,
+   so all of them (not just .print-area itself) need unclamping or the
+   print output silently clips to whatever fit on screen at print time. */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  /* Opposite of .no-print — context (e.g. "which date range this report
+     covers") that's only worth showing once the interactive filter controls
+     themselves are hidden. */
+  .print-only {
+    display: block !important;
+  }
+  [data-scroll-container] {
+    overflow: visible !important;
+    height: auto !important;
+  }
+  .print-area {
+    display: block !important;
+    height: auto !important;
+    overflow: visible !important;
+    width: 100% !important;
+  }
+  .print-area input,
+  .print-area select,
+  .print-area textarea {
+    border: none !important;
+    box-shadow: none !important;
+    background: transparent !important;
+    padding: 0 !important;
+    color: #000 !important;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+}

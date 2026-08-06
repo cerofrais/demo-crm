@@ -1,0 +1,824 @@
+// =============================================================================
+// Trē Wellness CRM — Prisma schema
+// See docs/04-database.md for the data model overview.
+// Identity (users/passwords) lives in Keycloak, NOT here. We only store the
+// Keycloak `sub` (and a cached display name) where we reference a staff member.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")          // pooled (PgBouncer) — app runtime
+  directUrl = env("DIRECT_DATABASE_URL")   // direct — migrations
+}
+
+// ---------------------------------------------------------------------------
+// Enums (mirror the sales-flow Kanban + spec)
+// ---------------------------------------------------------------------------
+
+/// Kanban pipeline stages, derived from the Sales Flow doc.
+enum EnquiryStage {
+  new_lead             // Receive lead
+  contacted            // WhatsApp + email sent
+  rnr                  // Responded Not Reached — in follow-up
+  qualified            // Interest understood / interested
+  pricing_shared       // Pricing & package details shared
+  doctor_consultation  // Doctor discovery call scheduled/done
+  payment_received     // Payment collected, awaiting booking confirmation
+  booking_confirmed    // Booked
+  converted            // Checked in / completed
+  staff                // Parked with general staff — not being actively worked, not dead yet
+  lost                 // Dead / not interested
+}
+
+enum LeadSource {
+  website_form
+  whatsapp
+  instagram
+  facebook
+  referral
+  walk_in
+  phone
+  email
+  google_sheets
+  other
+}
+
+enum DocumentCategory {
+  medical
+  consent
+  operational
+  marketing
+}
+
+enum MessageChannel {
+  whatsapp
+  email
+  sms
+}
+
+enum CallDirection {
+  inbound
+  outbound
+}
+
+enum CallStatus {
+  initiated
+  ringing
+  connected
+  completed
+  no_answer
+  failed
+  voicemail
+}
+
+enum MessageDirection {
+  inbound
+  outbound
+}
+
+enum TaskStatus {
+  open
+  done
+  cancelled
+}
+
+/// Distinguishes system-generated action-required tasks from ordinary
+/// follow-ups, without overloading TaskStatus.
+enum TaskKind {
+  follow_up
+  doctor_review
+  deletion_approval
+}
+
+enum DoctorDecision {
+  accepted
+  rejected
+  needs_phone_consult
+}
+
+// ---------------------------------------------------------------------------
+// Guest & Health
+// ---------------------------------------------------------------------------
+
+model Guest {
+  id               String         @id @default(uuid())
+  fullName         String
+  // nullable: email/social-sourced leads may have no phone (unique still allows many NULLs)
+  phone            String?        @unique
+  email            String?        @unique
+  dateOfBirth      DateTime?
+  gender           String?
+  city             String?
+  /// arbitrary, admin-defined searchable attributes (segments, custom fields)
+  customFields     Json           @default("{}")
+  tags             String[]       @default([])
+  referralCodeUsed String?
+  isReturning      Boolean        @default(false)
+  consentGiven     Boolean        @default(false)
+  consentAt        DateTime?
+  consentTextHash  String?
+  // soft delete / DPDP erasure
+  deletedAt        DateTime?
+  /// Blocked guest — every future inbound WhatsApp message or email from
+  /// this phone/address is silently dropped before it's ever stored (see
+  /// the webhook and inbound-mail handlers). Kept in sync with a "blocked"
+  /// system tag (src/lib/lead-tags.ts) for at-a-glance visibility; never
+  /// touches existing history, and is fully reversible via unblock.
+  isBlocked        Boolean        @default(false)
+  blockedAt        DateTime?
+  blockedBySub     String?
+  /// AI return-likelihood 0–100 + recommended next programme (background pipeline)
+  aiReturnScore    Int?
+  aiReturnReason   String?
+  aiNextProgram    String?
+  aiInsightAt      DateTime?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  healthProfile HealthProfile?
+  enquiries     Enquiry[]
+  memberships   Membership[]
+  documents     Document[]
+  messages      Message[]
+  calls         Call[]
+  aiDecisions   AiDecision[]
+
+  @@index([fullName])
+  @@index([isReturning])
+  @@index([tags], type: Gin)
+}
+
+/// Encrypted at the application layer (AES-256-GCM) before write. The blob holds
+/// the medical screening form: conditions, allergies, medications, diet, etc.
+model HealthProfile {
+  id            String   @id @default(uuid())
+  guestId       String   @unique
+  guest         Guest    @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  encryptedData Bytes // AES-256-GCM ciphertext (see lib/crypto.ts)
+  iv            Bytes // per-record initialization vector
+  authTag       Bytes // GCM auth tag
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Enquiry (the Kanban card / pipeline ticket)
+// ---------------------------------------------------------------------------
+
+model Enquiry {
+  id              String       @id @default(uuid())
+  guestId         String
+  guest           Guest        @relation(fields: [guestId], references: [id])
+  stage           EnquiryStage @default(new_lead)
+  source          LeadSource
+  /// Keycloak `sub` of the assigned staff member (null = unassigned queue)
+  assignedToSub   String?
+  assignedToName  String?
+  packageId       String?
+  package         Package?     @relation(fields: [packageId], references: [id])
+  referralCodeId  String?
+  referralCode    ReferralCode? @relation(fields: [referralCodeId], references: [id])
+  isReturningFlag Boolean      @default(false)
+  quotedPriceINR  Int?
+  proposedDates   String?
+  lostReason      String?
+  campaignLabel   String?
+  /// Permanent idempotency key for inbound webhook leads (e.g. a Meta lead-gen
+  /// row id, via the n8n integration's Idempotency-Key header). Lets a
+  /// reconciliation/replay re-POST the same source row at any time without
+  /// risking a duplicate card — unlike the webhook's own Idempotency-Key
+  /// check (enquiry-form/route.ts), which only dedupes within a 24h window.
+  externalRef     String?      @unique
+  /// Free-text captured at intake (e.g. lead-gen form Q&A pushed by the n8n
+  /// automation) — a single optional field, deliberately NOT the Note[]
+  /// remarks timeline below. Editable from the lead drawer.
+  intakeNotes     String?
+  /// effective tags on the card: persisted system tags (age/revisit/source) + custom
+  tags            String[]     @default([])
+  /// ordering within a kanban column
+  boardPosition   Int          @default(0)
+  /// true when the card needs staff attention (inbound email / new task) — cleared when drawer is opened
+  needsAttention  Boolean      @default(false)
+  /// AI conversion-likelihood score 0–100 (background pipeline)
+  aiScore         Int?
+  aiScoreReason   String?
+  aiScoredAt      DateTime?
+  /// saved AI Assist result: { summary, nextActions, draft } — persists across
+  /// drawer close/reopen; only regenerated when the rep explicitly requests it
+  aiAssist        Json?
+  aiAssistAt      DateTime?
+  lastActivityAt  DateTime     @default(now())
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  /// Soft delete (admin-only "delete lead ticket") — keeps Notes/Tasks/
+  /// Messages/Calls/AiDecisions intact instead of cascading, same convention
+  /// as Guest.deletedAt. Excluded from listEnquiries and dashboard counts.
+  deletedAt       DateTime?
+  /// Stamped the moment a lead enters "lost" — the auto-delete sweep counts
+  /// LeadDeletionSettings.autoDeleteDays from this timestamp. Cleared if the
+  /// lead is moved out of "lost" again, so a later re-entry restarts the clock.
+  lostAt          DateTime?
+  /// Doctor's Accept/Reject/Needs-phone-consult call on a consultation-stage lead.
+  doctorDecision      DoctorDecision?
+  doctorDecisionAt    DateTime?
+  doctorDecisionBySub String?
+  doctorDecisionNote  String?
+
+  notes       Note[]
+  activities  Activity[]
+  documents   Document[]
+  messages    Message[]
+  tasks       Task[]
+  calls       Call[]
+  aiDecisions AiDecision[]
+
+  @@index([stage, assignedToSub])
+  @@index([guestId])
+  @@index([lastActivityAt])
+  @@index([tags], type: Gin)
+}
+
+/// Shared tag vocabulary. System tags (age/revisit/source) are applied
+/// automatically; custom tags created here become available to everyone.
+model Tag {
+  id        String   @id @default(uuid())
+  value     String   @unique // canonical slug, e.g. "high-intent"
+  category  String   @default("custom") // age | revisit | source | custom
+  createdBy String? // Keycloak sub of the creator (null for seeded)
+  createdAt DateTime @default(now())
+
+  @@index([category])
+}
+
+model Note {
+  id        String   @id @default(uuid())
+  enquiryId String
+  enquiry   Enquiry  @relation(fields: [enquiryId], references: [id], onDelete: Cascade)
+  authorSub String
+  authorName String?
+  /// Snapshot of the author's primary role at write time (e.g. "ADMIN") — an
+  /// admin's remark renders in a distinct color in the Activity tab.
+  authorRole String?
+  body      String
+  /// An optional voice note or file attached to this remark — a real
+  /// Document row (so it's visible in the Documents tab too), same pattern
+  /// as Message.attachmentDocumentId. SetNull (not the default Restrict) so
+  /// a guest hard-delete's Document cleanup, which runs before the Enquiry
+  /// cascade that removes Notes, never trips a FK violation here.
+  attachmentDocumentId String?
+  attachmentDocument   Document? @relation(fields: [attachmentDocumentId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+
+  @@index([enquiryId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Packages & Memberships
+// ---------------------------------------------------------------------------
+
+model Package {
+  id           String       @id @default(uuid())
+  name         String
+  category     String // residential | day | corporate
+  durationDays Int
+  basePriceINR Int
+  therapies    String[]     @default([])
+  isActive     Boolean      @default(true)
+  enquiries    Enquiry[]
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+}
+
+model Membership {
+  id           String   @id @default(uuid())
+  guestId      String
+  guest        Guest    @relation(fields: [guestId], references: [id])
+  planName     String
+  startDate    DateTime
+  expiryDate   DateTime
+  creditsTotal Int      @default(0)
+  creditsUsed  Int      @default(0)
+  discountPct  Int      @default(0)
+  status       String   @default("active")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([guestId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Referral codes
+// ---------------------------------------------------------------------------
+
+model ReferralCode {
+  id              String    @id @default(uuid())
+  code            String    @unique
+  issuedToGuestId String?
+  campaignLabel   String?
+  maxRedemptions  Int       @default(0) // 0 = unlimited
+  redemptionCount Int       @default(0)
+  isActive        Boolean   @default(true)
+  enquiries       Enquiry[]
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([code])
+}
+
+// ---------------------------------------------------------------------------
+// Documents & Activity (audit trail)
+// ---------------------------------------------------------------------------
+
+model Document {
+  id         String           @id @default(uuid())
+  guestId    String?
+  guest      Guest?           @relation(fields: [guestId], references: [id])
+  enquiryId  String?
+  enquiry    Enquiry?         @relation(fields: [enquiryId], references: [id])
+  category   DocumentCategory
+  filename   String
+  mimeType   String
+  storageKey String // MinIO/S3 object key
+  sizeBytes  Int
+  uploadedBy String // Keycloak sub — "inbound-whatsapp" for received media
+  createdAt  DateTime         @default(now())
+  messages   Message[]
+  notes      Note[]
+
+  @@index([guestId])
+  @@index([enquiryId])
+}
+
+/// Append-only audit log. The app role has no DELETE on this table (DPDP).
+model Activity {
+  id         String   @id @default(uuid())
+  enquiryId  String?
+  enquiry    Enquiry? @relation(fields: [enquiryId], references: [id])
+  guestId    String?
+  actorSub   String
+  actorRole  String
+  actorName  String?
+  actionType String // stage_change | note | message_sent | task_created | doc_upload | assign | created | consent
+  metadata   Json     @default("{}")
+  createdAt  DateTime @default(now())
+
+  @@index([actorSub, createdAt])
+  @@index([enquiryId])
+}
+
+// ---------------------------------------------------------------------------
+// Messaging timeline (WhatsApp / email / sms)
+// ---------------------------------------------------------------------------
+
+model Message {
+  id          String           @id @default(uuid())
+  // Email threads are GUEST-level; enquiry is optional (doctor convos have none).
+  guestId     String?
+  guest       Guest?           @relation(fields: [guestId], references: [id])
+  enquiryId   String?
+  enquiry     Enquiry?         @relation(fields: [enquiryId], references: [id], onDelete: Cascade)
+  // Which mailbox/number this message belongs to: "sales" | "doctor" for email
+  // (role-based), or a WhatsAppNumber.instanceName for whatsapp.
+  mailboxId   String           @default("sales")
+  channel     MessageChannel   @default(email)
+  direction   MessageDirection
+  subject     String?
+  body        String // plain text
+  bodyHtml    String?
+  fromEmail   String?
+  toEmail     String?
+  messageId   String?          @unique // RFC 5322 Message-ID for threading + dedup
+  inReplyTo   String?
+  references  String[]         @default([])
+  templateId  String?
+  status      String           @default("sent") // sent | delivered | read | failed
+  errorDetail String?
+  externalId  String? // provider message id
+  needsReview Boolean          @default(false) // unmatched inbound flagged for staff
+  // Inline media (WhatsApp images/audio/documents; not used by email today,
+  // which surfaces attachments via the Documents tab instead — see docs/17).
+  attachmentDocumentId String?
+  attachmentDocument   Document? @relation(fields: [attachmentDocumentId], references: [id])
+  /// Set only for a bulk-broadcast send — which trigger it belongs to, for
+  /// the Broadcast Status page's per-recipient view. Never set for a 1:1
+  /// send or an inbound message. Deleting a trigger there (see
+  /// BroadcastJob.deletedAt) never touches this row — the guest's own
+  /// conversation thread is a separate, unaffected surface.
+  broadcastJobId String?
+  broadcastJob   BroadcastJob? @relation(fields: [broadcastJobId], references: [id])
+  createdAt   DateTime         @default(now())
+  // CRM-side correction/redaction of a message record — never touches
+  // WhatsApp itself, just tags the local copy for staff visibility.
+  editedAt    DateTime?
+  editedBySub String?
+  deletedAt   DateTime?
+  deletedBySub String?
+
+  @@index([enquiryId, createdAt])
+  @@index([guestId, mailboxId, createdAt])
+  @@index([broadcastJobId])
+}
+
+/// Per-mailbox IMAP cursor so the poller only fetches new mail and never marks
+/// messages read (staff may also read the inbox directly).
+model MailboxState {
+  mailboxId String   @id // "sales" | "doctor"
+  folder    String   @default("INBOX")
+  lastUid   Int      @default(0)
+  /// IMAP UIDVALIDITY of the account currently behind this mailboxId. UIDs
+  /// are only comparable within one (server, UIDVALIDITY) pair — if the env
+  /// creds for this role get pointed at a different mailbox account, the old
+  /// lastUid is meaningless in the new account's UID space and must not be
+  /// used to resume from, or the poller reads it as "unread mail" back to
+  /// UID 1 and imports the whole inbox as leads. A change here forces the
+  /// same re-anchor-without-importing path as a brand new mailboxId.
+  uidValidity BigInt?
+  updatedAt DateTime @updatedAt
+}
+
+/// A WhatsApp number connected via Evolution API. One row per "instance" —
+/// Message.mailboxId stores this row's instanceName for whatsapp-channel
+/// messages, the same way it stores "sales"/"doctor" for email (no FK; kept
+/// as a plain string like the email mailboxes for consistency).
+model WhatsAppNumber {
+  id            String   @id @default(uuid())
+  label         String
+  /// E.164, filled in once the QR pairing completes and Evolution reports it.
+  phoneNumber   String?
+  /// Evolution API instance name (slug, unique) — also used as Message.mailboxId.
+  instanceName  String   @unique
+  /// Evolution API instance-scoped token — never returned to the client.
+  instanceToken String
+  /// pending (created, awaiting QR scan) | connecting | connected | disconnected
+  status        String   @default("pending")
+  isDefault     Boolean  @default(false)
+  /// Whether staff can select this number to send from (dropdown, broadcast,
+  /// "this is your own number" default). Off = fully hidden from that pool
+  /// without disconnecting it — for scaling down how many of many connected
+  /// numbers are actually offered to staff. Existing message history and
+  /// in-progress conversations on this number are unaffected.
+  shared        Boolean  @default(true)
+  /// "baileys" (QR-paired, unofficial WhatsApp Web protocol) | "cloud_api"
+  /// (official Meta WhatsApp Business Platform). Governs how send/broadcast
+  /// composes a message — a cloud_api number can only send free-form text
+  /// inside an open 24h customer-service window; outside it (the normal case
+  /// for a bulk/marketing send) it must use an approved message template.
+  integration       String  @default("baileys")
+  /// Cloud API only — Meta's WhatsApp Business Account id, which owns the
+  /// number's message templates.
+  wabaId            String?
+  /// Cloud API only — Meta's Phone Number id (distinct from the E.164
+  /// phoneNumber above); this is what Graph API send/template calls address.
+  metaPhoneNumberId String?
+  /// Cloud API only — permanent System User access token for this WABA.
+  /// Never returned to the client, same handling as instanceToken.
+  metaAccessToken   String?
+  createdBy     String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  autoReplies AutoReply[]
+}
+
+/// An automated text reply sent on a WhatsApp number's inbound messages.
+/// Several can exist per number: each with its own trigger word fires only
+/// when that word appears in the inbound message; at most one with a blank
+/// triggerWord acts as a catch-all for everything else. See
+/// lib/whatsapp-autoreply.ts for the matching/sending logic.
+model AutoReply {
+  id       String         @id @default(uuid())
+  numberId String
+  number   WhatsAppNumber @relation(fields: [numberId], references: [id], onDelete: Cascade)
+  /// Case-insensitive substring match against the inbound message body.
+  /// Null/empty = matches every inbound message on this number.
+  triggerWord String?
+  replyText   String
+  enabled     Boolean  @default(true)
+  createdBy   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([numberId, enabled])
+}
+
+// ---------------------------------------------------------------------------
+// Tasks / reminders on an enquiry
+// ---------------------------------------------------------------------------
+
+model Task {
+  id         String     @id @default(uuid())
+  enquiryId  String
+  enquiry    Enquiry    @relation(fields: [enquiryId], references: [id], onDelete: Cascade)
+  title      String
+  dueAt      DateTime?
+  status     TaskStatus @default(open)
+  /// Distinguishes ordinary follow-ups from system-generated action-required
+  /// tasks (doctor review, deletion approval) that need a real decision.
+  kind       TaskKind   @default(follow_up)
+  /// Only meaningful for deletion_approval tasks: null = pending, true/false = decided.
+  approved   Boolean?
+  assignedToSub String?
+  createdBy  String
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  @@index([assignedToSub, status])
+  @@index([dueAt])
+}
+
+// ---------------------------------------------------------------------------
+// Per-user UI preferences (saved filters, column visibility) keyed by sub
+// ---------------------------------------------------------------------------
+
+model UserPreference {
+  id        String   @id @default(uuid())
+  userSub   String   @unique
+  prefs     Json     @default("{}")
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Staff profiles — phone numbers for click-to-call (identity stays in Keycloak)
+// ---------------------------------------------------------------------------
+
+model StaffProfile {
+  keycloakId  String   @id        // Keycloak `sub`
+  displayName String
+  /// E.164 phone, e.g. +919876543210 — required for click-to-call
+  phone       String?
+  isOnline    Boolean  @default(true)
+  /// Denormalized AppRole ("ADMIN"/"MANAGER"/"DOCTOR"/"RECEPTION"/"STAFF"),
+  /// synced from Keycloak by keycloak-admin.ts. Lets the inbound-call webhook
+  /// filter reps by role without an unauthenticated Keycloak Admin API call
+  /// on every ringing call.
+  role        String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Inbound call routing — single global settings row
+// ---------------------------------------------------------------------------
+
+enum CallRoutingScope {
+  reception
+  sales
+  reception_sales
+  all
+}
+
+model CallRoutingSettings {
+  id        String           @id @default("singleton")
+  /// Which StaffProfile.role(s) pickAvailableRep()/pickRepForCaller() consider
+  /// eligible for inbound routing: reception-only, sales-only, both, or any
+  /// online staff with a phone (pre-existing "all" behavior).
+  scope     CallRoutingScope @default(reception)
+  updatedAt DateTime         @updatedAt
+}
+
+/// How many days after manager approval a Dead lead sits before the
+/// background sweep soft-deletes it. Admin-configurable (Users page).
+model LeadDeletionSettings {
+  id             String   @id @default("singleton")
+  autoDeleteDays Int      @default(30)
+  updatedAt      DateTime @updatedAt
+}
+
+/// Round-robin cursor for automatic new-lead assignment. `id` is either
+/// "singleton" (the default Sales->Reception pool) or a LeadAssignmentCategory
+/// value (a per-channel cursor once an admin restricts that channel to a
+/// specific set of staff) — see LeadAssignmentSettings.
+model LeadRoutingState {
+  id              String   @id @default("singleton")
+  lastAssignedSub String?
+  updatedAt       DateTime @updatedAt
+}
+
+enum LeadAssignmentCategory {
+  whatsapp
+  email
+  call
+  google_sheets
+}
+
+enum LeadAssignmentStrategy {
+  round_robin
+  least_busy
+}
+
+/// Per-channel override for who a freshly auto-created lead gets assigned
+/// to. Empty eligibleSubs = not configured, falls back to the channel's
+/// default pool (today's behavior — Sales->Reception round robin for
+/// whatsapp/email, whichever rep call routing rings for calls). Only once an
+/// admin picks specific staff here does that channel's leads get restricted
+/// to them.
+model LeadAssignmentSettings {
+  category     LeadAssignmentCategory @id
+  strategy     LeadAssignmentStrategy @default(round_robin)
+  eligibleSubs String[]               @default([])
+  updatedAt    DateTime               @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Canned message templates (email/WhatsApp) — Admin/Manager managed, used by
+// the send-message template picker (individual + bulk).
+// ---------------------------------------------------------------------------
+
+enum MessageTemplateChannel {
+  email
+  whatsapp
+}
+
+model MessageTemplate {
+  id        String                 @id @default(uuid())
+  channel   MessageTemplateChannel
+  name      String
+  /// Email only — null for whatsapp.
+  subject   String?
+  /// {name} = the guest's first name; {rep_name}/{rep_phone} = the sending
+  /// staff member's own name/phone (StaffProfile) — all resolved client-side
+  /// at send time, never stored resolved.
+  body      String
+  createdBy String?
+  createdAt DateTime               @default(now())
+  updatedAt DateTime               @updatedAt
+
+  @@index([channel])
+}
+
+// ---------------------------------------------------------------------------
+// Bulk WhatsApp broadcast — one at a time, paced in the background
+// ---------------------------------------------------------------------------
+
+enum BroadcastStatus {
+  queued
+  running
+  completed
+  cancelled
+  failed
+}
+
+model BroadcastJob {
+  id               String          @id @default(uuid())
+  status           BroadcastStatus @default(queued)
+  createdBySub     String
+  /// Free-text body (Baileys numbers) — ignored when templateName is set.
+  message          String
+  imageDocumentId  String?
+  /// Cloud API numbers only — approved template name/language to send
+  /// instead of free text, since a Cloud API number can't send arbitrary
+  /// text to a broadcast recipient outside an open 24h window.
+  templateName       String?
+  templateLanguage   String?
+  /// Positional {{1}}, {{2}}, … BODY parameter templates — each may contain
+  /// {name}/{salutation} tokens, personalized per recipient same as message.
+  templateBodyParams Json?
+  /// Set only for a NAMED-parameter template (e.g. {{customer_name}}) —
+  /// the placeholder names, parallel array to templateBodyParams. Null for
+  /// a positional template, where Meta identifies params by array order
+  /// instead and no parameter_name is sent.
+  templateParamNames Json?
+  /// Cloud API templates with an IMAGE/VIDEO/DOCUMENT HEADER only — the
+  /// Meta-hosted media id for imageDocumentId, uploaded ONCE at broadcast
+  /// start (not per-recipient) and reused for every send in this job, since
+  /// the same header media goes out to everyone.
+  headerMediaId    String?
+  /// WhatsAppNumber.id to send from — null falls back to the org default number.
+  numberId         String?
+  /// seconds between sends — default 3s ≈ 20/minute
+  delaySec         Int             @default(3)
+  /// filtered guest-list snapshot at creation time (doesn't drift if filters change later)
+  guestIds         String[]
+  totalCount       Int
+  sentCount        Int             @default(0)
+  failedCount      Int             @default(0)
+  /// index into guestIds already processed
+  cursor           Int             @default(0)
+  /// [{ guestId, error }] for the small results summary
+  errors           Json            @default("[]")
+  lastSentAt       DateTime?
+  createdAt        DateTime        @default(now())
+  completedAt      DateTime?
+  /// Soft delete from the Broadcast Status page — hides the trigger from
+  /// that list only. The Message rows it sent (and the guest-level
+  /// conversation threads they're part of) are never touched by this.
+  deletedAt        DateTime?
+
+  messages         Message[]
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Call records — outbound (click-to-call) and inbound (Plivo number → rep)
+// ---------------------------------------------------------------------------
+
+model Call {
+  id            String        @id @default(uuid())
+  direction     CallDirection
+  status        CallStatus    @default(initiated)
+  /// Plivo CallUUID assigned once the call is created on Plivo's side
+  callUUID      String?       @unique
+
+  guestId       String?
+  guest         Guest?        @relation(fields: [guestId], references: [id])
+  enquiryId     String?
+  enquiry       Enquiry?      @relation(fields: [enquiryId], references: [id])
+
+  repKeycloakId String?
+  repName       String?
+  repPhone      String?
+  customerPhone String
+
+  startedAt     DateTime      @default(now())
+  answeredAt    DateTime?
+  endedAt       DateTime?
+  durationSec   Int           @default(0)
+
+  /// Plivo recording URL — proxy via /api/calls/:id/recording (needs Basic auth)
+  recordingUrl    String?
+  recordingDurSec Int?
+
+  tags          String[]      @default([])
+  notes         String?
+
+  /// AI call analysis (populated by the background pipeline)
+  /// native-script transcript, reconciled across candidate languages (see ASR_LANGUAGES)
+  transcript         String?
+  /// English translation of `transcript`, used as the input for scoring/coaching
+  transcriptEnglish  String?
+  /// detected spoken language code (e.g. "te", "hi") or "mixed"
+  transcriptLanguage String?
+  aiSummary     String?
+  /// overall call quality 0–100
+  aiScore       Int?
+  aiTags        String[]      @default([])
+  /// coaching suggestions: { hookLine, explanation, professionalism, … }
+  aiSuggestions Json?
+  aiAnalyzedAt  DateTime?
+
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  aiDecisions AiDecision[]
+
+  @@index([guestId])
+  @@index([enquiryId])
+  @@index([callUUID])
+  @@index([repKeycloakId])
+  @@index([startedAt])
+  @@index([tags], type: Gin)
+}
+
+// ---------------------------------------------------------------------------
+// AI/ML decision audit log — every LLM inference the system makes, with the
+// exact prompt sent and the exact output received, kept for verification
+// even after Call/Enquiry/Guest.ai* fields are overwritten by a later run.
+// ---------------------------------------------------------------------------
+
+enum AiDecisionKind {
+  call_analysis
+  lead_scoring
+  guest_insight
+  conversation_assist
+  transcript_translation
+}
+
+/// Append-only. No DELETE for the app role, same posture as Activity.
+model AiDecision {
+  id        String         @id @default(uuid())
+  kind      AiDecisionKind
+
+  callId    String?
+  call      Call?          @relation(fields: [callId], references: [id])
+  enquiryId String?
+  enquiry   Enquiry?       @relation(fields: [enquiryId], references: [id])
+  guestId   String?
+  guest     Guest?         @relation(fields: [guestId], references: [id])
+
+  provider  String // e.g. "ollama"
+  model     String // e.g. "gemma4:latest" — pipeline behavior changes with the model, so this is captured per-decision
+  promptSystem String @db.Text
+  promptUser   String @db.Text
+  /// the parsed, structured decision (score/tags/suggestions/etc.) — null on failure
+  output    Json?
+
+  success      Boolean  @default(true)
+  errorMessage String?
+  durationMs   Int?
+
+  /// Keycloak sub of the staff member who triggered a manual run, or "pipeline" for the background job
+  triggeredBy     String?
+  triggeredByName String?
+
+  createdAt DateTime @default(now())
+
+  @@index([kind, createdAt])
+  @@index([callId])
+  @@index([enquiryId])
+  @@index([guestId])
+}

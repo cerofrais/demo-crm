@@ -1,0 +1,433 @@
+# =============================================================================
+# Trē Wellness CRM — full local/dev stack.
+# All config comes from .env (env_file). Bring up with:  docker compose up -d
+# Service map & ports are documented in docs/03-docker.md
+# =============================================================================
+name: tre-crm
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — ONE service hosting THREE databases (CRM + Keycloak + Evolution
+  # API/WhatsApp). All dbs/users are created on first boot by infra/postgres/init/*.sql
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: tre-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPER_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPER_PASSWORD}
+      POSTGRES_DB: postgres
+      # consumed by the init script:
+      CRM_DB_NAME: ${CRM_DB_NAME}
+      CRM_DB_USER: ${CRM_DB_USER}
+      CRM_DB_PASSWORD: ${CRM_DB_PASSWORD}
+      KC_DB_NAME: ${KC_DB_NAME}
+      KC_DB_USER: ${KC_DB_USER}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
+      WA_DB_NAME: ${WA_DB_NAME}
+      WA_DB_USER: ${WA_DB_USER}
+      WA_DB_PASSWORD: ${WA_DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Loopback only — the app reaches postgres over the internal `tre` network by
+      # service name; the host mapping is for local psql/migrations, not the world.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPER_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [tre]
+
+  # ---------------------------------------------------------------------------
+  # PgBouncer — transaction pooling in front of the CRM database.
+  # The Next.js app connects here (DATABASE_URL); migrations use DIRECT url.
+  # ---------------------------------------------------------------------------
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: tre-pgbouncer
+    restart: unless-stopped
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${CRM_DB_USER}
+      DB_PASSWORD: ${CRM_DB_PASSWORD}
+      DB_NAME: ${CRM_DB_NAME}
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "100"
+      DEFAULT_POOL_SIZE: "20"
+      AUTH_TYPE: scram-sha-256
+      LISTEN_PORT: "6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PGBOUNCER_PORT:-6432}:6432"
+    networks: [tre]
+
+  # ---------------------------------------------------------------------------
+  # Redis — server sessions, JWKS cache, rate-limit counters.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: tre-redis
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--save", "60", "1",
+        "--appendonly", "no",
+        "--requirepass", "${REDIS_PASSWORD}",
+      ]
+    volumes:
+      - redisdata:/data
+    ports:
+      # Bind to loopback only — Redis is the session-revocation store and must not
+      # be reachable from other hosts on a shared network (Tailscale/VPC/cloud VM).
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [tre]
+
+  # ---------------------------------------------------------------------------
+  # Evolution API — self-hosted WhatsApp gateway (Baileys/WhatsApp-Web based).
+  # One "instance" = one connected WhatsApp number, paired via QR from the
+  # in-app admin screen (/whatsapp-numbers) — see docs/17-whatsapp-integration.md.
+  # Uses its own database on the shared postgres + a dedicated Redis db index
+  # (db 1) so its cache keys never collide with the app's own (db 0).
+  # ---------------------------------------------------------------------------
+  evolution-api:
+    image: evoapicloud/evolution-api:v2.3.7
+    container_name: tre-evolution-api
+    restart: unless-stopped
+    environment:
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: "postgresql://${WA_DB_USER}:${WA_DB_PASSWORD}@postgres:5432/${WA_DB_NAME}?schema=public"
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: "redis://redis:6379/1"
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_LOCAL_ENABLED: "false"
+      # Single endpoint receives every event type for every instance — we
+      # filter by `event` in the handler. The secret is a query param since
+      # Evolution's own webhook-signature support varies by version.
+      WEBHOOK_GLOBAL_ENABLED: "true"
+      WEBHOOK_GLOBAL_URL: "http://nextjs:3000/api/webhooks/whatsapp?secret=${WHATSAPP_WEBHOOK_SECRET}"
+      WEBHOOK_GLOBAL_WEBHOOK_BY_EVENTS: "false"
+      WEBHOOK_EVENTS_MESSAGES_UPSERT: "true"
+      WEBHOOK_EVENTS_CONNECTION_UPDATE: "true"
+      # Delivery-status changes (sent -> delivered -> read, or failed) for a
+      # message we sent — without this Evolution never forwards them, and
+      # Message.status sits at "sent" forever regardless of what actually
+      # happened. See handleMessagesUpdate in the webhook route.
+      WEBHOOK_EVENTS_MESSAGES_UPDATE: "true"
+      LANGUAGE: en
+      # Official Meta Cloud API mode (WHATSAPP-BUSINESS integration, as
+      # opposed to the QR-paired WHATSAPP-BAILEYS numbers above) — Evolution
+      # itself receives Meta's webhook at /webhook/meta (reached via the app's
+      # /api/webhooks/whatsapp-cloud-relay pass-through, since this container
+      # has no public address of its own) and validates it against
+      # WA_BUSINESS_TOKEN_WEBHOOK, the same value registered as the "Verify
+      # token" in Meta's console.
+      WA_BUSINESS_TOKEN_WEBHOOK: ${WA_BUSINESS_TOKEN_WEBHOOK}
+      WA_BUSINESS_URL: https://graph.facebook.com
+      WA_BUSINESS_VERSION: v20.0
+      WA_BUSINESS_LANGUAGE: en_US
+    volumes:
+      - evolutioninstances:/evolution/instances
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8090:8080" # host access for debugging only — the app talks to it over the tre network
+    networks: [tre]
+
+  # One-shot: render the realm import template, substituting ${SEED_ADMIN_PASSWORD}
+  # (and any other ${VAR} placeholders) from .env before Keycloak reads it. Runs
+  # on every `docker compose up` so the rendered file always reflects current env —
+  # note this only affects a FRESH realm import; an already-imported realm needs a
+  # manual kcadm sync, see docs/16-user-management.md.
+  keycloak-realm-render:
+    image: node:22-alpine
+    container_name: tre-keycloak-realm-render
+    environment:
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD}
+      SEED_DOCTOR_PASSWORD: ${SEED_DOCTOR_PASSWORD}
+      SEED_MANAGER_PASSWORD: ${SEED_MANAGER_PASSWORD}
+      SEED_RECEPTION_PASSWORD: ${SEED_RECEPTION_PASSWORD}
+      SEED_STAFF_PASSWORD: ${SEED_STAFF_PASSWORD}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET}
+    volumes:
+      - ./infra/keycloak/realm-export.template.json:/template/realm-export.template.json:ro
+      - ./infra/keycloak/render-realm.js:/render-realm.js:ro
+      - keycloakimport:/import
+    # Script lives in a file (not inline) because YAML folded scalars mangle
+    # the regex escapes, which silently no-oped the ${VAR} substitution.
+    entrypoint: ["node", "/render-realm.js"]
+    networks: [tre]
+
+  # ---------------------------------------------------------------------------
+  # Keycloak — identity provider. Uses its OWN database on the shared postgres.
+  # Realm `tre-wellness` (5 roles + test users) is imported on start.
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: tre-keycloak
+    restart: unless-stopped
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${KC_DB_NAME}
+      KC_DB_USERNAME: ${KC_DB_USER}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      # Trusts X-Forwarded-Proto/-Host/-Port from a reverse proxy in front
+      # (e.g. `tailscale serve` terminating TLS and forwarding to this
+      # container over plain HTTP) so self-reported URLs (issuer, the
+      # well-known document, browser redirects) correctly say "https" —
+      # without this Keycloak reports its own actual http:// connection
+      # regardless of what the browser used, which then fails token
+      # validation (issuer mismatch) against KEYCLOAK_PUBLIC_URL. A no-op
+      # for direct unproxied access (e.g. host-dev on :8080) since those
+      # requests carry no X-Forwarded-* headers to trust in the first place.
+      KC_PROXY_HEADERS: "xforwarded"
+    volumes:
+      - keycloakimport:/opt/keycloak/data/import:ro
+      - ./infra/keycloak/themes:/opt/keycloak/themes:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak-realm-render:
+        condition: service_completed_successfully
+    ports:
+      # Host port is configurable so Windows users can dodge the WinNAT-reserved
+      # 8030–8129 range (set KEYCLOAK_PORT=8180). Container port stays 8080.
+      - "${KEYCLOAK_PORT:-8080}:8080"
+    networks:
+      # Alias so the in-compose app resolves the browser-facing hostname
+      # (KEYCLOAK_PUBLIC_URL host) to this container directly. This keeps the
+      # OIDC issuer identical for both the browser (via Tailscale) and the
+      # server-side token exchange. Change this if KEYCLOAK_PUBLIC_URL's host
+      # changes. See docs/05-auth-keycloak.md.
+      tre:
+        aliases:
+          - harsha-pc-ubuntu
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible object storage for documents & files.
+  # Console on :9001, API on :9000. Bucket created by the `minio-init` job.
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: tre-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${STORAGE_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${STORAGE_SECRET_KEY}
+    volumes:
+      - miniodata:/data
+    ports:
+      # 9000 (S3 API) must stay reachable — presigned upload/download URLs are
+      # handed to the browser (STORAGE_PUBLIC_ENDPOINT). The 9001 admin console,
+      # which exposes root creds, is bound to loopback only.
+      - "9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [tre]
+
+  # One-shot: create the bucket the app expects.
+  minio-init:
+    image: minio/mc:latest
+    container_name: tre-minio-init
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${STORAGE_ACCESS_KEY} ${STORAGE_SECRET_KEY}; do echo 'waiting for minio...'; sleep 2; done;
+      mc mb --ignore-existing local/${STORAGE_BUCKET};
+      mc anonymous set none local/${STORAGE_BUCKET};
+      echo 'minio bucket ready'; exit 0;
+      "
+    networks: [tre]
+
+  # ---------------------------------------------------------------------------
+  # Mailhog — dev SMTP sink. Catches all outbound email; UI on :8025.
+  # Swap to Postal/Resend in prod by changing the EMAIL_* env vars only.
+  # ---------------------------------------------------------------------------
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: tre-mailhog
+    restart: unless-stopped
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # web UI
+    networks: [tre]
+
+  # ---------------------------------------------------------------------------
+  # Next.js CRM app — the only public-facing service in production.
+  # In dev you'll usually run `npm run dev` on the host; this service is for
+  # a containerised run / staging. Profile `app` keeps it opt-in.
+  # ---------------------------------------------------------------------------
+  nextjs:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile
+      args:
+        # NEXT_PUBLIC_* is baked into the client bundle at build time — this
+        # is the only way to change it; setting it in .env alone does nothing
+        # for an already-built image. Rebuild (docker compose build nextjs)
+        # after changing it, a restart is not enough.
+        NEXT_PUBLIC_LEADS_AUTOREFRESH_INTERVAL_SEC: "${NEXT_PUBLIC_LEADS_AUTOREFRESH_INTERVAL_SEC:-30}"
+    container_name: tre-nextjs
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Inside the compose network the app reaches services by name; these
+      # override the localhost values in .env (which target the host-run dev app).
+      DATABASE_URL: "postgresql://${CRM_DB_USER}:${CRM_DB_PASSWORD}@pgbouncer:6432/${CRM_DB_NAME}?pgbouncer=true"
+      DIRECT_DATABASE_URL: "postgresql://${CRM_DB_USER}:${CRM_DB_PASSWORD}@postgres:5432/${CRM_DB_NAME}?schema=public"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
+      # KEYCLOAK_URL stays the in-network address — this container's own
+      # token/userinfo/jwks calls (see lib/auth.ts's keycloakInternalIssuer)
+      # go through it directly and never touch KEYCLOAK_PUBLIC_URL at all.
+      KEYCLOAK_URL: "http://keycloak:8080"
+      # Browser-facing, over Tailscale HTTPS — `tailscale serve --https=8443
+      # http://localhost:8080` on the host. This container cannot route to
+      # its own Tailscale IP (confirmed: a request from inside this
+      # container to the tailnet hostname times out), which is exactly why
+      # KEYCLOAK_URL above has to stay a separate, in-network address.
+      KEYCLOAK_PUBLIC_URL: "https://harsha-pc-ubuntu.tail5a5cef.ts.net:8443"
+      NEXTAUTH_URL: "https://harsha-pc-ubuntu.tail5a5cef.ts.net"
+      APP_URL: "https://harsha-pc-ubuntu.tail5a5cef.ts.net"
+      STORAGE_ENDPOINT: "http://minio:9000"
+      # Presigned upload/download URLs are handed to the browser, so they must
+      # be signed against a host the browser can actually reach — not the
+      # in-network "minio" hostname above. Same reasoning as KEYCLOAK_PUBLIC_URL.
+      # Also over Tailscale HTTPS (`tailscale serve --https=9443
+      # http://localhost:9000`) — an http presigned URL would be blocked as
+      # mixed content once the app itself is served over https (uploads use
+      # `fetch(...PUT...)`, not just passive image/media loads).
+      STORAGE_PUBLIC_ENDPOINT: "https://harsha-pc-ubuntu.tail5a5cef.ts.net:9443"
+      SMTP_HOST: "mailhog"
+      # Ollama runs on the host, not in compose — reach it via the host gateway.
+      AI_BASE_URL: "http://host.docker.internal:11434/v1"
+      EVOLUTION_API_URL: "http://evolution-api:8080"
+    extra_hosts:
+      # Makes host.docker.internal resolve on Linux (no-op on Docker Desktop).
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      minio:
+        condition: service_started
+      evolution-api:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    profiles: ["app"]
+    networks: [tre]
+
+  # ---------------------------------------------------------------------------
+  # ngrok — DEV ONLY. Exposes the app over HTTPS for Plivo webhooks.
+  # Requires NGROK_AUTHTOKEN + NGROK_DOMAIN in .env.
+  # DO NOT deploy to production — use a real reverse proxy instead.
+  # ---------------------------------------------------------------------------
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: tre-ngrok
+    restart: unless-stopped
+    command: http --url=${NGROK_DOMAIN} http://nextjs:3000
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    ports:
+      - "4040:4040"  # ngrok web inspector UI
+    profiles: ["dev"]
+    networks: [tre]
+
+  # ---------------------------------------------------------------------------
+  # whisper — OPTIONAL (profile "ai"). OpenAI-compatible /v1/audio/transcriptions
+  # for AI call-transcript analysis. CPU image; models download on first use.
+  # Enable with:  docker compose --profile ai up -d whisper
+  # Then set:     AI_TRANSCRIBE_BASE_URL=http://whisper:8000/v1
+  #               AI_TRANSCRIBE_MODEL=Systran/faster-whisper-small
+  # ---------------------------------------------------------------------------
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    container_name: tre-whisper
+    restart: unless-stopped
+    volumes:
+      - whispermodels:/root/.cache/huggingface
+    ports:
+      - "8000:8000"   # host access for debugging; app uses http://whisper:8000
+    profiles: ["ai"]
+    networks: [tre]
+
+  # ---------------------------------------------------------------------------
+  # indic-asr — OPTIONAL (profile "ai"). AI4Bharat IndicConformer: conformer
+  # ASR covering all 22 official Indian languages (MIT licensed model, but the
+  # HF repo is GATED — request access + a token first, see docs/14-ai-features.md).
+  # No English support — use only when calls are primarily in a regional
+  # language; use the `whisper` service instead for English/code-switched calls.
+  # Enable with:  docker compose --profile ai up -d indic-asr
+  # Then set:     AI_TRANSCRIBE_BASE_URL=http://indic-asr:8001/v1
+  # ---------------------------------------------------------------------------
+  indic-asr:
+    build:
+      context: ./infra/indic-asr
+    container_name: tre-indic-asr
+    restart: unless-stopped
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      # Server-side fallback only — the app always sends an explicit
+      # `language` per request (looping over ASR_LANGUAGES, plural, read by
+      # the nextjs service from .env), so this rarely applies in practice.
+      ASR_LANGUAGE: ${ASR_LANGUAGE:-te}
+      ASR_DECODING: ${ASR_DECODING:-rnnt}
+    volumes:
+      - indicasrmodels:/root/.cache/huggingface
+    ports:
+      - "8001:8001"
+    profiles: ["ai"]
+    networks: [tre]
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  whispermodels:
+  indicasrmodels:
+  keycloakimport:
+  evolutioninstances:
+
+networks:
+  tre:
+    driver: bridge

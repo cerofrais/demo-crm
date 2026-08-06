@@ -1,0 +1,153 @@
+/* =============================================================================
+   Trē Wellness — Keycloak login theme overrides.
+   Hybrid palette (matches trewellness.in): teal #246a80 · deep teal #13484f ·
+   ink #142a2e · warm cream tint #f3f1ec. Classic "keycloak" parent theme.
+   ============================================================================= */
+
+:root {
+  --tre-green: #246a80;
+  --tre-green-dark: #13484f;
+  --tre-ink: #142a2e;
+  --tre-tint: #f3f1ec;
+}
+
+/* ---- Page background: soft teal → cream gradient (replace default image) ---- */
+.login-pf body,
+body.login-pf {
+  background: linear-gradient(135deg, #e8f1f2 0%, #ffffff 50%, #f5f1e8 100%) !important;
+  background-image: linear-gradient(135deg, #e8f1f2 0%, #ffffff 50%, #f5f1e8 100%) !important;
+}
+
+.login-pf-page {
+  padding-top: 40px;
+}
+
+/* ---- Brand header: logo mark + name + tagline ---- */
+#kc-header,
+#kc-header-wrapper {
+  color: var(--tre-ink) !important;
+  text-shadow: none !important;
+  font-weight: 700;
+  font-size: 0; /* hide the realm display name text; we re-add a styled mark below */
+  padding: 0;
+}
+
+#kc-header-wrapper::before {
+  content: "Trē";
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  margin-bottom: 14px;
+  border-radius: 18px;
+  background: var(--tre-green-dark);
+  color: #fff;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}
+
+#kc-header-wrapper::after {
+  content: "Trē Wellness CRM";
+  display: block;
+  margin-top: 12px;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--tre-ink);
+}
+
+/* Tagline under the brand */
+#kc-header::after {
+  content: "Personalised wellness retreat — staff portal";
+  display: block;
+  margin-top: 10px;
+  font-size: 13px;
+  font-weight: 400;
+  color: #5b6b62;
+}
+
+/* ---- Card ---- */
+.login-pf-page .card-pf {
+  border: 1px solid #e2ece7;
+  border-top: 4px solid var(--tre-green);
+  border-radius: 16px;
+  box-shadow: 0 18px 40px -24px rgba(27, 67, 50, 0.45);
+  background: #ffffff;
+  margin-top: 24px;
+}
+
+#kc-page-title {
+  color: var(--tre-ink);
+  font-weight: 600;
+}
+
+/* ---- Labels & inputs ---- */
+.login-pf-page label,
+#kc-form-login label {
+  color: var(--tre-ink);
+  font-weight: 600;
+}
+
+#kc-content input[type="text"],
+#kc-content input[type="password"],
+#kc-content input[type="email"],
+.login-pf-page .form-control {
+  border-radius: 8px !important;
+  border: 1px solid #cfe0d7 !important;
+  background: #fff !important;
+  color: var(--tre-ink) !important;
+  box-shadow: none !important;
+}
+
+#kc-content input:focus,
+.login-pf-page .form-control:focus {
+  border-color: var(--tre-green) !important;
+  box-shadow: 0 0 0 3px rgba(45, 106, 79, 0.18) !important;
+  outline: none !important;
+}
+
+/* ---- Primary button ---- */
+.login-pf-page .btn-primary,
+#kc-login {
+  background: var(--tre-green) !important;
+  border-color: var(--tre-green) !important;
+  border-radius: 8px !important;
+  font-weight: 600 !important;
+  padding: 10px 16px !important;
+  transition: background 0.15s ease;
+}
+.login-pf-page .btn-primary:hover,
+#kc-login:hover {
+  background: var(--tre-green-dark) !important;
+  border-color: var(--tre-green-dark) !important;
+}
+
+/* ---- Links ---- */
+.login-pf-page a,
+#kc-registration a,
+#kc-info-message a {
+  color: var(--tre-green) !important;
+}
+.login-pf-page a:hover {
+  color: var(--tre-green-dark) !important;
+}
+
+/* ---- Checkbox accent ---- */
+#kc-form-login input[type="checkbox"] {
+  accent-color: var(--tre-green);
+}
+
+/* ---- Alerts: tint to brand where sensible ---- */
+.alert-success {
+  background: var(--tre-tint);
+  border-color: #b7e4c7;
+  color: var(--tre-green-dark);
+}
+
+/* ---- Footer note ---- */
+#kc-info,
+.login-pf-page #kc-info-wrapper {
+  color: #5b6b62;
+}
