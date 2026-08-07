@@ -14,6 +14,7 @@ import {
 import { cn } from "@/lib/utils";
 import { Sheet } from "@/components/ui/sheet";
 import { NavList, UserFooter, NAV_ICONS, isActive, type NavItem } from "./nav-list";
+import { SiteFooter } from "./site-footer";
 
 /**
  * Responsive app shell.
@@ -120,6 +121,10 @@ export function AppShell({
         <main data-scroll-container className="min-h-0 flex-1 overflow-y-auto">
           {children}
         </main>
+
+        {/* Attribution — a shrink-0 sibling of the scroll area, so it's pinned
+            under every page without ever overlapping content. */}
+        <SiteFooter />
 
         {/* Phone: bottom nav (in-flow, never overlaps the scroll area) */}
         <nav className="no-print flex shrink-0 items-stretch border-t border-border bg-background pb-safe md:hidden">

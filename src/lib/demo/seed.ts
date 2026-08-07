@@ -127,6 +127,16 @@ export const DEMO_USERS: DemoUser[] = [
 
 const SALES_SUBS = ["demo-sales-1", "demo-sales-2", "demo-reception"];
 
+/**
+ * Demo email mailboxes. The real app resolves these from the org's configured
+ * IMAP/SMTP accounts; here they're a fixed pair so the conversation panel has
+ * a From address to attribute outbound mail to, and a mailbox filter to offer.
+ */
+export const DEMO_MAILBOXES = [
+  { id: "sales-inbox", label: "Sales", address: "sales@meridianwellness.demo" },
+  { id: "reception-inbox", label: "Front Desk", address: "reception@meridianwellness.demo" },
+];
+
 function userName(sub: string | null): string | null {
   return DEMO_USERS.find((u) => u.sub === sub)?.name ?? null;
 }
@@ -370,6 +380,48 @@ export function generateSeed(): DemoData {
         });
       }
 
+      // Email thread — only for guests who left an address behind.
+      if (guest.email) {
+        const mailbox = pick(r, DEMO_MAILBOXES);
+        const emailCount = intBetween(r, 0, 3);
+        for (let m = 0; m < emailCount; m++) {
+          const inbound = m % 2 === 1;
+          messages.push({
+            id: uid("msg"),
+            guestId: guest.id,
+            enquiryId: enquiry.id,
+            mailboxId: mailbox.id,
+            channel: "email",
+            direction: inbound ? "inbound" : "outbound",
+            subject: inbound
+              ? `Re: Your enquiry with Meridian Wellness`
+              : pick(r, ["Your enquiry with Meridian Wellness", `${pkg?.name ?? "Wellness Programme"} — details inside`, "Following up on your wellness enquiry"]),
+            body: inbound
+              ? pick(r, [
+                  "Thanks for the details. Could you also share what's included in the daily schedule?",
+                  "This looks good. What dates do you have open in the next two months?",
+                  "Received, thank you. I'll discuss with my family and revert.",
+                  "Do you offer any discount for a couple booking together?",
+                ])
+              : pick(r, [
+                  `Dear ${guest.fullName.split(" ")[0]},\n\nThank you for your interest in Meridian Wellness. I've attached the details for our ${pkg?.name ?? "wellness programmes"} along with current availability.\n\nWarm regards,\nMeridian Wellness Team`,
+                  `Dear ${guest.fullName.split(" ")[0]},\n\nFollowing up on our conversation — our doctor is happy to review your case before you commit to a programme. Would a call this week suit you?\n\nWarm regards,\nMeridian Wellness Team`,
+                  `Dear ${guest.fullName.split(" ")[0]},\n\nJust checking in on your enquiry. Do let me know if you'd like me to hold a slot for you.\n\nWarm regards,\nMeridian Wellness Team`,
+                ]),
+            bodyHtml: null,
+            fromEmail: inbound ? guest.email : mailbox.address,
+            toEmail: inbound ? mailbox.address : guest.email,
+            status: "delivered",
+            needsReview: false,
+            fromLabel: inbound ? null : mailbox.label,
+            editedAt: null,
+            deletedAt: null,
+            attachment: null,
+            createdAt: daysAgo(intBetween(r, 0, 45), r),
+          });
+        }
+      }
+
       // Tasks
       if (r() < 0.35 && stage !== "converted" && stage !== "lost") {
         tasks.push({
@@ -513,7 +565,7 @@ export function generateSeed(): DemoData {
   ];
 
   return {
-    version: 1,
+    version: 2,
     users: DEMO_USERS,
     guests,
     enquiries,

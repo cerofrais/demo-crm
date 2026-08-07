@@ -125,6 +125,9 @@ export interface DemoMessage {
   editedAt: string | null;
   deletedAt: string | null;
   createdAt: string;
+  /** Mirrors MessageDTO.attachment — the demo has no document table, so the
+   *  file's metadata is denormalised onto the message it was sent with. */
+  attachment?: { id: string; filename: string; mimeType: string } | null;
 }
 
 export interface DemoTask {

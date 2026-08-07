@@ -4,7 +4,10 @@ import type { DemoData } from "./types";
 import { generateSeed } from "./seed";
 
 const STORAGE_KEY = "meridian_demo_data_v1";
-const SEED_VERSION = 1;
+// v2 — added seeded email threads (previously WhatsApp-only), so anyone
+// carrying a v1 payload in localStorage gets reseeded rather than landing on
+// an empty Email tab.
+const SEED_VERSION = 2;
 
 let cache: DemoData | null = null;
 const listeners = new Set<() => void>();

@@ -10,12 +10,13 @@
  * at the bottom.
  */
 import { getDb, mutateDb, newId, nowIso } from "./store";
-import { DEMO_USERS } from "./seed";
+import { DEMO_MAILBOXES, DEMO_USERS } from "./seed";
 import { readClientSessionCookie } from "./session";
 import type {
   DemoData,
   DemoEnquiry,
   DemoGuest,
+  DemoMessage,
   DemoTask,
   EnquiryStage,
 } from "./types";
@@ -96,6 +97,52 @@ function toTimelineDTO(db: DemoData, enquiryId: string) {
       meta: a.metadata,
     }));
   return [...notes, ...activities].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+
+function toMessageDTO(m: DemoMessage) {
+  return {
+    id: m.id,
+    direction: m.direction,
+    mailboxId: m.mailboxId,
+    subject: m.subject,
+    body: m.body,
+    bodyHtml: m.bodyHtml,
+    fromEmail: m.fromEmail,
+    toEmail: m.toEmail,
+    status: m.status,
+    needsReview: m.needsReview,
+    createdAt: m.createdAt,
+    attachment: m.attachment ?? null,
+    fromLabel: m.fromLabel,
+    editedAt: m.editedAt,
+    deletedAt: m.deletedAt,
+  };
+}
+
+const THREAD_PAGE_SIZE = 25;
+
+/**
+ * Newest-first page of a guest's thread on one channel. The real API cursors
+ * on the message id; here an offset is enough and keeps "Load older" honest
+ * about when it's run out of history.
+ */
+function pageThread(
+  messages: DemoMessage[],
+  guestId: string,
+  channel: DemoMessage["channel"],
+  opts: { mailboxId?: string | null; cursor?: string | null } = {},
+) {
+  const all = messages
+    .filter((m) => m.guestId === guestId && m.channel === channel)
+    .filter((m) => !opts.mailboxId || m.mailboxId === opts.mailboxId)
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)); // newest-first
+  const offset = Number.parseInt(opts.cursor ?? "", 10) || 0;
+  const page = all.slice(offset, offset + THREAD_PAGE_SIZE);
+  const nextOffset = offset + page.length;
+  return {
+    items: page.map(toMessageDTO),
+    nextCursor: nextOffset < all.length ? String(nextOffset) : null,
+  };
 }
 
 function describeActivity(actionType: string, meta: Record<string, unknown>): string {
@@ -580,6 +627,180 @@ on("DELETE", "/api/guests/:id", ({ params }) => {
 on("GET", "/api/guests/:id/messages", ({ params }) => {
   const db = getDb();
   return ok(db.messages.filter((m) => m.guestId === params.id));
+});
+
+// ---- Conversation threads (lead drawer: Email + WhatsApp tabs) -------------
+
+on("GET", "/api/guests/:id/conversation", ({ params, query }) => {
+  const db = getDb();
+  const guest = db.guests.find((g) => g.id === params.id);
+  const mailboxId = query.get("mailbox") || null;
+  const { items, nextCursor } = pageThread(db.messages, params.id, "email", {
+    mailboxId,
+    cursor: query.get("cursor"),
+  });
+  // Whichever mailbox this guest was last mailed from is the natural From
+  // address; falls back to the first configured one for a fresh thread.
+  const lastOutbound = db.messages
+    .filter((m) => m.guestId === params.id && m.channel === "email" && m.direction === "outbound")
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+  const active =
+    DEMO_MAILBOXES.find((mb) => mb.id === (mailboxId ?? lastOutbound?.mailboxId)) ?? DEMO_MAILBOXES[0]!;
+  const me = currentUser();
+  return ok({
+    items,
+    nextCursor,
+    activeMailbox: active.id,
+    guestEmail: guest?.email ?? null,
+    fromAddress: active.address,
+    // Viewers are read-only in the real app; everyone else can reply as long
+    // as the guest actually left an address.
+    canSend: Boolean(guest?.email) && me.role !== "VIEWER",
+    mailboxOptions: DEMO_MAILBOXES.map((mb) => ({ id: mb.id, label: mb.label })),
+  });
+});
+
+on("GET", "/api/guests/:id/whatsapp", ({ params, query }) => {
+  const db = getDb();
+  const guest = db.guests.find((g) => g.id === params.id);
+  const { items, nextCursor } = pageThread(db.messages, params.id, "whatsapp", {
+    cursor: query.get("cursor"),
+  });
+  const connected = db.whatsappNumbers.filter((n) => n.status === "connected");
+  const numberOptions = connected.map((n) => ({
+    id: n.id,
+    label: n.label,
+    phoneNumber: n.phoneNumber,
+    isDefault: n.isDefault,
+    instanceName: n.instanceName,
+  }));
+  // Messages store the number's instanceName in mailboxId, so the thread's
+  // last message tells us which line this conversation already lives on.
+  const lastMailboxId = db.messages
+    .filter((m) => m.guestId === params.id && m.channel === "whatsapp")
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0]?.mailboxId;
+  const me = currentUser();
+  return ok({
+    items,
+    nextCursor,
+    guestPhone: guest?.phone ?? null,
+    canSend: Boolean(guest?.phone) && numberOptions.length > 0 && me.role !== "VIEWER",
+    numberOptions,
+    suggestedNumberId: connected.find((n) => n.instanceName === lastMailboxId)?.id ?? null,
+    myNumberId: connected.find((n) => n.phoneNumber && n.phoneNumber === me.phone)?.id ?? null,
+  });
+});
+
+// ---- Messages -------------------------------------------------------------
+
+/** Shared body shape for both send endpoints. */
+function sendInput(body: unknown) {
+  const b = (body ?? {}) as Record<string, unknown>;
+  return {
+    guestId: typeof b.guestId === "string" ? b.guestId : null,
+    enquiryId: typeof b.enquiryId === "string" ? b.enquiryId : null,
+    numberId: typeof b.numberId === "string" ? b.numberId : null,
+    subject: typeof b.subject === "string" ? b.subject : null,
+    body: typeof b.body === "string" ? b.body : "",
+    html: typeof b.html === "string" ? b.html : null,
+    attachmentDocumentId:
+      typeof b.attachmentDocumentId === "string" ? b.attachmentDocumentId : null,
+  };
+}
+
+on("POST", "/api/messages/email", ({ body }) => {
+  const input = sendInput(body);
+  const db = getDb();
+  const guest = db.guests.find((g) => g.id === input.guestId);
+  if (!guest) throw new Error("Guest not found");
+  if (!guest.email) throw new Error("This guest has no email address on file.");
+  const lastOutbound = db.messages
+    .filter((m) => m.guestId === guest.id && m.channel === "email" && m.direction === "outbound")
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+  const mailbox = DEMO_MAILBOXES.find((mb) => mb.id === lastOutbound?.mailboxId) ?? DEMO_MAILBOXES[0]!;
+  const msg: DemoMessage = {
+    id: newId("msg"),
+    guestId: guest.id,
+    enquiryId: input.enquiryId,
+    mailboxId: mailbox.id,
+    channel: "email",
+    direction: "outbound",
+    subject: input.subject ?? `Re: Your enquiry with Meridian Wellness`,
+    body: input.body,
+    bodyHtml: input.html,
+    fromEmail: mailbox.address,
+    toEmail: guest.email,
+    status: "sent",
+    needsReview: false,
+    fromLabel: mailbox.label,
+    editedAt: null,
+    deletedAt: null,
+    attachment: lookupUpload(input.attachmentDocumentId),
+    createdAt: nowIso(),
+  };
+  mutateDb((d) => {
+    d.messages.push(msg);
+  });
+  return ok(toMessageDTO(msg));
+});
+
+on("POST", "/api/messages/whatsapp", ({ body }) => {
+  const input = sendInput(body);
+  const db = getDb();
+  const guest = db.guests.find((g) => g.id === input.guestId);
+  if (!guest) throw new Error("Guest not found");
+  if (!guest.phone) throw new Error("This guest has no phone number on file.");
+  const number =
+    db.whatsappNumbers.find((n) => n.id === input.numberId) ??
+    db.whatsappNumbers.find((n) => n.isDefault && n.status === "connected");
+  if (!number) throw new Error("No connected WhatsApp number to send from.");
+  const msg: DemoMessage = {
+    id: newId("msg"),
+    guestId: guest.id,
+    enquiryId: input.enquiryId,
+    mailboxId: number.instanceName,
+    channel: "whatsapp",
+    direction: "outbound",
+    subject: null,
+    body: input.body,
+    bodyHtml: null,
+    fromEmail: null,
+    toEmail: null,
+    status: "sent",
+    needsReview: false,
+    fromLabel: number.label,
+    editedAt: null,
+    deletedAt: null,
+    attachment: lookupUpload(input.attachmentDocumentId),
+    createdAt: nowIso(),
+  };
+  mutateDb((d) => {
+    d.messages.push(msg);
+  });
+  return ok(toMessageDTO(msg));
+});
+
+on("PATCH", "/api/messages/:id", ({ params, body }) => {
+  const text = String((body as Record<string, unknown>)?.body ?? "").trim();
+  if (!text) throw new Error("Message body can't be empty.");
+  const editedAt = nowIso();
+  mutateDb((d) => {
+    const m = d.messages.find((x) => x.id === params.id);
+    if (m) {
+      m.body = text;
+      m.editedAt = editedAt;
+    }
+  });
+  return ok({ id: params.id, body: text, editedAt });
+});
+
+on("DELETE", "/api/messages/:id", ({ params }) => {
+  const deletedAt = nowIso();
+  mutateDb((d) => {
+    const m = d.messages.find((x) => x.id === params.id);
+    if (m) m.deletedAt = deletedAt;
+  });
+  return ok({ id: params.id, deletedAt });
 });
 
 // ---- Tasks --------------------------------------------------------------
@@ -1100,6 +1321,48 @@ on("GET", "/api/files/meta", () => {
   return ok({ readable: ["operational", "marketing", "medical", "consent"], uploadable });
 });
 on("GET", "/api/files", () => ok([]));
+
+/**
+ * Uploads pending a `/api/files/confirm`, keyed by storage key. Deliberately
+ * in-memory (not in the persisted store): the browser never uploads bytes
+ * anywhere in demo mode, so there's nothing worth surviving a reload — only
+ * the confirmed metadata, which gets denormalised onto the message instead.
+ */
+const pendingUploads = new Map<string, { filename: string; mimeType: string }>();
+const confirmedUploads = new Map<string, { id: string; filename: string; mimeType: string }>();
+
+function lookupUpload(id: string | null) {
+  return id ? confirmedUploads.get(id) ?? null : null;
+}
+
+on("POST", "/api/files/upload-url", ({ body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const storageKey = newId("demo-upload");
+  pendingUploads.set(storageKey, {
+    filename: String(b.filename ?? "attachment"),
+    mimeType: String(b.mimeType ?? "application/octet-stream"),
+  });
+  // Points back at /api/** on purpose so the fetch interceptor swallows the
+  // PUT instead of it escaping to a storage bucket that doesn't exist here.
+  return ok({ url: `/api/files/demo-put/${storageKey}`, storageKey });
+});
+
+// The presigned PUT itself — the body is the raw File, which we discard.
+on("PUT", "/api/files/demo-put/:storageKey", () => ok({ success: true }));
+
+on("POST", "/api/files/confirm", ({ body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const storageKey = String(b.storageKey ?? "");
+  const pending = pendingUploads.get(storageKey);
+  pendingUploads.delete(storageKey);
+  const doc = {
+    id: newId("doc"),
+    filename: String(b.filename ?? pending?.filename ?? "attachment"),
+    mimeType: String(b.mimeType ?? pending?.mimeType ?? "application/octet-stream"),
+  };
+  confirmedUploads.set(doc.id, doc);
+  return ok(doc);
+});
 
 // ---------------------------------------------------------------------------
 // Dispatch
