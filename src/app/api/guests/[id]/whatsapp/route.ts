@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { handle, ok, requireSession, ApiError } from "@/lib/api";
 import { can } from "@/lib/rbac";
 import { prisma } from "@/lib/prisma";
-import { toMessageDTO } from "@/lib/messages";
+import { toMessageDTO, resolveReplyTargets } from "@/lib/messages";
 import { resolveMyWhatsAppNumberId } from "@/lib/whatsapp";
 
 export const dynamic = "force-dynamic";
@@ -53,9 +53,15 @@ export async function GET(
     const labelByInstance = new Map(allNumbers.map((n) => [n.instanceName, n.label]));
 
     const hasMore = rows.length > PAGE;
-    const items = rows
-      .slice(0, PAGE)
-      .map((m) => toMessageDTO(m, m.direction === "outbound" ? labelByInstance.get(m.mailboxId) ?? null : null));
+    const page = rows.slice(0, PAGE);
+    const replyTargets = await resolveReplyTargets(page);
+    const items = page.map((m) =>
+      toMessageDTO(
+        m,
+        m.direction === "outbound" ? labelByInstance.get(m.mailboxId) ?? null : null,
+        m.inReplyTo ? replyTargets.get(m.inReplyTo) ?? null : null,
+      ),
+    );
     const nextCursor = hasMore ? rows[PAGE - 1].createdAt.toISOString() : null;
 
     // Not shared: taken out of the staff-facing pool by an admin, but its

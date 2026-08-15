@@ -36,6 +36,61 @@ require_docker() {
   docker info >/dev/null 2>&1 || die "Docker daemon is not running. Start Docker Desktop and retry."
 }
 
+# ---- disk ------------------------------------------------------------------
+# Docker's build cache grows by gigabytes per image build and is never
+# reclaimed on its own. On the live box (an 88G root shared with Postgres and
+# MinIO) it reached 8.3GB and filled the disk completely: a deploy died
+# mid-build with "no space left on device", and Postgres was left sitting at
+# zero bytes free — which is how a slow leak turns into lost writes.
+#
+# `--min-free-space` trims only as much cache as it takes to reach the target,
+# so a box with room keeps its cache (and its fast incremental builds) while a
+# tight one is cleared just enough to build. Nothing else is touched: images,
+# containers and volumes are all left alone.
+PRUNE_MIN_FREE_GB="${PRUNE_MIN_FREE_GB:-10}"
+
+# Free GB on the filesystem holding Docker's data root — not necessarily "/".
+docker_free_gb() {
+  local root
+  root="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)"
+  df -PBG "$root" 2>/dev/null | awk 'NR==2 { gsub("G","",$4); print $4+0 }'
+}
+
+# Called before an image build. Safe to run every time: a no-op on a box that
+# already has headroom.
+prune_build_cache() {
+  local before after
+  before="$(docker_free_gb)"
+  if [ -z "$before" ]; then
+    warn "Couldn't read free disk space — skipping the build-cache check."
+    return 0
+  fi
+  if [ "$before" -ge "$PRUNE_MIN_FREE_GB" ]; then
+    info "disk: ${before}G free (>= ${PRUNE_MIN_FREE_GB}G) — keeping the build cache"
+    return 0
+  fi
+
+  warn "disk: only ${before}G free — reclaiming Docker space to reach ${PRUNE_MIN_FREE_GB}G"
+  # -a matters: without it BuildKit treats the cache from recent builds as
+  # "in use" and reclaims nothing. On the live box a plain prune freed 0B
+  # twice at 95% full, while `-af` immediately returned 5.6GB. The cost is a
+  # cold first build afterwards, which is the right trade for a box that
+  # would otherwise fail the build outright.
+  # Never fatal: a failed prune shouldn't stop a deploy that might still fit.
+  docker builder prune -af --min-free-space "${PRUNE_MIN_FREE_GB}GB" >/dev/null 2>&1 \
+    || warn "build-cache prune failed — continuing anyway"
+  # Dangling images too: every rebuild leaves the previous, now-untagged app
+  # image behind, and those accumulate quietly. `image prune` without -a only
+  # removes untagged images nothing references, so a tagged or running image
+  # is never at risk.
+  docker image prune -f >/dev/null 2>&1 \
+    || warn "dangling-image prune failed — continuing anyway"
+  after="$(docker_free_gb)"
+  log "disk: ${before}G -> ${after}G free"
+  [ "${after:-0}" -ge 3 ] \
+    || warn "Still under 3G free. The build may fail — free space on this host (df -h /)."
+}
+
 ensure_env() {
   if [ ! -f .env ]; then
     warn ".env not found — creating it from .env.example (review the secrets!)."

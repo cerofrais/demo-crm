@@ -41,6 +41,21 @@ export function tagCategory(value: string): TagCategory {
   return "custom";
 }
 
+/**
+ * The package a guest asked about on the enquiry form ("Package Preference:
+ * Mini Detox" → "mini-detox").
+ *
+ * A PLAIN custom slug, deliberately un-namespaced. Staff had already been
+ * tagging leads "mini-detox" / "wellness-experience" / "major-detox" by hand
+ * long before this was automated, so minting a parallel "package:mini-detox"
+ * put two identically-labelled chips in the tag picker for the same thing.
+ * Using the slug staff already use means the automation and a human land on
+ * one shared tag, which is also what makes filtering by it work.
+ */
+export function packageTag(preference: string): string | null {
+  return slugifyTag(preference) || null;
+}
+
 /** Normalise a user-entered custom tag into a safe slug. */
 export function slugifyTag(input: string): string {
   return input
@@ -169,7 +184,9 @@ export function formatTag(value: string): FormattedTag {
 }
 
 /** Sort tags for display: blocked first (most important to notice), then
- *  age → revisit → source → campaign → custom, alpha within. */
+ *  age → revisit → source → campaign → custom, alpha within.
+ *  Every category must appear here — indexOf returns -1 for a missing one,
+ *  which would silently sort it ahead of "blocked". */
 export function sortTags(values: string[]): string[] {
   const order: TagCategory[] = ["blocked", "age", "revisit", "foreign", "source", "campaign", "custom"];
   return [...values].sort((a, b) => {

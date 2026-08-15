@@ -37,7 +37,14 @@ export async function POST(
         enquiryId: params.id,
         title,
         dueAt,
-        assignedToSub: ctx.sub,
+        // The lead's OWNER owns the follow-up, not whoever typed it. An Admin
+        // or Manager adding a task on someone else's lead is asking that
+        // person to do it — assigning it to the creator instead put the work
+        // in the wrong queue and left the owner unaware of it.
+        // Falls back to the creator when the lead is unassigned, so a task on
+        // an orphan lead still belongs to somebody.
+        assignedToSub: enquiry.assignedToSub ?? ctx.sub,
+        // Who asked for it stays recorded, and the card shows it.
         createdBy: ctx.sub,
       },
     });

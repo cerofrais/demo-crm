@@ -26,6 +26,13 @@ DEFAULT_LANGUAGE = os.environ.get("ASR_LANGUAGE", "te")
 DEFAULT_DECODING = os.environ.get("ASR_DECODING", "rnnt")  # "rnnt" (accurate) | "ctc" (fast)
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
 
+# Windowed decoding — see the chunking loop in transcribe(). 25s sits inside
+# the model's trained utterance length; the overlap keeps a word that straddles
+# a boundary from being clipped out of both neighbouring windows.
+CHUNK_SECONDS = float(os.environ.get("ASR_CHUNK_SECONDS", "25"))
+CHUNK_OVERLAP_SECONDS = float(os.environ.get("ASR_CHUNK_OVERLAP_SECONDS", "2"))
+MIN_CHUNK_SECONDS = float(os.environ.get("ASR_MIN_CHUNK_SECONDS", "1"))
+
 # The model's 22 supported Indian-language codes — English is not among them.
 SUPPORTED_LANGUAGES = {
     "as", "bn", "brx", "doi", "gu", "hi", "kn", "kok", "ks", "mai", "ml",
@@ -78,19 +85,40 @@ async def transcribe(
         except RuntimeError as err:
             raise HTTPException(422, str(err))
 
-        audio, _sr = sf.read(wav_path, dtype="float32")
+        audio, sr = sf.read(wav_path, dtype="float32")
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
-        wav = torch.from_numpy(audio).unsqueeze(0)
 
+        # IndicConformer is trained on utterance-length audio. Handing it a
+        # whole call in one forward pass does not error — it silently returns
+        # an EMPTY string, which is how multi-minute recordings ended up with
+        # no transcript at all. Decode in windows and stitch the pieces.
+        window = int(CHUNK_SECONDS * sr)
+        overlap = int(CHUNK_OVERLAP_SECONDS * sr)
+        step = max(window - overlap, 1)
+        total = len(audio)
+
+        pieces: list[str] = []
         try:
-            result = _model(wav, lang, DEFAULT_DECODING)
+            for start in range(0, max(total, 1), step):
+                segment = audio[start : start + window]
+                # Conformer needs a minimum span to produce anything; a sub-second
+                # tail is silence-padding at the end of the call, not speech.
+                if len(segment) < sr * MIN_CHUNK_SECONDS:
+                    break
+                wav = torch.from_numpy(segment).unsqueeze(0)
+                result = _model(wav, lang, DEFAULT_DECODING)
+                piece = result[0] if isinstance(result, (list, tuple)) else result
+                piece = str(piece).strip()
+                if piece:
+                    pieces.append(piece)
         except Exception as err:  # noqa: BLE001 — surface any inference failure as a 500
             logger.exception("inference failed")
             raise HTTPException(500, f"ASR inference failed: {err}")
 
-    text = result[0] if isinstance(result, (list, tuple)) else result
-    return JSONResponse({"text": str(text).strip()})
+    text = " ".join(pieces).strip()
+    logger.info("decoded %d chunk(s), %d chars, lang=%s", len(pieces), len(text), lang)
+    return JSONResponse({"text": text})
 
 
 @app.get("/health")

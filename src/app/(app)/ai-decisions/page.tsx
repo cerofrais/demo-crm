@@ -1,9 +1,13 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { ShieldCheck, ShieldAlert, RefreshCw, CheckCircle2, XCircle, Filter, Loader2 } from "lucide-react";
+import {
+  ShieldCheck, ShieldAlert, RefreshCw, CheckCircle2, XCircle, Filter, Loader2,
+  MessageSquareQuote,
+} from "lucide-react";
 import { PageHeader } from "@/components/app/page-header";
-import { Card, Badge, Button, Select, Sheet } from "@/components/ui";
+import { Card, Badge, Button, Select, Sheet, ScrollableTabs, type TabItem } from "@/components/ui";
+import { InboundQuestions } from "@/components/ai-decisions/inbound-questions";
 import { api } from "@/lib/client";
 import { cn, formatIST } from "@/lib/utils";
 import type { AiDecisionListItemDTO, AiDecisionDetailDTO } from "@/lib/ai-decisions";
@@ -24,6 +28,11 @@ const KIND_COLOR: Record<string, string> = {
   transcript_translation: "bg-teal-100 text-teal-800",
 };
 
+const TABS: TabItem[] = [
+  { key: "decisions", label: "Decision log", icon: <ShieldCheck className="h-3.5 w-3.5" /> },
+  { key: "inbound", label: "Inbound questions", icon: <MessageSquareQuote className="h-3.5 w-3.5" /> },
+];
+
 function fmtDuration(ms: number | null): string {
   if (ms === null) return "—";
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
@@ -40,6 +49,7 @@ export default function AiDecisionsPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [tab, setTab] = useState("decisions");
 
   const load = useCallback(async (cursor?: string) => {
     setLoading(true);
@@ -93,6 +103,19 @@ export default function AiDecisionsPage() {
         title="AI Audit"
         subtitle="Every AI/ML decision the system has made — exact prompt sent, exact output received. Admin only."
       />
+
+      <div className="px-4 pt-4 md:px-6">
+        <ScrollableTabs
+          tabs={TABS}
+          active={tab}
+          onChange={setTab}
+        />
+      </div>
+
+      {tab === "inbound" ? (
+        <InboundQuestions />
+      ) : (
+      <>
 
       {stats && (
         <div className="grid grid-cols-3 gap-3 p-4 pb-0 md:p-6 md:pb-0">
@@ -275,6 +298,8 @@ export default function AiDecisionsPage() {
               ) : null}
             </div>
       </Sheet>
+      </>
+      )}
     </div>
   );
 }

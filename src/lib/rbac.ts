@@ -39,6 +39,7 @@ export type Permission =
   | "guests.delete" // delete a guest record — admin only
   | "health.view"
   | "messaging.send"
+  | "messaging.broadcast" // mass-send: broadcasts + bulk email to the guest directory
   | "documents.medical"
   | "documents.operational"
   | "packages.manage"
@@ -63,6 +64,7 @@ const PERMISSIONS: Record<AppRole, Permission[]> = {
     "leads.manage",
     "health.view",
     "messaging.send",
+    "messaging.broadcast",
     "documents.medical",
     "documents.operational",
     "packages.manage",
@@ -81,6 +83,7 @@ const PERMISSIONS: Record<AppRole, Permission[]> = {
     "guests.view",
     "leads.manage",
     "messaging.send",
+    "messaging.broadcast",
     "documents.operational",
     "packages.manage",
     "referrals.manage",
@@ -102,12 +105,14 @@ const PERMISSIONS: Record<AppRole, Permission[]> = {
     // click-to-call, message edit/delete, and the template picker in line
     // with that same precedent instead of leaving them WhatsApp-only gaps.
     "messaging.send",
+    "messaging.broadcast",
   ],
   RECEPTION: [
     "leads.view",
     "guests.view",
     "leads.ownOnly",
     "messaging.send",
+    "messaging.broadcast",
     "documents.operational",
     "reports.own",
   ],
@@ -124,10 +129,16 @@ const PERMISSIONS: Record<AppRole, Permission[]> = {
     "leads.ownOnly",
     "leads.preBookingOnly",
     "messaging.send",
+    "messaging.broadcast",
     "documents.operational",
     "reports.own",
   ],
-  STAFF: ["leads.view", "guests.view", "documents.operational"],
+  // Read-only on the pipeline (no leads.manage/ownOnly, so canMutateLeads is
+  // false), but it can reach out to an individual guest — email, WhatsApp,
+  // click-to-call. Deliberately WITHOUT messaging.broadcast: replying to one
+  // guest and mass-mailing the entire directory are very different powers,
+  // and only the first was asked for.
+  STAFF: ["leads.view", "guests.view", "documents.operational", "messaging.send"],
   // Read-only across almost the whole app — every ".view" permission that
   // exists, none of the ".manage"/"ownOnly"/"delete"/"send" ones. Deliberately
   // excludes health.view/documents.medical (no Health Records access) per the
@@ -148,6 +159,26 @@ const PERMISSIONS: Record<AppRole, Permission[]> = {
     "templates.view",
   ],
 };
+
+/**
+ * The permissions a single role grants, for display. `can()` remains the only
+ * thing that should ever be used to make an access decision — this is a copy
+ * so a caller can't mutate the table that authorization reads from.
+ */
+export function permissionsFor(role: AppRole): Permission[] {
+  return [...(PERMISSIONS[role] ?? [])];
+}
+
+/** Every role in the system, in the order the permissions matrix shows them. */
+export const ALL_ROLES: AppRole[] = [
+  "ADMIN",
+  "MANAGER",
+  "DOCTOR",
+  "RECEPTION",
+  "SALES",
+  "STAFF",
+  "VIEWER",
+];
 
 export function can(roles: AppRole[], perm: Permission): boolean {
   return roles.some((r) => PERMISSIONS[r]?.includes(perm));
@@ -243,8 +274,10 @@ export const NAV: NavItem[] = [
   { href: "/reports", label: "Reports", icon: "BarChart3", perm: "reports.own" },
   { href: "/calls", label: "Calls", icon: "Phone", perm: "reports.allStaff" },
   { href: "/activity", label: "Activity Log", icon: "History", perm: "reports.allStaff" },
+  { href: "/deleted", label: "Deleted Leads", icon: "Trash2", perm: "leads.delete" },
   { href: "/ai-decisions", label: "AI Audit", icon: "ShieldCheck", perm: "ai.audit" },
   { href: "/users", label: "Users", icon: "UserCog", perm: ["users.manage", "users.view"] },
+  { href: "/permissions", label: "Permissions", icon: "ShieldCheck", perm: "users.manage" },
   { href: "/whatsapp-numbers", label: "WhatsApp Numbers", icon: "MessageCircle", perm: ["whatsapp.manage", "whatsapp.view"] },
   { href: "/autoreplies", label: "Auto-Reply", icon: "Bot", perm: ["whatsapp.manage", "whatsapp.view"] },
   { href: "/broadcast-status", label: "Broadcast Status", icon: "Send", perm: "messaging.send" },
@@ -310,7 +343,15 @@ export const ROUTE_GUARDS: Array<{ prefix: string; perm: Permission | Permission
   { prefix: "/referrals", perm: ["referrals.manage", "referrals.view"] },
   { prefix: "/ai-decisions", perm: "ai.audit" },
   { prefix: "/activity", perm: "reports.allStaff" },
+  // leads.delete is ADMIN-only — a deleted lead's archive carries its full
+  // message and call history, so this is deliberately narrower than the
+  // Activity Log's reports.allStaff (which MANAGER also holds).
+  { prefix: "/deleted", perm: "leads.delete" },
   { prefix: "/users", perm: ["users.manage", "users.view"] },
+  // users.manage only (ADMIN) — VIEWER holds users.view and can see the staff
+  // list, but this page also spells out every sensitive capability in the
+  // system and lets roles be reassigned.
+  { prefix: "/permissions", perm: "users.manage" },
   { prefix: "/whatsapp-numbers", perm: ["whatsapp.manage", "whatsapp.view"] },
   { prefix: "/autoreplies", perm: ["whatsapp.manage", "whatsapp.view"] },
   { prefix: "/broadcast-status", perm: "messaging.send" },

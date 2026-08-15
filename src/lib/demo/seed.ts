@@ -16,6 +16,9 @@ import type {
   DemoAutoReply,
   DemoMessageTemplate,
   DemoBroadcastJob,
+  DemoDocument,
+  DemoCampaignRule,
+  DemoMarketingReport,
   EnquiryStage,
 } from "./types";
 
@@ -81,6 +84,10 @@ const CAMPAIGNS = [
   "Post-Surgery Recovery", "Immunity Boost Camp", "Ayurveda for Seniors", "Couples Wellness Escape",
 ];
 const SOURCES = ["website_form", "whatsapp", "instagram", "facebook", "referral", "walk_in", "phone", "email", "google_sheets"];
+const PREFERRED_CHECKINS = [
+  "First week of September", "Mid-October", "Second week of November",
+  "Any weekend in December", "After Diwali", "Early January", "Flexible — whenever there's availability",
+];
 const STAGE_ORDER: EnquiryStage[] = [
   "new_lead", "contacted", "rnr", "qualified", "pricing_shared",
   "doctor_consultation", "payment_received", "booking_confirmed", "converted", "staff", "lost",
@@ -280,6 +287,11 @@ export function generateSeed(): DemoData {
         doctorDecisionAt: null,
         doctorDecisionNote: null,
         lostRequestPending: stage !== "lost" && r() < 0.05,
+        preferredCheckIn: r() < 0.45 ? pick(r, PREFERRED_CHECKINS) : null,
+        // ~7% of leads are archived. Seeded here rather than as a separate
+        // pass so the deleted lead keeps the full history (notes, messages,
+        // calls, tasks) the Deleted page is built to show.
+        deletedAt: r() < 0.07 ? daysAgo(intBetween(r, 1, 40), r) : null,
         lastActivityAt,
         createdAt: enqCreatedAt,
         updatedAt: lastActivityAt,
@@ -564,8 +576,77 @@ export function generateSeed(): DemoData {
     { id: uid("bcast"), status: "running", message: "🎉 Diwali Special: 14-Day Wellness Reset at a special festive price.", numberId: whatsappNumbers[0]!.id, totalCount: 210, sentCount: 134, failedCount: 2, createdAt: daysAgo(0, r), completedAt: null, deletedAt: null },
   ];
 
+  // ---- Resources library ---------------------------------------------------
+  // A mix of general collateral (what the composer's attachment picker offers
+  // for reuse) and a few guest-scoped files, so the Documents tab isn't empty.
+  const documents: DemoDocument[] = [
+    { id: uid("doc"), filename: "Meridian-Wellness-Brochure-2026.pdf", mimeType: "application/pdf", sizeBytes: 2_845_120, category: "marketing", guestId: null, enquiryId: null, uploadedBySub: "demo-admin", createdAt: daysAgo(120, r) },
+    { id: uid("doc"), filename: "Package-Pricing-Sheet.pdf", mimeType: "application/pdf", sizeBytes: 486_300, category: "marketing", guestId: null, enquiryId: null, uploadedBySub: "demo-manager", createdAt: daysAgo(95, r) },
+    { id: uid("doc"), filename: "Panchakarma-Programme-Schedule.pdf", mimeType: "application/pdf", sizeBytes: 731_400, category: "operational", guestId: null, enquiryId: null, uploadedBySub: "demo-manager", createdAt: daysAgo(88, r) },
+    { id: uid("doc"), filename: "Daily-Diet-Plan-Sample.pdf", mimeType: "application/pdf", sizeBytes: 312_900, category: "operational", guestId: null, enquiryId: null, uploadedBySub: "demo-doctor", createdAt: daysAgo(70, r) },
+    { id: uid("doc"), filename: "Retreat-Photos-Gallery.jpg", mimeType: "image/jpeg", sizeBytes: 1_204_800, category: "marketing", guestId: null, enquiryId: null, uploadedBySub: "demo-admin", createdAt: daysAgo(64, r) },
+    { id: uid("doc"), filename: "Consent-Form-Template.pdf", mimeType: "application/pdf", sizeBytes: 198_700, category: "consent", guestId: null, enquiryId: null, uploadedBySub: "demo-doctor", createdAt: daysAgo(150, r) },
+    { id: uid("doc"), filename: "Travel-and-Directions.pdf", mimeType: "application/pdf", sizeBytes: 254_100, category: "operational", guestId: null, enquiryId: null, uploadedBySub: "demo-reception", createdAt: daysAgo(45, r) },
+    { id: uid("doc"), filename: "Corporate-Wellness-Deck.pdf", mimeType: "application/pdf", sizeBytes: 3_920_400, category: "marketing", guestId: null, enquiryId: null, uploadedBySub: "demo-manager", createdAt: daysAgo(30, r) },
+  ];
+  // A handful attached to real guests, so per-guest document lists have content.
+  for (const g of guests.filter(() => r() < 0.12).slice(0, 10)) {
+    documents.push({
+      id: uid("doc"),
+      filename: pick(r, ["Blood-Report.pdf", "Previous-Prescription.pdf", "ID-Proof.jpg", "Signed-Consent.pdf"]),
+      mimeType: r() < 0.3 ? "image/jpeg" : "application/pdf",
+      sizeBytes: intBetween(r, 120_000, 2_400_000),
+      category: pick(r, ["medical", "consent", "operational"] as const),
+      guestId: g.id,
+      enquiryId: enquiries.find((e) => e.guestId === g.id)?.id ?? null,
+      uploadedBySub: pick(r, SALES_SUBS),
+      createdAt: daysAgo(intBetween(r, 1, 60), r),
+    });
+  }
+
+  // ---- Campaign-based lead assignment --------------------------------------
+  const campaignRules: DemoCampaignRule[] = [
+    { campaignSlug: "winter-detox-2026", campaignLabel: "Winter Detox 2026", strategy: "round_robin", eligibleSubs: ["demo-sales-1", "demo-sales-2"] },
+    { campaignSlug: "executive-stress-relief", campaignLabel: "Executive Stress Relief", strategy: "least_busy", eligibleSubs: ["demo-sales-1", "demo-reception"] },
+  ];
+
+  // ---- Marketing reports ---------------------------------------------------
+  // One daily CSV per day for the last week, plus a custom-range export.
+  const marketingReports: DemoMarketingReport[] = Array.from({ length: 7 }).map((_, i) => {
+    const day = daysAgo(i + 1, r).slice(0, 10);
+    const rows = intBetween(r, 3, 24);
+    return {
+      id: uid("mrep"),
+      reportDate: day,
+      rangeStart: `${day}T00:00:00.000Z`,
+      rangeEnd: `${day}T23:59:59.999Z`,
+      custom: false,
+      filename: `meridian-marketing-${day}.csv`,
+      rowCount: rows,
+      sizeBytes: rows * 640 + intBetween(r, 200, 900),
+      generatedAt: daysAgo(i, r),
+      emailedAt: i > 0 ? daysAgo(i, r) : null,
+      emailedTo: i > 0 ? "ceo@meridianwellness.demo" : null,
+      emailError: null,
+    };
+  });
+  marketingReports.push({
+    id: uid("mrep"),
+    reportDate: null,
+    rangeStart: daysAgo(30, r),
+    rangeEnd: daysAgo(1, r),
+    custom: true,
+    filename: "meridian-marketing-custom-range.csv",
+    rowCount: 148,
+    sizeBytes: 96_400,
+    generatedAt: daysAgo(1, r),
+    emailedAt: null,
+    emailedTo: null,
+    emailError: null,
+  });
+
   return {
-    version: 2,
+    version: 3,
     users: DEMO_USERS,
     guests,
     enquiries,
@@ -582,5 +663,8 @@ export function generateSeed(): DemoData {
     autoReplies,
     messageTemplates,
     broadcastJobs,
+    documents,
+    campaignRules,
+    marketingReports,
   };
 }

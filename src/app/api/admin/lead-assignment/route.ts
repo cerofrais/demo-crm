@@ -1,5 +1,5 @@
 /**
- * GET   /api/admin/lead-assignment — read all three channels' settings.
+ * GET   /api/admin/lead-assignment — read all channels' settings.
  * PATCH /api/admin/lead-assignment — set one channel's strategy + eligible staff.
  */
 import { NextRequest } from "next/server";
@@ -9,8 +9,11 @@ import { getAllLeadAssignmentSettings, setLeadAssignmentSettings } from "@/lib/l
 
 export const dynamic = "force-dynamic";
 
+// Keep in sync with LEAD_ASSIGNMENT_CATEGORIES in lib/lead-assignment.ts —
+// this fell out of sync when "google_sheets" was added there, which broke
+// saving that category's settings from the admin page.
 const patchSchema = z.object({
-  category: z.enum(["whatsapp", "email", "call"]),
+  category: z.enum(["whatsapp", "email", "call", "google_sheets"]),
   strategy: z.enum(["round_robin", "least_busy"]),
   eligibleSubs: z.array(z.string()).default([]),
 });

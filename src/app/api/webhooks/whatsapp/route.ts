@@ -37,6 +37,8 @@ import {
   isInternalPhone,
   detectInboundMedia,
   describeInboundMedia,
+  describeNonMediaMessage,
+  quotedMessageId,
   applyWhatsAppStatusUpdate,
   type WaMessageContent,
 } from "@/lib/whatsapp";
@@ -114,8 +116,12 @@ async function handleMessagesUpsert(instanceName: string, data: UpsertData) {
     // already exists (you can't block someone before they're a guest), and
     // this way a blocked guest never gets a Message/Activity row or a
     // needsAttention flip out of an inbound message we're supposed to ignore.
+    // No deletedAt filter: a guest who was blocked and THEN soft-deleted must
+    // stay blocked on the way back in. Scoping this to live guests would let
+    // their next message through and — now that resolveGuestByPhone revives a
+    // soft-deleted guest — quietly un-hide them too.
     const existingByPhone = await prisma.guest.findFirst({
-      where: { phone, deletedAt: null },
+      where: { phone },
       select: { id: true, isBlocked: true },
     });
     if (existingByPhone?.isBlocked) {
@@ -172,8 +178,16 @@ async function handleMessagesUpsert(instanceName: string, data: UpsertData) {
       body = "[Media message — download failed]";
     }
   } else {
-    body = textOnly || "[Unsupported message type]";
+    // Reactions, locations, shared contacts, polls, button/list replies and
+    // friends carry no downloadable media but are perfectly describable —
+    // before this they all collapsed into "[Unsupported message type]".
+    body = textOnly || describeNonMediaMessage(data.message ?? {}) || "[Unsupported message type]";
   }
+
+  // A reply points at the message it quotes. Reuse `inReplyTo` (email uses it
+  // for the RFC Message-ID) to hold the quoted message's WhatsApp id, so the
+  // thread can show what was being replied to.
+  const inReplyTo = quotedMessageId(data.message ?? {});
 
   await prisma.message.create({
     data: {
@@ -186,6 +200,7 @@ async function handleMessagesUpsert(instanceName: string, data: UpsertData) {
       fromEmail: fromMe ? number.phoneNumber : phone,
       toEmail: fromMe ? phone : number.phoneNumber,
       externalId: messageId,
+      inReplyTo,
       attachmentDocumentId,
       status: fromMe ? "sent" : "received",
     },

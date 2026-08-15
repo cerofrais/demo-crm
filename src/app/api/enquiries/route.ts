@@ -24,6 +24,7 @@ export async function GET(req: NextRequest) {
       tag: sp.get("tag") ?? undefined,
       createdFrom: sp.get("from") ?? undefined,
       createdTo: sp.get("to") ?? undefined,
+      rnrDone: sp.get("rnrDone") ?? undefined,
     };
     const assignee = sp.get("assignee");
     if (assignee === "me") filters.assignee = ctx.sub;

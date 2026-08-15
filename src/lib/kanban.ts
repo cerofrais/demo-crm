@@ -29,26 +29,33 @@ export const STAGES: StageDef[] = [
     accent: "bg-brand-400",
     badge: "bg-brand-100 text-brand-800",
   },
+  // These two sit ahead of RNR: a guest who asked for a call back, or one
+  // being actively worked, is further along than the not-reached cycle.
+  //
+  // The ids stay `pricing_shared` / `qualified` — they're a Postgres enum
+  // used by every historical row, the marketing report's classifier and the
+  // stage-permission rules, so renaming them would be a migration plus a
+  // data rewrite for a change that is purely what staff read on the board.
+  {
+    id: "pricing_shared",
+    label: "Call back requested",
+    description: "Guest asked us to call them back — pricing/package already shared",
+    accent: "bg-teal-500",
+    badge: "bg-teal-100 text-teal-800",
+  },
+  {
+    id: "qualified",
+    label: "Pipeline",
+    description: "Being actively worked — interest understood, conversation live",
+    accent: "bg-brand-500",
+    badge: "bg-brand-100 text-brand-800",
+  },
   {
     id: "rnr",
     label: "RNR / Follow-up",
     description: "Responded Not Reached — in the 6-2-1 follow-up cycle",
     accent: "bg-amber-400",
     badge: "bg-amber-100 text-amber-800",
-  },
-  {
-    id: "qualified",
-    label: "Qualified",
-    description: "Spoke to lead — interest understood, interested",
-    accent: "bg-brand-500",
-    badge: "bg-brand-100 text-brand-800",
-  },
-  {
-    id: "pricing_shared",
-    label: "Pricing & Package Shared",
-    description: "Pricing / location / package details sent on WA/email",
-    accent: "bg-teal-500",
-    badge: "bg-teal-100 text-teal-800",
   },
   {
     id: "doctor_consultation",
@@ -59,7 +66,7 @@ export const STAGES: StageDef[] = [
   },
   {
     id: "payment_received",
-    label: "Payment Received",
+    label: "Payment Pending",
     description: "Payment collected — awaiting booking confirmation",
     accent: "bg-cyan-500",
     badge: "bg-cyan-100 text-cyan-800",

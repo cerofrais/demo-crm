@@ -42,9 +42,42 @@ Source of truth: [`src/lib/rbac.ts`](../src/lib/rbac.ts).
 | Message Templates         |  ✅   |   —    |   ✅    |     —     |   —   |   —   |  read  |
 | User management           |  ✅   |   —    |    —    |     —     |   —   |   —   |  read  |
 | WhatsApp number management|  ✅   |   —    |    —    |     —     |   —   |   —   |  read  |
+| Deleted Leads archive     |  ✅   |   —    |    —    |     —     |   —   |   —   |   —    |
+| Permissions page          |  ✅   |   —    |    —    |     —     |   —   |   —   |   —    |
 
 \* Reception/Sales see their **own** leads plus the **unassigned** queue (so
 they can pick up new leads); moving a card assigns it to them.
+
+**Deleted Leads** (`/deleted`, `leads.delete`) is the read-only archive of
+soft-deleted leads — the pipeline hides them, but every child record survives
+(activity trail, email + WhatsApp messages, calls with recordings and
+transcripts, remarks, tasks, documents), including leads removed automatically
+by the lost-lead sweep in `lead-deletion.ts`. It is ADMIN-only and
+deliberately *narrower* than the Activity Log's `reports.allStaff`, which
+MANAGER also holds: the archive replays the full correspondence of a record
+somebody chose to remove. Guarded in `ROUTE_GUARDS` as well as `NAV`, so
+hiding the sidebar link isn't the only thing stopping someone typing the URL.
+Nothing in the feature writes — there is no restore or purge; a HARD delete
+(`guest-delete.ts`) wipes the rows outright and leaves nothing for it to
+find.
+
+**Permissions** (`/permissions`, `users.manage`) is the one-place answer to
+"what can this person actually do". Two views: the full role × permission
+matrix with a plain-English description of each capability, and every staff
+account with the permissions their role grants them. Access is changed by
+changing someone's **role** — permissions are granted per role, not per
+person, and `PERMISSIONS` in `rbac.ts` is a compile-time table that `can()`
+reads directly, so there is no per-user override to edit. The role dropdown
+reuses `PATCH /api/admin/users/:id`, which already refuses a self-role change
+(the guard that stops an admin locking themselves out) and stamps session
+revocation so a change lands on the user's next request rather than their next
+sign-in.
+
+It is `users.manage` (ADMIN) rather than `users.view`: VIEWER can see the
+staff list, but this page enumerates every sensitive capability and can
+reassign roles. Descriptions live in `permissions-catalog.ts`, deliberately
+separate from the authorization table — a test asserts the two stay in sync,
+so a permission added to `rbac.ts` can't silently appear undocumented.
 
 Guests directory is the standalone `/guests` search page, gated by its own
 `guests.view` permission — separate from `leads.view` (which every role

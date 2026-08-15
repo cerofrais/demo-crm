@@ -21,7 +21,7 @@ export async function GET(
   { params }: { params: { id: string } },
 ) {
   return handle(async () => {
-    await requirePermission("messaging.send");
+    await requirePermission("messaging.broadcast");
 
     const job = await prisma.broadcastJob.findFirst({
       where: { id: params.id, deletedAt: null },

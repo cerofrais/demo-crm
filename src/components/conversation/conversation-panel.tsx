@@ -4,9 +4,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Send, ChevronUp, Mail, AlertTriangle, Paperclip, X, Maximize2 } from "lucide-react";
 import { Button, Input, Select, Badge, Dialog, RichTextEditor } from "@/components/ui";
 import { api } from "@/lib/client";
+import { MessageBody } from "@/components/messaging/message-body";
 import { cn, formatIST } from "@/lib/utils";
 import type { MessageDTO } from "@/lib/types";
 import { TemplatePicker } from "@/components/messaging/template-picker";
+import { AttachmentPicker, type AttachmentSelection } from "@/components/messaging/attachment-picker";
 import { personalizeTemplate } from "@/lib/message-templates";
 
 interface ConversationResponse {
@@ -41,10 +43,10 @@ export function ConversationPanel({
   const [subject, setSubject] = useState("");
   const [bodyHtml, setBodyHtml] = useState("");
   const [editorOpen, setEditorOpen] = useState(false);
-  const [attachFile, setAttachFile] = useState<File | null>(null);
+  const [attachment, setAttachment] = useState<AttachmentSelection | null>(null);
+  const [attachNote, setAttachNote] = useState<string | null>(null);
   const [uploadCategory, setUploadCategory] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     api
@@ -158,8 +160,11 @@ export function ConversationPanel({
     setError(null);
     try {
       let attachmentDocumentId: string | undefined;
-      if (attachFile && uploadCategory) {
-        attachmentDocumentId = await uploadDocument(attachFile, uploadCategory);
+      // An existing pick is already a Document — nothing to upload.
+      if (attachment?.kind === "existing") {
+        attachmentDocumentId = attachment.doc.id;
+      } else if (attachment?.kind === "new" && uploadCategory) {
+        attachmentDocumentId = await uploadDocument(attachment.file, uploadCategory);
       }
 
       const last = items[items.length - 1];
@@ -175,8 +180,8 @@ export function ConversationPanel({
       setItems((prev) => [...prev, msg]);
       setBodyHtml("");
       setSubject("");
-      setAttachFile(null);
-      if (fileRef.current) fileRef.current.value = "";
+      setAttachment(null);
+      setAttachNote(null);
       if (msg.status === "failed") setError("The email failed to send. Check mailbox settings.");
       setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }), 50);
     } catch (e) {
@@ -260,7 +265,7 @@ export function ConversationPanel({
                       )}
                     </div>
                     {m.subject && <div className="text-xs font-semibold text-foreground">{m.subject}</div>}
-                    <div className="whitespace-pre-wrap break-words text-foreground">{m.body}</div>
+                    <MessageBody body={m.body} />
                     {m.attachment && (
                       <div className="mt-1 flex items-center gap-1 text-[11px] text-muted-foreground">
                         <Paperclip className="h-3 w-3 shrink-0" />
@@ -291,12 +296,14 @@ export function ConversationPanel({
             placeholder="Subject (optional — defaults to Re: …)"
             className="h-8 shrink-0 text-sm"
           />
-          {attachFile && (
+          {attachment && (
             <div className="flex shrink-0 items-center gap-2 rounded-md border border-border bg-secondary/50 px-2.5 py-1.5 text-xs">
               <Paperclip className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              <span className="truncate">{attachFile.name}</span>
+              <span className="truncate">
+                {attachment.kind === "new" ? attachment.file.name : attachment.doc.filename}
+              </span>
               <button
-                onClick={() => { setAttachFile(null); if (fileRef.current) fileRef.current.value = ""; }}
+                onClick={() => { setAttachment(null); setAttachNote(null); }}
                 className="ml-auto shrink-0 text-muted-foreground hover:text-foreground"
                 title="Remove attachment"
               >
@@ -304,24 +311,21 @@ export function ConversationPanel({
               </button>
             </div>
           )}
+          {attachNote && (
+            <p className="shrink-0 px-0.5 text-[11px] text-muted-foreground">{attachNote}</p>
+          )}
           <div className="flex shrink-0 items-center gap-2">
-            <input
-              ref={fileRef}
-              type="file"
-              className="hidden"
-              onChange={(e) => setAttachFile(e.target.files?.[0] ?? null)}
-            />
             {uploadCategory && (
-              <Button
-                variant="outline"
-                size="icon"
-                onClick={() => fileRef.current?.click()}
-                disabled={sending}
-                title="Attach a file"
-                type="button"
-              >
-                <Paperclip className="h-4 w-4" />
-              </Button>
+              <AttachmentPicker
+                guestId={guestId}
+                openUpward
+                disabled={sending || Boolean(attachment)}
+                title="Attach from Resources, or upload a new file"
+                onSelect={(sel, note) => {
+                  setAttachment(sel);
+                  setAttachNote(note ?? null);
+                }}
+              />
             )}
             <TemplatePicker
               channel="email"

@@ -8,7 +8,7 @@ export default async function BroadcastStatusPage() {
   const session = await auth();
   if (!session?.user) redirect("/login");
   const roles = session.roles ?? [];
-  if (!can(roles, "messaging.send")) redirect("/leads");
+  if (!can(roles, "messaging.broadcast")) redirect("/leads");
   const canDelete = can(roles, "leads.manage");
 
   return (

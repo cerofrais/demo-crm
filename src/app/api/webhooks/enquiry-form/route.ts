@@ -4,6 +4,7 @@ import { env } from "@/lib/env";
 import { logger } from "@/lib/logger";
 import { createEnquiry } from "@/lib/enquiry-service";
 import { enquiryWebhookSchema } from "@/lib/validation";
+import { packageTag } from "@/lib/lead-tags";
 import { redis } from "@/lib/redis";
 import { rateLimit, rateLimitResponse } from "@/lib/rate-limit";
 
@@ -103,8 +104,14 @@ export async function POST(req: NextRequest) {
 
   try {
     const input = enquiryWebhookSchema.parse(JSON.parse(raw));
+    const pkgTag = input.packagePreference ? packageTag(input.packagePreference) : null;
     const result = await createEnquiry(
-      { ...input, note: input.intakeNotes ?? input.message, externalRef: idem },
+      {
+        ...input,
+        note: input.intakeNotes ?? input.message,
+        enquiryTags: pkgTag ? [pkgTag] : undefined,
+        externalRef: idem,
+      },
       null, // inbound: unassigned, picked up on the board
     );
     logger.info(

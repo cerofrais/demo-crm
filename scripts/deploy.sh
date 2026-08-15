@@ -15,6 +15,10 @@
 #   --no-migrate   skip running migrations (infra target only)
 #
 # Notes:
+#   • Before any image build, Docker's build cache is trimmed if free disk has
+#     dropped below PRUNE_MIN_FREE_GB (default 10). A cache left to grow filled
+#     the live box's root and failed a deploy mid-build; a box with headroom is
+#     untouched and keeps its fast incremental builds.
 #   • The app container runs `prisma migrate deploy` on startup (entrypoint.sh),
 #     so 'all'/'app' deploys migrate themselves. 'infra' runs migrations for you
 #     (host npm if available, otherwise a one-off container).
@@ -39,12 +43,13 @@ ensure_env
 
 deploy_all() {
   hr "Deploy: ALL (infra + app)"
-  $DO_BUILD && { log "Building app image…"; compose build "$APP_SERVICE"; }
+  $DO_BUILD && { prune_build_cache; log "Building app image…"; compose build "$APP_SERVICE"; }
   log "Starting backing services…"
   compose up -d "${INFRA_SERVICES[@]}"
   wait_healthy postgres
   wait_healthy redis
   log "Starting app (migrations run on container start)…"
+  prune_build_cache
   compose --profile app up -d --build "$APP_SERVICE"
   wait_http_health || compose logs --tail 30 "$APP_SERVICE"
   if [ -n "${NGROK_AUTHTOKEN:-}" ] && [ -n "${NGROK_DOMAIN:-}" ]; then
@@ -68,7 +73,7 @@ deploy_infra() {
 
 deploy_app() {
   hr "Deploy: APP"
-  $DO_BUILD && { log "Building app image…"; compose build "$APP_SERVICE"; }
+  $DO_BUILD && { prune_build_cache; log "Building app image…"; compose build "$APP_SERVICE"; }
   log "Starting app + its dependencies…"
   compose --profile app up -d "$APP_SERVICE"
   wait_http_health || compose logs --tail 30 "$APP_SERVICE"

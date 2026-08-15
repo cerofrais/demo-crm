@@ -104,7 +104,32 @@ export async function uploadMedia(
   return { mediaId: data.id };
 }
 
-/** Sends an approved template message. `to` is E.164 (with +); converted internally. */
+/**
+ * Whether marketing templates should go out over the Marketing Messages API
+ * (MM Lite) instead of the Cloud API. Kill switch: unset/false keeps every
+ * send on the Cloud API path, so this can be turned off without a deploy if
+ * delivery gets worse rather than better.
+ */
+export function marketingApiEnabled(): boolean {
+  return process.env.WHATSAPP_MM_API_ENABLED === "true";
+}
+
+/**
+ * Sends an approved template message. `to` is E.164 (with +); converted
+ * internally.
+ *
+ * `viaMarketingApi` switches the send to Meta's Marketing Messages API
+ * (formerly MM Lite): the same request body, posted to `/marketing_messages`
+ * instead of `/messages` on the same phone number id. That path runs the send
+ * through Meta's engagement ranking — the same gate that rejects Cloud API
+ * marketing sends with error 131049 ("in order to maintain a healthy
+ * ecosystem engagement…"), which is the overwhelming majority of this
+ * deployment's broadcast failures.
+ *
+ * Only MARKETING templates may use it; Meta rejects utility, authentication
+ * and service templates on that endpoint, so the caller must check the
+ * category first.
+ */
 export async function sendTemplateMessage(
   phoneNumberId: string,
   accessToken: string,
@@ -112,12 +137,17 @@ export async function sendTemplateMessage(
   templateName: string,
   languageCode: string,
   components?: TemplateSendComponent[],
+  viaMarketingApi = false,
 ): Promise<{ externalId: string | null }> {
-  const url = `${META_GRAPH_BASE}/${META_GRAPH_VERSION}/${phoneNumberId}/messages`;
+  const endpoint = viaMarketingApi ? "marketing_messages" : "messages";
+  const url = `${META_GRAPH_BASE}/${META_GRAPH_VERSION}/${phoneNumberId}/${endpoint}`;
   const res = await metaFetchOk(url, accessToken, {
     method: "POST",
     body: JSON.stringify({
       messaging_product: "whatsapp",
+      // Required by /marketing_messages and accepted (ignored) by /messages,
+      // so it's sent unconditionally rather than branching the body shape.
+      recipient_type: "individual",
       to: to.replace(/^\+/, ""),
       type: "template",
       template: {
@@ -129,6 +159,9 @@ export async function sendTemplateMessage(
   });
   const data = await res.json();
   const externalId: string | null = data?.messages?.[0]?.id ?? null;
-  logger.info({ phoneNumberId, templateName, externalId }, "whatsapp cloud api: template sent");
+  logger.info(
+    { phoneNumberId, templateName, externalId, endpoint },
+    "whatsapp cloud api: template sent",
+  );
   return { externalId };
 }

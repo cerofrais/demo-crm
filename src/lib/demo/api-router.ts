@@ -12,10 +12,14 @@
 import { getDb, mutateDb, newId, nowIso } from "./store";
 import { DEMO_MAILBOXES, DEMO_USERS } from "./seed";
 import { readClientSessionCookie } from "./session";
+import { PERMISSION_CATALOG, PERMISSION_GROUP_ORDER } from "../permissions-catalog";
+import { ALL_ROLES, permissionsFor, type AppRole } from "../rbac";
+import { CRM_ROLE_TO_APP_ROLE, type CrmRole } from "../keycloak-roles";
 import type {
   DemoData,
   DemoEnquiry,
   DemoGuest,
+  DemoMarketingReport,
   DemoMessage,
   DemoTask,
   EnquiryStage,
@@ -70,7 +74,14 @@ function toEnquiryDTO(db: DemoData, e: DemoEnquiry) {
     packageId: e.packageId,
     proposedDates: e.proposedDates,
     lostReason: e.lostReason,
+    preferredCheckIn: e.preferredCheckIn,
   };
+}
+
+/** Live (non-archived) leads. Every board/list/report query goes through this
+ *  so a soft-deleted lead can't leak back into the pipeline. */
+function liveEnquiries(db: DemoData): DemoEnquiry[] {
+  return db.enquiries.filter((e) => !e.deletedAt);
 }
 
 function toTimelineDTO(db: DemoData, enquiryId: string) {
@@ -94,12 +105,16 @@ function toTimelineDTO(db: DemoData, enquiryId: string) {
       actorRole: a.actorRole,
       text: describeActivity(a.actionType, a.metadata),
       createdAt: a.createdAt,
+      actionType: a.actionType,
       meta: a.metadata,
     }));
   return [...notes, ...activities].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 }
 
-function toMessageDTO(m: DemoMessage) {
+function toMessageDTO(m: DemoMessage, all?: DemoMessage[]) {
+  // The quoted message a reply points at. Resolved against the same thread the
+  // caller already has in hand, so this stays a pure lookup.
+  const parent = m.replyToId && all ? all.find((x) => x.id === m.replyToId) : undefined;
   return {
     id: m.id,
     direction: m.direction,
@@ -116,6 +131,7 @@ function toMessageDTO(m: DemoMessage) {
     fromLabel: m.fromLabel,
     editedAt: m.editedAt,
     deletedAt: m.deletedAt,
+    replyTo: parent ? { id: parent.id, body: parent.body, direction: parent.direction } : null,
   };
 }
 
@@ -140,7 +156,7 @@ function pageThread(
   const page = all.slice(offset, offset + THREAD_PAGE_SIZE);
   const nextOffset = offset + page.length;
   return {
-    items: page.map(toMessageDTO),
+    items: page.map((m) => toMessageDTO(m, messages)),
     nextCursor: nextOffset < all.length ? String(nextOffset) : null,
   };
 }
@@ -221,7 +237,7 @@ function findOr404<T>(arr: T[], pred: (x: T) => boolean): T | null {
 
 on("GET", "/api/enquiries", ({ query }) => {
   const db = getDb();
-  let list = db.enquiries.slice();
+  let list = liveEnquiries(db);
   const q = query.get("q")?.toLowerCase();
   const stage = query.get("stage");
   const source = query.get("source");
@@ -310,6 +326,8 @@ on("POST", "/api/enquiries", ({ body }) => {
       doctorDecisionAt: null,
       doctorDecisionNote: null,
       lostRequestPending: false,
+      preferredCheckIn: (input.preferredCheckIn as string) || null,
+      deletedAt: null,
       lastActivityAt: nowIso(),
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -440,7 +458,9 @@ on("GET", "/api/enquiries/:id/timeline", ({ params }) => {
   return ok(toTimelineDTO(db, params.id));
 });
 
-on("POST", "/api/enquiries/:id/tags", ({ params, body }) => {
+// The drawer PATCHes; keep POST too so either verb behaves the same rather
+// than one of them silently falling through to the generic echo fallback.
+const updateEnquiryTags: Handler = ({ params, body }) => {
   const { add, remove } = body as { add?: string; remove?: string };
   const db = mutateDb((d) => {
     const e = d.enquiries.find((x) => x.id === params.id);
@@ -450,7 +470,9 @@ on("POST", "/api/enquiries/:id/tags", ({ params, body }) => {
   });
   const e = db.enquiries.find((x) => x.id === params.id);
   return ok(e ? toEnquiryDTO(db, e) : null);
-});
+};
+on("POST", "/api/enquiries/:id/tags", updateEnquiryTags);
+on("PATCH", "/api/enquiries/:id/tags", updateEnquiryTags);
 
 on("GET", "/api/enquiries/:id/tasks", ({ params }) => {
   const db = getDb();
@@ -482,7 +504,9 @@ on("POST", "/api/enquiries/:id/tasks", ({ params, body }) => {
   return ok(db.tasks[db.tasks.length - 1], 201);
 });
 
-on("POST", "/api/enquiries/:id/doctor-decision", ({ params, body }) => {
+// The consultation queue PATCHes this; POST is kept alongside so neither verb
+// falls through to the generic echo fallback and silently does nothing.
+const recordDoctorDecision: Handler = ({ params, body }) => {
   const { decision, note } = body as { decision: "accepted" | "rejected" | "needs_phone_consult"; note?: string };
   const me = currentUser();
   const db = mutateDb((d) => {
@@ -506,6 +530,32 @@ on("POST", "/api/enquiries/:id/doctor-decision", ({ params, body }) => {
   });
   const e = db.enquiries.find((x) => x.id === params.id);
   return ok(e ? toEnquiryDTO(db, e) : null);
+};
+on("POST", "/api/enquiries/:id/doctor-decision", recordDoctorDecision);
+on("PATCH", "/api/enquiries/:id/doctor-decision", recordDoctorDecision);
+
+/**
+ * `?mode=soft` archives the lead (it shows up under Deleted, restorable);
+ * `?mode=hard` purges it and its history outright, same as the real route.
+ */
+on("DELETE", "/api/enquiries/:id", ({ params, query }) => {
+  const hard = query.get("mode") === "hard";
+  mutateDb((d) => {
+    if (hard) {
+      d.enquiries = d.enquiries.filter((x) => x.id !== params.id);
+      d.messages = d.messages.filter((m) => m.enquiryId !== params.id);
+      d.notes = d.notes.filter((n) => n.enquiryId !== params.id);
+      d.activities = d.activities.filter((a) => a.enquiryId !== params.id);
+      d.tasks = d.tasks.filter((t) => t.enquiryId !== params.id);
+      return;
+    }
+    const e = d.enquiries.find((x) => x.id === params.id);
+    if (e) {
+      e.deletedAt = nowIso();
+      e.updatedAt = e.deletedAt;
+    }
+  });
+  return ok({ id: params.id, mode: hard ? "hard" : "soft" });
 });
 
 on("POST", "/api/enquiries/:id/request-lost", ({ params, body }) => {
@@ -553,7 +603,7 @@ on("GET", "/api/guests", ({ query }) => {
     isReturning: g.isReturning,
     isBlocked: g.isBlocked,
     tags: g.tags,
-    enquiryCount: db.enquiries.filter((e) => e.guestId === g.id).length,
+    enquiryCount: liveEnquiries(db).filter((e) => e.guestId === g.id).length,
     hasHealthProfile: false,
     consentGiven: g.consentGiven,
     aiReturnScore: g.aiReturnScore,
@@ -602,7 +652,7 @@ on("GET", "/api/guests/:id", ({ params }) => {
     aiReturnReason: g.aiReturnReason,
     aiNextProgram: g.aiNextProgram,
     createdAt: g.createdAt,
-    enquiries: db.enquiries.filter((e) => e.guestId === g.id).map((e) => toEnquiryDTO(db, e)),
+    enquiries: liveEnquiries(db).filter((e) => e.guestId === g.id).map((e) => toEnquiryDTO(db, e)),
   });
 });
 
@@ -1274,14 +1324,14 @@ on("GET", "/api/reports/activity", ({ query }) => {
 on("GET", "/api/reports/campaigns", () => {
   const db = getDb();
   const labels = new Set<string>();
-  for (const e of db.enquiries) if (e.campaignLabel) labels.add(e.campaignLabel);
+  for (const e of liveEnquiries(db)) if (e.campaignLabel) labels.add(e.campaignLabel);
   return ok(Array.from(labels).sort());
 });
 
 on("GET", "/api/reports/performance", () => {
   const db = getDb();
   const rows = DEMO_USERS.filter((u) => u.role === "SALES" || u.role === "RECEPTION" || u.role === "MANAGER").map((u) => {
-    const owned = db.enquiries.filter((e) => e.assignedToSub === u.sub);
+    const owned = liveEnquiries(db).filter((e) => e.assignedToSub === u.sub);
     return {
       sub: u.sub,
       name: u.name,
@@ -1300,7 +1350,7 @@ on("GET", "/api/reports/source-stage-matrix", () => {
   const db = getDb();
   const rows: { source: string; stage: string; count: number }[] = [];
   const seen = new Map<string, number>();
-  for (const e of db.enquiries) {
+  for (const e of liveEnquiries(db)) {
     const key = `${e.source}::${e.stage}`;
     seen.set(key, (seen.get(key) ?? 0) + 1);
   }
@@ -1320,7 +1370,36 @@ on("GET", "/api/files/meta", () => {
   const uploadable = me.role === "DOCTOR" ? ["medical", "consent", "operational"] : ["operational", "marketing"];
   return ok({ readable: ["operational", "marketing", "medical", "consent"], uploadable });
 });
-on("GET", "/api/files", () => ok([]));
+/**
+ * The Resources library. `scope=attachable` is what the composer's attachment
+ * picker asks for — files worth re-sending — so guest-scoped medical records
+ * stay out of it unless that guest's own thread is the one being composed.
+ */
+on("GET", "/api/files", ({ query }) => {
+  const db = getDb();
+  const scope = query.get("scope");
+  const guestId = query.get("guestId");
+  const q = query.get("q")?.toLowerCase();
+  let list = db.documents.slice();
+  if (scope === "attachable") {
+    list = list.filter((d) => d.guestId === null || (guestId && d.guestId === guestId));
+  } else if (guestId) {
+    list = list.filter((d) => d.guestId === guestId);
+  }
+  if (q) list = list.filter((d) => d.filename.toLowerCase().includes(q));
+  list.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  return ok(
+    list.map((d) => ({
+      id: d.id,
+      filename: d.filename,
+      mimeType: d.mimeType,
+      sizeBytes: d.sizeBytes,
+      category: d.category,
+      guestId: d.guestId,
+      createdAt: d.createdAt,
+    })),
+  );
+});
 
 /**
  * Uploads pending a `/api/files/confirm`, keyed by storage key. Deliberately
@@ -1331,8 +1410,17 @@ on("GET", "/api/files", () => ok([]));
 const pendingUploads = new Map<string, { filename: string; mimeType: string }>();
 const confirmedUploads = new Map<string, { id: string; filename: string; mimeType: string }>();
 
+/**
+ * Resolve an attachment id to its metadata. Two sources: a file just uploaded
+ * through the presigned-PUT dance, or an existing Resources document picked
+ * for reuse (attachment-picker.tsx) — which never goes through upload at all.
+ */
 function lookupUpload(id: string | null) {
-  return id ? confirmedUploads.get(id) ?? null : null;
+  if (!id) return null;
+  const uploaded = confirmedUploads.get(id);
+  if (uploaded) return uploaded;
+  const doc = getDb().documents.find((d) => d.id === id);
+  return doc ? { id: doc.id, filename: doc.filename, mimeType: doc.mimeType } : null;
 }
 
 on("POST", "/api/files/upload-url", ({ body }) => {
@@ -1364,6 +1452,784 @@ on("POST", "/api/files/confirm", ({ body }) => {
   return ok(doc);
 });
 
+// ---- Tag vocabularies ------------------------------------------------------
+// Four endpoints, one idea: the distinct tags actually in use, so a filter bar
+// only ever offers values that will match something.
+
+function distinctTags(values: string[][]): string[] {
+  return [...new Set(values.flat())].sort((a, b) => a.localeCompare(b));
+}
+
+// The tag-input vocabulary. A bare string[] — the drawer renders these
+// straight into <option> keys, so tag objects here produce a datalist of
+// identical "[object Object]" keys.
+on("GET", "/api/tags", () => {
+  const db = getDb();
+  return ok(distinctTags([db.tags.map((t) => t.value), ...db.enquiries.map((e) => e.tags)]));
+});
+on("GET", "/api/enquiries/tags", () => ok(distinctTags(liveEnquiries(getDb()).map((e) => e.tags))));
+on("GET", "/api/guests/tags", () => ok(distinctTags(getDb().guests.map((g) => g.tags))));
+on("GET", "/api/deleted-leads/tags", () =>
+  ok(distinctTags(getDb().enquiries.filter((e) => e.deletedAt).map((e) => e.tags))),
+);
+
+// ---- Attention badge -------------------------------------------------------
+
+/**
+ * Leads waiting on someone. `?list=1` additionally returns what's waiting —
+ * the unanswered inbound message or the overdue task — so the bell can open
+ * straight into it rather than just showing a number.
+ */
+on("GET", "/api/enquiries/attention-count", ({ query }) => {
+  const db = getDb();
+  const me = currentUser();
+  const scoped = liveEnquiries(db).filter(
+    (e) =>
+      // Admin/Manager see everything; everyone else sees their own book.
+      me.role === "ADMIN" || me.role === "MANAGER" ? true : e.assignedToSub === me.sub,
+  );
+  const waiting = scoped.filter((e) => e.needsAttention || e.lostRequestPending);
+  if (!query.get("list")) return ok({ count: waiting.length });
+
+  const limit = Number.parseInt(query.get("limit") ?? "", 10) || 10;
+  const items = waiting
+    .sort((a, b) => (a.lastActivityAt < b.lastActivityAt ? 1 : -1))
+    .slice(0, limit)
+    .map((e) => {
+      const guest = db.guests.find((g) => g.id === e.guestId);
+      // The most recent inbound message is what's actually unanswered.
+      const lastInbound = db.messages
+        .filter((m) => m.enquiryId === e.id && m.direction === "inbound" && !m.deletedAt)
+        .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+      const openTask = db.tasks
+        .filter((t) => t.enquiryId === e.id && t.status === "open")
+        .sort((a, b) => ((a.dueAt ?? "") < (b.dueAt ?? "") ? -1 : 1))[0];
+      return {
+        enquiryId: e.id,
+        guestName: guest?.fullName ?? "Unknown guest",
+        stage: e.stage,
+        lastActivityAt: e.lastActivityAt,
+        message: lastInbound
+          ? {
+              channel: lastInbound.channel,
+              preview: lastInbound.body.slice(0, 140),
+              subject: lastInbound.subject,
+              createdAt: lastInbound.createdAt,
+            }
+          : null,
+        task: openTask ? { title: openTask.title, dueAt: openTask.dueAt } : null,
+      };
+    });
+  return ok({ count: waiting.length, items });
+});
+
+// ---- Deleted leads (archive) ----------------------------------------------
+
+function deletedLeadListItem(db: DemoData, e: DemoEnquiry) {
+  const guest = db.guests.find((g) => g.id === e.guestId);
+  const messages = db.messages.filter((m) => m.enquiryId === e.id);
+  const calls = db.calls.filter((c) => c.enquiryId === e.id);
+  return {
+    id: e.id,
+    guestId: e.guestId,
+    guestName: guest?.fullName ?? "Unknown guest",
+    guestPhone: guest?.phone ?? null,
+    guestEmail: guest?.email ?? null,
+    stage: e.stage,
+    source: e.source,
+    campaignLabel: e.campaignLabel,
+    assignedToName: e.assignedToName,
+    deletedAt: e.deletedAt!,
+    createdAt: e.createdAt,
+    tags: e.tags,
+    counts: {
+      activities: db.activities.filter((a) => a.enquiryId === e.id).length,
+      messages: messages.length,
+      calls: calls.length,
+      recordings: calls.filter((c) => c.recordingUrl).length,
+      notes: db.notes.filter((n) => n.enquiryId === e.id).length,
+      tasks: db.tasks.filter((t) => t.enquiryId === e.id).length,
+      documents: db.documents.filter((d) => d.enquiryId === e.id).length,
+    },
+  };
+}
+
+const DELETED_PAGE_SIZE = 25;
+
+on("GET", "/api/deleted-leads", ({ query }) => {
+  const db = getDb();
+  const archived = db.enquiries.filter((e) => e.deletedAt);
+  const q = query.get("q")?.toLowerCase();
+  const source = query.get("source");
+  const tags = (query.get("tags") ?? "").split(",").filter(Boolean);
+  let list = archived;
+  if (q) {
+    list = list.filter((e) => {
+      const g = db.guests.find((gg) => gg.id === e.guestId);
+      return (
+        g?.fullName.toLowerCase().includes(q) ||
+        g?.phone?.toLowerCase().includes(q) ||
+        g?.email?.toLowerCase().includes(q)
+      );
+    });
+  }
+  if (source) list = list.filter((e) => e.source === source);
+  // AND semantics, matching the live board's multi-select tag filter.
+  if (tags.length) list = list.filter((e) => tags.every((t) => e.tags.includes(t)));
+  list = list.slice().sort((a, b) => (a.deletedAt! < b.deletedAt! ? 1 : -1));
+
+  const offset = Number.parseInt(query.get("cursor") ?? "", 10) || 0;
+  const page = list.slice(offset, offset + DELETED_PAGE_SIZE);
+  const nextOffset = offset + page.length;
+  return ok({
+    items: page.map((e) => deletedLeadListItem(db, e)),
+    nextCursor: nextOffset < list.length ? String(nextOffset) : null,
+    matching: list.length,
+    total: archived.length,
+  });
+});
+
+on("GET", "/api/deleted-leads/:id", ({ params }) => {
+  const db = getDb();
+  const e = db.enquiries.find((x) => x.id === params.id && x.deletedAt);
+  if (!e) throw new Error("Deleted lead not found");
+  const messages = db.messages.filter((m) => m.enquiryId === e.id);
+  return ok({
+    ...deletedLeadListItem(db, e),
+    lostReason: e.lostReason,
+    quotedPriceINR: e.quotedPriceINR,
+    proposedDates: e.proposedDates,
+    intakeNotes: e.intakeNotes,
+    aiScore: e.aiScore,
+    aiScoreReason: e.aiScoreReason,
+    activities: db.activities
+      .filter((a) => a.enquiryId === e.id)
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+      .map((a) => ({
+        id: a.id,
+        createdAt: a.createdAt,
+        actorName: a.actorName,
+        actorRole: a.actorRole,
+        actionType: a.actionType,
+        actionLabel: describeActivity(a.actionType, a.metadata),
+        metadata: a.metadata,
+      })),
+    messages: messages
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+      .map((m) => ({
+        id: m.id,
+        channel: m.channel,
+        direction: m.direction,
+        subject: m.subject,
+        body: m.body,
+        fromEmail: m.fromEmail,
+        toEmail: m.toEmail,
+        status: m.status,
+        createdAt: m.createdAt,
+        attachment: m.attachment ?? null,
+      })),
+    calls: db.calls
+      .filter((c) => c.enquiryId === e.id)
+      .map((c) => ({
+        id: c.id,
+        direction: c.direction,
+        status: c.status,
+        customerPhone: c.customerPhone,
+        repName: c.repName,
+        startedAt: c.startedAt,
+        durationSec: c.durationSec,
+        hasRecording: Boolean(c.recordingUrl),
+        transcript: c.transcript,
+        transcriptEnglish: c.transcriptEnglish,
+        aiSummary: c.aiSummary,
+        aiScore: c.aiScore,
+      })),
+    notes: db.notes
+      .filter((n) => n.enquiryId === e.id)
+      .map((n) => ({ id: n.id, body: n.body, authorName: n.authorName, createdAt: n.createdAt })),
+    tasks: db.tasks
+      .filter((t) => t.enquiryId === e.id)
+      .map((t) => ({ id: t.id, title: t.title, status: t.status, dueAt: t.dueAt, createdAt: t.createdAt })),
+    documents: db.documents
+      .filter((d) => d.enquiryId === e.id)
+      .map((d) => ({ id: d.id, filename: d.filename, mimeType: d.mimeType, category: d.category, createdAt: d.createdAt })),
+  });
+});
+
+/** Restore — clears the soft delete and puts the lead back on the board. */
+on("PATCH", "/api/deleted-leads/:id", ({ params }) => {
+  mutateDb((d) => {
+    const e = d.enquiries.find((x) => x.id === params.id);
+    if (e) {
+      e.deletedAt = null;
+      e.updatedAt = nowIso();
+    }
+  });
+  return ok({ id: params.id, restored: true });
+});
+
+/** Purge — the archive's own delete, which is permanent even in the demo. */
+on("DELETE", "/api/deleted-leads/:id", ({ params }) => {
+  mutateDb((d) => {
+    d.enquiries = d.enquiries.filter((x) => x.id !== params.id);
+    d.messages = d.messages.filter((m) => m.enquiryId !== params.id);
+    d.notes = d.notes.filter((n) => n.enquiryId !== params.id);
+    d.activities = d.activities.filter((a) => a.enquiryId !== params.id);
+    d.tasks = d.tasks.filter((t) => t.enquiryId !== params.id);
+  });
+  return ok({ id: params.id, purged: true });
+});
+
+// ---- Permissions matrix ----------------------------------------------------
+
+/** Inverse of CRM_ROLE_TO_APP_ROLE — the demo stores users by app role, but
+ *  the role picker is keyed on the Keycloak realm role. */
+const APP_ROLE_TO_CRM_ROLE = Object.fromEntries(
+  Object.entries(CRM_ROLE_TO_APP_ROLE).map(([crm, app]) => [app, crm as CrmRole]),
+) as Record<AppRole, CrmRole>;
+
+/**
+ * Role change from the Permissions page. The real route refuses a self-role
+ * change (an admin can't lock themselves out) — kept here so the demo shows
+ * that guard rather than silently allowing it.
+ */
+on("PATCH", "/api/admin/users/:id", ({ params, body }) => {
+  const crmRole = String((body as Record<string, unknown>)?.role ?? "") as CrmRole;
+  const appRole = CRM_ROLE_TO_APP_ROLE[crmRole];
+  if (!appRole) throw new Error("Unknown role");
+  const me = currentUser();
+  if (me.sub === params.id) {
+    throw new Error("You can't change your own role — ask another administrator.");
+  }
+  mutateDb((d) => {
+    const u = d.users.find((x) => x.sub === params.id);
+    if (u) u.role = appRole;
+  });
+  return ok({ id: params.id, role: crmRole });
+});
+
+on("GET", "/api/permissions", () => {
+  const db = getDb();
+  // Catalog and matrix come straight from rbac.ts/permissions-catalog.ts —
+  // the same modules the real route reads, so the demo can't drift from it.
+  return ok({
+    catalog: PERMISSION_CATALOG,
+    groupOrder: PERMISSION_GROUP_ORDER,
+    roles: ALL_ROLES,
+    matrix: Object.fromEntries(ALL_ROLES.map((r) => [r, permissionsFor(r)])),
+    users: db.users.map((u) => ({
+      id: u.sub,
+      fullName: u.name,
+      username: u.email.split("@")[0],
+      email: u.email,
+      enabled: true,
+      // `role` is the Keycloak realm role the picker's options are keyed on
+      // ("crm-sales"); `appRole` is the CRM role it maps to ("SALES"). Mixing
+      // the two makes every row's dropdown fall back to its first option.
+      role: APP_ROLE_TO_CRM_ROLE[u.role as AppRole] ?? null,
+      appRole: u.role,
+      roleFetchError: false,
+      permissions: permissionsFor(u.role as AppRole),
+    })),
+  });
+});
+
+// ---- Marketing report ------------------------------------------------------
+
+on("GET", "/api/reports/marketing", () => {
+  const db = getDb();
+  return ok({
+    ceoEmail: "ceo@meridianwellness.demo",
+    reports: db.marketingReports
+      .slice()
+      .sort((a, b) => (a.generatedAt < b.generatedAt ? 1 : -1)),
+  });
+});
+
+/** Generate — for a custom range when `from`/`to` are given, else "today". */
+on("POST", "/api/reports/marketing", ({ body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const from = typeof b.from === "string" ? b.from : null;
+  const to = typeof b.to === "string" ? b.to : null;
+  const db = getDb();
+  const custom = Boolean(from && to);
+  // Row count is the leads actually in range, so the number means something.
+  const rows = liveEnquiries(db).filter((e) => {
+    if (!custom) return e.createdAt.slice(0, 10) === nowIso().slice(0, 10);
+    return e.createdAt >= from! && e.createdAt <= `${to!}T23:59:59.999Z`;
+  }).length;
+  const today = nowIso().slice(0, 10);
+  const report: DemoMarketingReport = {
+    id: newId("mrep"),
+    reportDate: custom ? null : today,
+    rangeStart: custom ? from! : `${today}T00:00:00.000Z`,
+    rangeEnd: custom ? `${to!}T23:59:59.999Z` : `${today}T23:59:59.999Z`,
+    custom,
+    filename: custom ? `meridian-marketing-${from}_${to}.csv` : `meridian-marketing-${today}.csv`,
+    rowCount: rows,
+    sizeBytes: rows * 640 + 480,
+    generatedAt: nowIso(),
+    emailedAt: null,
+    emailedTo: null,
+    emailError: null,
+  };
+  mutateDb((d) => {
+    d.marketingReports.push(report);
+  });
+  return ok({ rowCount: rows });
+});
+
+on("POST", "/api/reports/marketing/:id/email", ({ params }) => {
+  const to = "ceo@meridianwellness.demo";
+  mutateDb((d) => {
+    const rep = d.marketingReports.find((x) => x.id === params.id);
+    if (rep) {
+      rep.emailedAt = nowIso();
+      rep.emailedTo = to;
+      rep.emailError = null;
+    }
+  });
+  return ok({ to });
+});
+
+// ---- AI: inbound question analysis ----------------------------------------
+
+/** Topic buckets, each with the keywords that classify an inbound message
+ *  into it. Deliberately the same shape the real analysis returns. */
+const INBOUND_TOPICS: { key: string; label: string; description: string; keywords: string[] }[] = [
+  { key: "pricing", label: "Pricing & payment", description: "What it costs, deposits, EMI and discounts.", keywords: ["price", "pricing", "cost", "fee", "discount", "emi", "payment", "charge", "₹"] },
+  { key: "availability", label: "Dates & availability", description: "When they can come, and what's open.", keywords: ["date", "dates", "available", "availability", "slot", "book", "when", "schedule"] },
+  { key: "programme", label: "Programme details", description: "What's included, daily schedule, duration.", keywords: ["package", "programme", "program", "include", "schedule", "day", "therapy", "detox"] },
+  { key: "medical", label: "Medical suitability", description: "Conditions, medication, whether it's safe for them.", keywords: ["diabetes", "bp", "medic", "condition", "doctor", "surgery", "pregnan", "suitable"] },
+  { key: "logistics", label: "Travel & logistics", description: "Getting there, stay, food, what to bring.", keywords: ["location", "reach", "address", "travel", "airport", "room", "food", "stay"] },
+];
+
+on("GET", "/api/ai/inbound-analysis", ({ query }) => {
+  const db = getDb();
+  const days = Number.parseInt(query.get("days") ?? "90", 10) || 90;
+  const cutoff = new Date(Date.now() - days * 864e5).toISOString();
+  const inbound = db.messages.filter((m) => m.direction === "inbound" && m.createdAt >= cutoff && !m.deletedAt);
+
+  // Short acknowledgements ("ok", "thanks") carry no question — counted as
+  // noise so the shares below are shares of messages that actually asked
+  // something, which is the number worth acting on.
+  const isNoise = (b: string) => b.trim().length < 12 || /^(ok|okay|thanks|thank you|sure|yes|no)\b/i.test(b.trim());
+  const noise = inbound.filter((m) => isNoise(m.body)).length;
+  const analysable = inbound.filter((m) => !isNoise(m.body));
+
+  // Split of the *analysed* set, not of all inbound — the page prints this
+  // directly beneath the analysed total, so the two have to reconcile.
+  const byChannel: Record<string, number> = {};
+  for (const m of analysable) byChannel[m.channel] = (byChannel[m.channel] ?? 0) + 1;
+
+  // The page renders these straight into `{share}%` and a bar width, so they
+  // are whole percentages, not 0-1 fractions.
+  const pct = (n: number) => (analysable.length ? Math.round((n / analysable.length) * 1000) / 10 : 0);
+
+  const matchedIds = new Set<string>();
+  const topics = INBOUND_TOPICS.map((t) => {
+    const hits = analysable.filter((m) => t.keywords.some((k) => m.body.toLowerCase().includes(k)));
+    hits.forEach((h) => matchedIds.add(h.id));
+    // "Primary" = the topic's keyword appears first in the message, i.e. it's
+    // what the guest led with rather than a passing mention.
+    const primary = hits.filter((m) => {
+      const lower = m.body.toLowerCase();
+      const mine = Math.min(...t.keywords.map((k) => (lower.includes(k) ? lower.indexOf(k) : 1e9)));
+      return INBOUND_TOPICS.every((o) =>
+        o.key === t.key
+          ? true
+          : mine <= Math.min(...o.keywords.map((k) => (lower.includes(k) ? lower.indexOf(k) : 1e9))),
+      );
+    });
+    const existingTemplates = db.messageTemplates
+      .filter((tpl) => t.keywords.some((k) => tpl.body.toLowerCase().includes(k) || tpl.name.toLowerCase().includes(k)))
+      .map((tpl) => ({ name: tpl.name, channels: [tpl.channel] }));
+    return {
+      key: t.key,
+      label: t.label,
+      description: t.description,
+      primaryCount: primary.length,
+      primaryShare: pct(primary.length),
+      count: hits.length,
+      share: pct(hits.length),
+      examples: [...new Set(hits.map((m) => m.body.trim()))].slice(0, 6),
+      existingTemplates,
+      // The point of the report: a topic guests ask about with no template
+      // covering it is a gap worth filling.
+      gap: hits.length > 0 && existingTemplates.length === 0,
+    };
+  }).sort((a, b) => b.count - a.count);
+
+  const unmatched = analysable.filter((m) => !matchedIds.has(m.id));
+  return ok({
+    from: cutoff,
+    to: nowIso(),
+    totalInbound: inbound.length,
+    analysed: analysable.length,
+    noise,
+    internal: 0,
+    forms: liveEnquiries(db).filter((e) => e.source === "website_form" && e.createdAt >= cutoff).length,
+    byChannel,
+    unmatched: unmatched.length,
+    unmatchedExamples: [...new Set(unmatched.map((m) => m.body.trim()))].slice(0, 8),
+    topics,
+  });
+});
+
+on("POST", "/api/ai/inbound-analysis/suggest", ({ body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const key = String(b.topic ?? b.topicKey ?? "");
+  const topic = INBOUND_TOPICS.find((t) => t.key === key) ?? INBOUND_TOPICS[0]!;
+  const questions = Array.isArray(b.questions) ? (b.questions as string[]) : [];
+  const DRAFTS: Record<string, string> = {
+    pricing: "Hi {name}, thanks for asking! Our programmes start at ₹6,500 for a day package and ₹68,000 for the 7-day Panchakarma Detox. That covers accommodation, all therapies, consultations and meals. We also offer EMI on programmes above ₹50,000. Would you like the full pricing sheet? — {rep_name}",
+    availability: "Hi {name}, we currently have availability from the second week of next month, and a few slots earlier if you're flexible. If you let me know your preferred dates I'll hold a room for you while you decide. — {rep_name}",
+    programme: "Hi {name}, here's what a typical day looks like: morning yoga and consultation, two therapy sessions, a personalised naturopathy diet, and evening meditation. Our doctor tailors the plan to you after an initial assessment. I've attached the full schedule. — {rep_name}",
+    medical: "Hi {name}, thank you for sharing that. Our doctor reviews every guest's history before the programme starts and adjusts the therapies accordingly — several of our guests join us managing diabetes or blood pressure. Shall I set up a short call with Dr. Iyer? — {rep_name}",
+    logistics: "Hi {name}, we're at Meridian Wellness Retreat, Shamirpet, about 45 minutes from Hyderabad airport. We can arrange pickup for you. Rooms are single or twin-sharing, and all meals are included. — {rep_name}",
+  };
+  return ok({
+    name: `${topic.label} — standard reply`,
+    body: DRAFTS[topic.key] ?? DRAFTS.pricing!,
+    rationale: `Guests ask about ${topic.label.toLowerCase()} more than almost anything else in this window, and no template currently covers it. This draft answers the common form of the question directly and ends with a next step, so a rep can send it without editing.`,
+    coversQuestions: questions.slice(0, 5),
+  });
+});
+
+// ---- Campaign-based lead assignment ---------------------------------------
+
+function campaignSlug(label: string): string {
+  return label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+on("GET", "/api/admin/lead-assignment/campaigns", () => {
+  const db = getDb();
+  const knownCampaigns = [
+    ...new Set(liveEnquiries(db).map((e) => e.campaignLabel).filter((c): c is string => Boolean(c))),
+  ].sort((a, b) => a.localeCompare(b));
+  return ok({ rules: db.campaignRules, knownCampaigns });
+});
+
+on("PUT", "/api/admin/lead-assignment/campaigns", ({ body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const label = String(b.campaignLabel ?? "").trim();
+  if (!label) throw new Error("A campaign name is required.");
+  const rule = {
+    campaignSlug: campaignSlug(label),
+    campaignLabel: label,
+    strategy: (b.strategy === "least_busy" ? "least_busy" : "round_robin") as "round_robin" | "least_busy",
+    eligibleSubs: Array.isArray(b.eligibleSubs) ? (b.eligibleSubs as string[]) : [],
+  };
+  mutateDb((d) => {
+    const i = d.campaignRules.findIndex((r) => r.campaignSlug === rule.campaignSlug);
+    // An empty eligibility list clears the rule rather than leaving a rule
+    // that can never assign to anyone.
+    if (!rule.eligibleSubs.length) {
+      if (i >= 0) d.campaignRules.splice(i, 1);
+      return;
+    }
+    if (i >= 0) d.campaignRules[i] = rule;
+    else d.campaignRules.push(rule);
+  });
+  return ok(rule);
+});
+
+// ---- Task follow-up decisions ---------------------------------------------
+
+on("PATCH", "/api/tasks/:id/decision", ({ params, body }) => {
+  const approved = Boolean((body as Record<string, unknown>)?.approved);
+  mutateDb((d) => {
+    const t = d.tasks.find((x) => x.id === params.id);
+    if (t) {
+      t.approved = approved;
+      t.status = approved ? "done" : "cancelled";
+      t.updatedAt = nowIso();
+    }
+  });
+  return ok({ id: params.id, approved });
+});
+
+// ---- Guest tags / block / health ------------------------------------------
+
+on("PATCH", "/api/guests/:id/tags", ({ params, body }) => {
+  const tags = (body as Record<string, unknown>)?.tags;
+  const next = Array.isArray(tags) ? (tags as string[]) : [];
+  mutateDb((d) => {
+    const g = d.guests.find((x) => x.id === params.id);
+    if (g) {
+      g.tags = next;
+      g.updatedAt = nowIso();
+    }
+  });
+  return ok({ id: params.id, tags: next });
+});
+
+on("PATCH", "/api/guests/:id/block", ({ params, body }) => {
+  const blocked = Boolean((body as Record<string, unknown>)?.blocked ?? true);
+  mutateDb((d) => {
+    const g = d.guests.find((x) => x.id === params.id);
+    if (g) {
+      g.isBlocked = blocked;
+      g.updatedAt = nowIso();
+    }
+  });
+  return ok({ id: params.id, isBlocked: blocked });
+});
+
+on("GET", "/api/guests/:id/health", () => ok(null));
+on("DELETE", "/api/guests/:id/health", ({ params }) => ok({ id: params.id, cleared: true }));
+
+// ---- Bulk guest operations -------------------------------------------------
+
+on("POST", "/api/guests/bulk-delete", ({ body }) => {
+  const ids = Array.isArray((body as Record<string, unknown>)?.ids)
+    ? ((body as Record<string, unknown>).ids as string[])
+    : [];
+  mutateDb((d) => {
+    d.guests = d.guests.filter((g) => !ids.includes(g.id));
+    // Their leads go with them — the archive is for deleted *leads*, and a
+    // lead whose guest no longer exists can't be rendered.
+    d.enquiries = d.enquiries.filter((e) => !ids.includes(e.guestId));
+  });
+  return ok({ deleted: ids.length, failed: [] });
+});
+
+on("POST", "/api/guests/bulk-email", ({ body }) => {
+  const ids = Array.isArray((body as Record<string, unknown>)?.ids)
+    ? ((body as Record<string, unknown>).ids as string[])
+    : [];
+  const db = getDb();
+  // Only guests with an address can actually be mailed; the rest are skipped,
+  // which is the number the UI reports back.
+  const sendable = db.guests.filter((g) => ids.includes(g.id) && g.email);
+  return ok({ sent: sendable.length, skipped: ids.length - sendable.length, failed: 0, errors: [] });
+});
+
+on("POST", "/api/guests/bulk-import", () =>
+  ok({ created: 0, updated: 0, skipped: 0, errors: ["File import isn't wired up in the demo — the data here is generated."] }),
+);
+
+// ---- Broadcast -------------------------------------------------------------
+
+on("GET", "/api/guests/broadcast/status", () => {
+  const running = getDb().broadcastJobs.find((j) => j.status === "running" || j.status === "queued");
+  return ok(
+    running
+      ? {
+          id: running.id,
+          status: running.status,
+          totalCount: running.totalCount,
+          sentCount: running.sentCount,
+          failedCount: running.failedCount,
+          cursor: running.sentCount,
+          createdAt: running.createdAt,
+        }
+      : null,
+  );
+});
+
+on("POST", "/api/guests/broadcast", ({ body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const ids = Array.isArray(b.ids) ? (b.ids as string[]) : [];
+  const job = {
+    id: newId("bcast"),
+    status: "running" as const,
+    message: String(b.message ?? ""),
+    numberId: String(b.numberId ?? getDb().whatsappNumbers[0]?.id ?? ""),
+    totalCount: ids.length,
+    sentCount: 0,
+    failedCount: 0,
+    createdAt: nowIso(),
+    completedAt: null,
+    deletedAt: null,
+  };
+  mutateDb((d) => {
+    d.broadcastJobs.push(job);
+  });
+  return ok({ id: job.id, queued: ids.length });
+});
+
+on("POST", "/api/guests/broadcast/:id/cancel", ({ params }) => {
+  mutateDb((d) => {
+    const j = d.broadcastJobs.find((x) => x.id === params.id);
+    if (j) {
+      j.status = "cancelled";
+      j.completedAt = nowIso();
+    }
+  });
+  return ok({ id: params.id, status: "cancelled" });
+});
+
+/** Per-recipient breakdown for one broadcast job. */
+on("GET", "/api/broadcast-status/:id", ({ params }) => {
+  const db = getDb();
+  const job = db.broadcastJobs.find((j) => j.id === params.id);
+  const withPhone = db.guests.filter((g) => g.phone);
+  const recipients = withPhone.slice(0, job?.totalCount ?? 25).map((g, i) => {
+    const sent = i < (job?.sentCount ?? 0);
+    const failed = !sent && i < (job?.sentCount ?? 0) + (job?.failedCount ?? 0);
+    return {
+      guestId: g.id,
+      guestName: g.fullName,
+      guestPhone: g.phone,
+      status: failed ? ("failed" as const) : sent ? ("delivered" as const) : ("pending" as const),
+      errorDetail: failed ? "Number not on WhatsApp" : null,
+      sentAt: sent ? job?.createdAt ?? null : null,
+    };
+  });
+  return ok({ recipients });
+});
+
+on("DELETE", "/api/broadcast-status/:id", ({ params }) => {
+  mutateDb((d) => {
+    const j = d.broadcastJobs.find((x) => x.id === params.id);
+    if (j) j.deletedAt = nowIso();
+  });
+  return ok({ id: params.id, deleted: true });
+});
+
+// ---- Admin: users, numbers, settings ---------------------------------------
+
+on("POST", "/api/admin/users", ({ body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const crmRole = String(b.role ?? "crm-sales") as CrmRole;
+  const user = {
+    sub: newId("user"),
+    name: String(b.fullName ?? "New Staff Member"),
+    email: String(b.email ?? "new.staff@meridianwellness.demo"),
+    role: CRM_ROLE_TO_APP_ROLE[crmRole] ?? "SALES",
+    phone: (b.phone as string) || "",
+    isOnline: false,
+  };
+  mutateDb((d) => {
+    d.users.push(user);
+  });
+  return ok({ id: user.sub });
+});
+
+on("DELETE", "/api/admin/users/:id", ({ params }) => {
+  const me = currentUser();
+  if (me.sub === params.id) throw new Error("You can't delete your own account.");
+  mutateDb((d) => {
+    d.users = d.users.filter((u) => u.sub !== params.id);
+  });
+  return ok({ id: params.id, deleted: true });
+});
+
+on("POST", "/api/admin/users/:id/reset-password", () =>
+  ok({ temporaryPassword: "demo-temp-password", note: "Not a real credential — the demo has no identity provider." }),
+);
+
+on("POST", "/api/admin/whatsapp/numbers", ({ body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const number = {
+    id: newId("wan"),
+    label: String(b.label ?? "New Number"),
+    phoneNumber: (b.phoneNumber as string) || null,
+    instanceName: campaignSlug(String(b.label ?? "new-number")),
+    status: "pending" as const,
+    isDefault: false,
+    shared: Boolean(b.shared ?? true),
+    integration: (b.integration === "cloud_api" ? "cloud_api" : "baileys") as "baileys" | "cloud_api",
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  };
+  mutateDb((d) => {
+    d.whatsappNumbers.push(number);
+  });
+  return ok(number);
+});
+
+on("PATCH", "/api/admin/whatsapp/numbers/:id", ({ params, body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const db = mutateDb((d) => {
+    const n = d.whatsappNumbers.find((x) => x.id === params.id);
+    if (!n) return;
+    if (typeof b.label === "string") n.label = b.label;
+    if (typeof b.shared === "boolean") n.shared = b.shared;
+    // Only one default at a time, same as the real constraint.
+    if (b.isDefault === true) {
+      d.whatsappNumbers.forEach((x) => (x.isDefault = x.id === params.id));
+    }
+    n.updatedAt = nowIso();
+  });
+  return ok(db.whatsappNumbers.find((x) => x.id === params.id) ?? null);
+});
+
+on("DELETE", "/api/admin/whatsapp/numbers/:id", ({ params }) => {
+  mutateDb((d) => {
+    d.whatsappNumbers = d.whatsappNumbers.filter((n) => n.id !== params.id);
+  });
+  return ok({ id: params.id, deleted: true });
+});
+
+/**
+ * The pairing poll. A real Baileys link hands back a rotating QR; there's no
+ * socket here, so a pending number reports itself connected on the first poll
+ * rather than showing a QR that could never be scanned.
+ */
+on("GET", "/api/admin/whatsapp/numbers/:id/qr", ({ params }) => {
+  const db = mutateDb((d) => {
+    const n = d.whatsappNumbers.find((x) => x.id === params.id);
+    if (n && n.status !== "connected") {
+      n.status = "connected";
+      n.phoneNumber = n.phoneNumber ?? "+91 98765 10099";
+      n.updatedAt = nowIso();
+    }
+  });
+  const n = db.whatsappNumbers.find((x) => x.id === params.id);
+  return ok({ state: n?.status ?? "connected", phoneNumber: n?.phoneNumber ?? null, qrCodeDataUrl: null });
+});
+
+on("GET", "/api/admin/whatsapp/numbers/:id/templates", () => ok([]));
+
+on("PATCH", "/api/admin/call-routing", ({ body }) => ok(body ?? { scope: "reception_sales" }));
+on("PATCH", "/api/admin/lead-deletion", ({ body }) => ok(body ?? { autoDeleteDays: 30 }));
+
+// ---- Misc ------------------------------------------------------------------
+
+on("GET", "/api/calls/ringing", () => ok(null));
+
+on("PATCH", "/api/calls/:id", ({ params, body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const db = mutateDb((d) => {
+    const c = d.calls.find((x) => x.id === params.id);
+    if (c && typeof b.notes === "string") c.notes = b.notes;
+  });
+  return ok(db.calls.find((x) => x.id === params.id) ?? null);
+});
+
+on("PATCH", "/api/message-templates/:id", ({ params, body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const db = mutateDb((d) => {
+    const t = d.messageTemplates.find((x) => x.id === params.id);
+    if (!t) return;
+    if (typeof b.name === "string") t.name = b.name;
+    if (typeof b.body === "string") t.body = b.body;
+    if (typeof b.subject === "string" || b.subject === null) t.subject = b.subject as string | null;
+    t.updatedAt = nowIso();
+  });
+  return ok(db.messageTemplates.find((x) => x.id === params.id) ?? null);
+});
+
+on("DELETE", "/api/message-templates/:id", ({ params }) => {
+  mutateDb((d) => {
+    d.messageTemplates = d.messageTemplates.filter((t) => t.id !== params.id);
+  });
+  return ok({ id: params.id, deleted: true });
+});
+
+on("PUT", "/api/staff-profiles/me", ({ body }) => {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const me = currentUser();
+  mutateDb((d) => {
+    const u = d.users.find((x) => x.sub === me.sub);
+    if (u && typeof b.displayName === "string") u.name = b.displayName;
+    if (u && typeof b.phone === "string") u.phone = b.phone;
+  });
+  return ok({ keycloakId: me.sub, displayName: b.displayName ?? me.name, phone: b.phone ?? me.phone });
+});
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -1380,12 +2246,28 @@ async function parseBody(init?: RequestInit): Promise<unknown> {
   return undefined;
 }
 
+/**
+ * Most-specific-first: a route is tried ahead of any route with more path
+ * parameters, so `/api/enquiries/attention-count` wins over
+ * `/api/enquiries/:id` no matter which order the two were registered in.
+ * Without this, adding a literal sub-route below an existing `:id` route
+ * silently routes it to the wrong handler.
+ */
+let sortedRoutes: Route[] | null = null;
+function routesBySpecificity(): Route[] {
+  // Every on() call runs at module load, so this is computed once on the
+  // first request. Sort is stable, so same-specificity routes keep the order
+  // they were registered in.
+  sortedRoutes ??= routes.slice().sort((a, b) => a.keys.length - b.keys.length);
+  return sortedRoutes;
+}
+
 export async function handleMockRequest(url: string, method: string, init?: RequestInit): Promise<Response> {
   const u = new URL(url, typeof window !== "undefined" ? window.location.origin : "http://localhost");
   const pathname = u.pathname;
   const body = await parseBody(init);
 
-  for (const route of routes) {
+  for (const route of routesBySpecificity()) {
     if (route.method !== method) continue;
     const match = route.regex.exec(pathname);
     if (!match) continue;

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   Search,
   RefreshCw,
@@ -33,6 +34,7 @@ import { formatTag, sortTags, isSystemTag } from "@/lib/lead-tags";
 import { formatPackageForEmail } from "@/lib/packages";
 import { TemplatePicker } from "@/components/messaging/template-picker";
 import { PackagePicker } from "@/components/messaging/package-picker";
+import { AttachmentPicker, type AttachmentSelection } from "@/components/messaging/attachment-picker";
 
 interface Pkg {
   id: string;
@@ -57,6 +59,18 @@ interface GuestRow {
   tags: string[];
   enquiryCount: number;
   hasHealthProfile: boolean;
+  /** Newest lead for this guest — live if there is one, else soft-deleted. */
+  latestLeadId: string | null;
+  latestLeadDeleted: boolean;
+}
+
+/** Hover text for a guest row, so where the click goes is obvious first. */
+function leadHint(g: GuestRow): string {
+  if (!g.latestLeadId) return "No lead for this guest";
+  if (g.latestLeadDeleted) return "Open this guest's deleted lead (archive)";
+  return g.enquiryCount > 1
+    ? `Open this guest's latest lead (${g.enquiryCount} enquiries)`
+    : "Open this guest's lead";
 }
 
 // ---------------------------------------------------------------------------
@@ -142,9 +156,9 @@ function BulkEmailDialog({
   const [packages, setPackages] = useState<Pkg[]>([]);
   const [packageId, setPackageId] = useState("");
   const [sending, setSending] = useState(false);
-  const [attachFile, setAttachFile] = useState<File | null>(null);
+  const [attachment, setAttachment] = useState<AttachmentSelection | null>(null);
+  const [attachNote, setAttachNote] = useState<string | null>(null);
   const [uploadCategory, setUploadCategory] = useState<string | null>(null);
-  const attachFileRef = useRef<HTMLInputElement>(null);
   const [result, setResult] = useState<{
     sent: number;
     skipped: number;
@@ -207,8 +221,10 @@ function BulkEmailDialog({
     setSending(true);
     try {
       let attachmentDocumentId: string | undefined;
-      if (attachFile && uploadCategory) {
-        attachmentDocumentId = await uploadDocument(attachFile, uploadCategory);
+      if (attachment?.kind === "existing") {
+        attachmentDocumentId = attachment.doc.id;
+      } else if (attachment?.kind === "new" && uploadCategory) {
+        attachmentDocumentId = await uploadDocument(attachment.file, uploadCategory);
       }
       const res = await api.post<{ sent: number; skipped: number; failed: number; errors: string[] }>(
         "/api/guests/bulk-email",
@@ -295,12 +311,14 @@ function BulkEmailDialog({
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-foreground">Attachment (optional)</label>
-              {attachFile ? (
+              {attachment ? (
                 <div className="flex items-center gap-2 rounded-md border border-border bg-secondary/50 px-2.5 py-1.5 text-xs">
                   <Paperclip className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                  <span className="truncate">{attachFile.name}</span>
+                  <span className="truncate">
+                    {attachment.kind === "new" ? attachment.file.name : attachment.doc.filename}
+                  </span>
                   <button
-                    onClick={() => { setAttachFile(null); if (attachFileRef.current) attachFileRef.current.value = ""; }}
+                    onClick={() => { setAttachment(null); setAttachNote(null); }}
                     className="ml-auto shrink-0 text-muted-foreground hover:text-foreground"
                     title="Remove attachment"
                     type="button"
@@ -309,27 +327,21 @@ function BulkEmailDialog({
                   </button>
                 </div>
               ) : (
+                // No guestId: one asset goes to every recipient, so only the
+                // shared Resources library is offered — a guest-scoped file
+                // would be refused by the bulk-email route anyway.
                 uploadCategory && (
-                  <>
-                    <input
-                      ref={attachFileRef}
-                      type="file"
-                      className="hidden"
-                      onChange={(e) => setAttachFile(e.target.files?.[0] ?? null)}
-                    />
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => attachFileRef.current?.click()}
-                      disabled={sending}
-                      type="button"
-                      className="gap-1.5 text-xs"
-                    >
-                      <Paperclip className="h-3.5 w-3.5" /> Attach a file
-                    </Button>
-                  </>
+                  <AttachmentPicker
+                    disabled={sending}
+                    title="Attach from Resources, or upload a new file"
+                    onSelect={(sel, note) => {
+                      setAttachment(sel);
+                      setAttachNote(note ?? null);
+                    }}
+                  />
                 )
               )}
+              {attachNote && <p className="text-[11px] text-muted-foreground">{attachNote}</p>}
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-foreground">Include package details (optional)</label>
@@ -389,13 +401,18 @@ interface BulkImportResult {
   updated: number;
   skipped: number;
   errors: { row: number; error: string }[];
-  conflicts: { row: number; type: "duplicate_in_file" | "name_mismatch"; detail: string }[];
+  conflicts: {
+    row: number;
+    type: "duplicate_in_file" | "name_mismatch" | "soft_deleted";
+    detail: string;
+  }[];
   tag: string;
 }
 
 const CONFLICT_LABELS: Record<BulkImportResult["conflicts"][number]["type"], string> = {
   duplicate_in_file: "Duplicate in file",
   name_mismatch: "Name mismatch",
+  soft_deleted: "Deleted guest",
 };
 
 function BulkImportDialog({
@@ -451,7 +468,9 @@ function BulkImportDialog({
           {result.conflicts.length > 0 && (
             <div className="w-full text-left">
               <p className="mb-1 text-xs font-medium text-amber-600">
-                {result.conflicts.length} possible conflict{result.conflicts.length !== 1 ? "s" : ""} — imported, but worth a look
+                {/* Not all conflicts import — a "Deleted guest" row is
+                    skipped, so this can't claim they all went in. */}
+                {result.conflicts.length} row{result.conflicts.length !== 1 ? "s" : ""} worth a look
               </p>
               <div className="max-h-32 w-full overflow-y-auto rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
                 {result.conflicts.map((c, i) => (
@@ -828,6 +847,10 @@ interface WhatsAppTemplateOption {
   category: string;
   language: string;
   components: { type: string; format?: string; text?: string }[];
+  /** Server-decided: this template will send over Meta's Marketing Messages
+   *  API rather than the Cloud API. Not a choice — routing follows the
+   *  category — so it's shown, not offered. */
+  viaMarketingApi?: boolean;
 }
 
 /** True when the template's HEADER requires media — the send fails outright
@@ -1087,6 +1110,13 @@ function BroadcastDialog({
                     <option key={t.id} value={t.name}>{t.name} ({t.category.toLowerCase()}, {t.language})</option>
                   ))}
                 </Select>
+              )}
+              {selectedTemplate?.viaMarketingApi && (
+                <p className="rounded-md border border-violet-200 bg-violet-50 px-2.5 py-1.5 text-[11px] text-violet-800">
+                  Sends via Meta&apos;s <strong>Marketing Messages API</strong> — chosen automatically
+                  because this is a marketing template. Meta ranks these for engagement, which
+                  usually lands more of them than the plain Cloud API.
+                </p>
               )}
               {selectedTemplate && (
                 <div className="space-y-2 rounded-md border border-dashed border-border bg-secondary/40 p-2.5">
@@ -1601,6 +1631,8 @@ export function GuestSearch({
   canCreateGuest = false,
   canBlock = false,
   canEditGuest = false,
+  canViewLeads = false,
+  canViewDeletedLeads = false,
 }: {
   canViewHealth: boolean;
   canDelete?: boolean;
@@ -1611,6 +1643,8 @@ export function GuestSearch({
   canCreateGuest?: boolean;
   canBlock?: boolean;
   canEditGuest?: boolean;
+  canViewLeads?: boolean;
+  canViewDeletedLeads?: boolean;
 }) {
   const [q, setQ] = useState("");
   // Seeds the search box from ?q= (e.g. the incoming-call banner's "View
@@ -1648,7 +1682,37 @@ export function GuestSearch({
   const [selectingAll, setSelectingAll] = useState(false);
   const [tagVocab, setTagVocab] = useState<string[]>([]);
   const [tagOptions, setTagOptions] = useState<string[]>([]);
+  const [leadNotice, setLeadNotice] = useState<string | null>(null);
   const debounce = useRef<ReturnType<typeof setTimeout>>();
+  const router = useRouter();
+
+  // Clicking a guest opens their lead. A live lead goes to the Leads board's
+  // drawer (?lead= deep link, same one Tasks uses); a guest whose only lead
+  // was soft-deleted goes to the admin-only Deleted Leads archive so their
+  // history is still reachable instead of the click dead-ending. Anything we
+  // can't open says why rather than doing nothing.
+  function openLead(g: GuestRow) {
+    setLeadNotice(null);
+    if (!g.latestLeadId) {
+      setLeadNotice(`${g.fullName} has no lead — they're in the guest directory only.`);
+      return;
+    }
+    if (!g.latestLeadDeleted) {
+      if (!canViewLeads) {
+        setLeadNotice("You don't have access to the Leads board.");
+        return;
+      }
+      router.push(`/leads?lead=${g.latestLeadId}`);
+      return;
+    }
+    if (!canViewDeletedLeads) {
+      setLeadNotice(
+        `${g.fullName}'s lead was deleted. Only an admin can open it, from Deleted Leads.`,
+      );
+      return;
+    }
+    router.push(`/deleted?lead=${g.latestLeadId}`);
+  }
 
   const refreshTagVocab = useCallback(() => {
     api.get<string[]>("/api/tags").then(setTagVocab).catch(() => {});
@@ -2032,6 +2096,18 @@ export function GuestSearch({
 
       {/* ── Guest grid / list ── */}
       <div className="p-4 md:p-6">
+        {leadNotice && (
+          <div className="mb-3 flex items-start gap-2 rounded-lg border border-border bg-secondary/60 px-3 py-2 text-xs text-muted-foreground">
+            <span className="flex-1">{leadNotice}</span>
+            <button
+              onClick={() => setLeadNotice(null)}
+              className="shrink-0 rounded p-0.5 hover:bg-secondary hover:text-foreground"
+              title="Dismiss"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
         {!loading && visible.length === 0 ? (
           <p className="py-12 text-center text-sm text-muted-foreground">No guests found.</p>
         ) : view === "list" ? (
@@ -2063,13 +2139,15 @@ export function GuestSearch({
                   {sortedVisible.map((g) => (
                     <tr
                       key={g.id}
+                      onClick={() => openLead(g)}
+                      title={leadHint(g)}
                       className={cn(
-                        "border-b border-border last:border-0 hover:bg-secondary/40",
+                        "cursor-pointer border-b border-border last:border-0 hover:bg-secondary/40",
                         selected.has(g.id) && "bg-brand-50/60",
                         g.isBlocked && "bg-destructive/5",
                       )}
                     >
-                      <td className="px-3 py-2.5">
+                      <td className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
                         <input
                           type="checkbox"
                           checked={selected.has(g.id)}
@@ -2110,7 +2188,7 @@ export function GuestSearch({
                           onChanged={(tags) => updateGuestTags(g.id, tags)}
                         />
                       </td>
-                      <td className="whitespace-nowrap px-3 py-2.5">
+                      <td className="whitespace-nowrap px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
                         <div className="flex items-center gap-0.5">
                           {canEditGuest && (
                             <button
@@ -2167,8 +2245,10 @@ export function GuestSearch({
             {visible.map((g) => (
               <Card
                 key={g.id}
+                onClick={() => openLead(g)}
+                title={leadHint(g)}
                 className={cn(
-                  "p-4",
+                  "cursor-pointer p-4 transition-colors hover:bg-secondary/40",
                   selected.has(g.id) && "border-brand-300 ring-2 ring-brand-300",
                   g.isBlocked && "border-red-300",
                 )}
@@ -2178,6 +2258,7 @@ export function GuestSearch({
                     type="checkbox"
                     checked={selected.has(g.id)}
                     onChange={() => toggleSelect(g)}
+                    onClick={(e) => e.stopPropagation()}
                     title="Select for bulk email/broadcast"
                     className="mt-1.5 h-4 w-4 shrink-0 rounded border-input accent-brand-600"
                   />
@@ -2188,7 +2269,10 @@ export function GuestSearch({
                       {g.isReturning && (
                         <Badge className="bg-brand-100 text-brand-700 shrink-0">Returning</Badge>
                       )}
-                      <div className="ml-auto flex shrink-0 items-center gap-0.5">
+                      <div
+                        className="ml-auto flex shrink-0 items-center gap-0.5"
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         {canEditGuest && (
                           <button
                             onClick={() => setEditTarget(g)}

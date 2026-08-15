@@ -27,6 +27,7 @@ import { TagFilterBar } from "./tag-filter-bar";
 import type { EnquiryDTO } from "@/lib/types";
 import type { EnquiryStage } from "@prisma/client";
 import type { StageDef } from "@/lib/kanban";
+import { AttentionBell } from "@/components/app/attention-bell";
 
 // Client-exposed at build time by Next.js (NEXT_PUBLIC_ prefix required — do
 // NOT read this through src/lib/env.ts, which is server-only and would pull
@@ -80,6 +81,7 @@ export function LeadsWorkspace({
   const [view, setView] = useState<"pipeline" | "list">("pipeline");
   const [q, setQ] = useState("");
   const [source, setSource] = useState("");
+  const [rnrDone, setRnrDone] = useState("");
   const [gender, setGender] = useState("");
   // "all" | "me" | "unassigned" are sentinels; any other value is a specific
   // staff member's Keycloak sub (Admin/Manager only — see assignableUsers).
@@ -93,11 +95,14 @@ export function LeadsWorkspace({
   const [timeFrom, setTimeFrom] = useState("");
   const [timeTo, setTimeTo] = useState("");
   const [selected, setSelected] = useState<EnquiryDTO | null>(null);
+  // Set by a ?tab= deep link so the drawer opens on that channel.
+  const [openTab, setOpenTab] = useState<string | undefined>(undefined);
   const [showNew, setShowNew] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [activeTags, setActiveTags] = useState<string[]>([]);
+  const [allTags, setAllTags] = useState<string[]>([]);
   const [autoRefresh, setAutoRefresh] = useState(AUTOREFRESH_INTERVAL_SEC > 0);
   const debounce = useRef<ReturnType<typeof setTimeout>>();
   const { isPhone, mounted } = useBreakpoint();
@@ -119,6 +124,18 @@ export function LeadsWorkspace({
       .catch(() => {});
   }, [canManage, currentSub]);
 
+  // Every tag across ALL active leads, not just whatever's currently loaded
+  // on the board — otherwise a real tag (e.g. "revisit") with no carrier in
+  // the current view silently couldn't be filtered by at all. See
+  // listDistinctActiveLeadTags(). Best-effort: the board still works off the
+  // client-derived set below if this fails.
+  useEffect(() => {
+    api
+      .get<string[]>("/api/enquiries/tags")
+      .then(setAllTags)
+      .catch(() => {});
+  }, []);
+
   // Deep-link support — a task card in Tasks & Reminders links here with
   // ?lead=<enquiryId> to jump straight to that lead's drawer. Checks the
   // already-loaded list first (the common case); falls back to fetching it
@@ -127,11 +144,23 @@ export function LeadsWorkspace({
   useEffect(() => {
     const leadId = searchParams.get("lead");
     if (!leadId) return;
+    const tab = searchParams.get("tab");
+    setOpenTab(tab ?? undefined);
     const inList = enquiries.find((e) => e.id === leadId);
     if (inList) {
       setSelected(inList);
     } else {
-      api.get<EnquiryDTO>(`/api/enquiries/${leadId}`).then(setSelected).catch(() => {});
+      // A deep link can point at a lead this user isn't allowed to see (stage
+      // or ownership scoped) or one that has since been deleted. Say so —
+      // silently ignoring it looks like the click did nothing.
+      api
+        .get<EnquiryDTO>(`/api/enquiries/${leadId}`)
+        .then(setSelected)
+        .catch((e) =>
+          setLoadError(
+            e instanceof Error ? e.message : "That lead couldn't be opened.",
+          ),
+        );
     }
     router.replace("/leads", { scroll: false });
     // Deliberately one-shot on the param itself, not on `enquiries` (which
@@ -144,6 +173,7 @@ export function LeadsWorkspace({
     const params = new URLSearchParams();
     if (q) params.set("q", q);
     if (source) params.set("source", source);
+    if (rnrDone) params.set("rnrDone", rnrDone);
     if (gender) params.set("gender", gender);
     if (assignee === "me") params.set("assignee", "me");
     else if (assignee !== "all" && assignee !== "unassigned") params.set("assignee", assignee);
@@ -168,7 +198,7 @@ export function LeadsWorkspace({
     } finally {
       if (!opts.silent) setLoading(false);
     }
-  }, [q, source, gender, assignee, dateFrom, dateTo, timeFrom, timeTo]);
+  }, [q, source, rnrDone, gender, assignee, dateFrom, dateTo, timeFrom, timeTo]);
 
   // Re-query on filter change (debounced for the search box).
   useEffect(() => {
@@ -221,10 +251,12 @@ export function LeadsWorkspace({
     setSelected((s) => (s?.id === id ? null : s));
   }, []);
 
-  // Distinct tags currently on the board → the clickable filter bar.
+  // The full server-side tag universe, unioned with whatever's on the
+  // currently-loaded board — the union covers a tag added moments ago that
+  // hasn't round-tripped through the server fetch yet.
   const availableTags = useMemo(
-    () => sortTags(Array.from(new Set(enquiries.flatMap((e) => e.tags)))),
-    [enquiries],
+    () => sortTags(Array.from(new Set([...allTags, ...enquiries.flatMap((e) => e.tags)]))),
+    [allTags, enquiries],
   );
 
   // Client-side tag filter (AND): a lead must carry every active tag.
@@ -306,6 +338,9 @@ export function LeadsWorkspace({
               <Plus className="h-4 w-4" /> <span className="hidden sm:inline">New lead</span>
             </Button>
           )}
+          {/* Sits with the board's own controls rather than in a global bar —
+              the count is about leads, and this is where you act on them. */}
+          <AttentionBell />
         </div>
 
         {/* Search — its own row so it never has to shrink to share space
@@ -340,6 +375,27 @@ export function LeadsWorkspace({
                 {l}
               </option>
             ))}
+          </Select>
+          {/* Picking any value here implies the RNR stage — see EnquiryFilters
+              .rnrDone — so the board narrows to that column. */}
+          <Select
+            value={rnrDone}
+            onChange={(e) => setRnrDone(e.target.value)}
+            className="w-48"
+            title="Narrow the board to RNR leads by how far through their follow-up calls they are"
+          >
+            <option value="">All follow-ups</option>
+            {/* "Any still pending" is the union of the two indented options,
+                not a fourth separate bucket — the grouping and the "·" say so,
+                because a flat list of four read as mutually exclusive. */}
+            <optgroup label="RNR — still to do">
+              <option value="open">Any still pending — both below</option>
+              <option value="none">· Not started (no calls yet)</option>
+              <option value="partial">· Partly done (some calls left)</option>
+            </optgroup>
+            <optgroup label="RNR — nothing left">
+              <option value="all">All done (every call made)</option>
+            </optgroup>
           </Select>
           <Select value={gender} onChange={(e) => setGender(e.target.value)} className="w-32">
             <option value="">All genders</option>
@@ -441,6 +497,23 @@ export function LeadsWorkspace({
               {SOURCES.map(([v, l]) => (
                 <option key={v} value={v}>{l}</option>
               ))}
+            </Select>
+          </label>
+          <label className="block space-y-1">
+            <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              RNR follow-ups
+            </span>
+            <Select value={rnrDone} onChange={(e) => setRnrDone(e.target.value)}>
+              <option value="">All follow-ups</option>
+              {/* Same grouping as the toolbar select — see the note there. */}
+              <optgroup label="Still to do">
+                <option value="open">Any still pending — both below</option>
+                <option value="none">· Not started (no calls yet)</option>
+                <option value="partial">· Partly done (some calls left)</option>
+              </optgroup>
+              <optgroup label="Nothing left">
+                <option value="all">All done (every call made)</option>
+              </optgroup>
             </Select>
           </label>
           <label className="block space-y-1">
@@ -546,7 +619,8 @@ export function LeadsWorkspace({
         canDelete={canDelete}
         canDoctorDecide={canDoctorDecide}
         isAdmin={isAdmin}
-        onClose={() => setSelected(null)}
+        initialTab={openTab as never}
+        onClose={() => { setSelected(null); setOpenTab(undefined); }}
         onUpdated={replace}
         onDeleted={handleDeleted}
       />

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { Download, Printer } from "lucide-react";
 import { Select, Button, Input } from "@/components/ui";
 import { api } from "@/lib/client";
@@ -133,6 +134,20 @@ export function ReportsWorkspace() {
 
   return (
     <div className="space-y-6 p-4 md:p-6">
+      {/* Sub-navigation — the Marketing page is a sibling report view, not a
+          filter of this one, so it gets its own route. */}
+      <div className="no-print flex gap-1 border-b border-border">
+        <span className="border-b-2 border-brand-600 px-3 py-2 text-sm font-medium text-foreground">
+          Overview
+        </span>
+        <Link
+          href="/reports/marketing"
+          className="border-b-2 border-transparent px-3 py-2 text-sm text-muted-foreground hover:text-foreground"
+        >
+          Marketing
+        </Link>
+      </div>
+
       <div className="no-print flex flex-wrap items-center justify-end gap-2">
         <Select value={period} onChange={(e) => setPeriod(e.target.value)} className="w-36">
           <option value="day">Last 24 hours</option>

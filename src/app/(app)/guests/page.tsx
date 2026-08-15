@@ -20,11 +20,13 @@ export default async function GuestsPage() {
       />
       <GuestSearch
         canViewHealth={can(roles, "health.view")}
+        canViewLeads={can(roles, "leads.view")}
+        canViewDeletedLeads={can(roles, "leads.delete")}
         canDelete={can(roles, "guests.delete")}
         canBulkImport={can(roles, "leads.manage")}
-        canBroadcast={can(roles, "messaging.send")}
+        canBroadcast={can(roles, "messaging.broadcast")}
         canEditTags={can(roles, "leads.manage")}
-        canBulkEmail={can(roles, "messaging.send")}
+        canBulkEmail={can(roles, "messaging.broadcast")}
         canCreateGuest={can(roles, "leads.manage")}
         canBlock={can(roles, "leads.manage")}
         canEditGuest={can(roles, "leads.manage")}

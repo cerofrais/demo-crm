@@ -40,6 +40,17 @@ export function ageGroup(age: number | null): string {
 }
 
 /**
+ * Inverse of ageFromDob — a self-reported age (from a form's "Age" field,
+ * not a real birth date) turned into an approximate dateOfBirth so the
+ * existing ageGroup() bucketing works off it. Uses the same 365.25-day-year
+ * math as ageFromDob so round-tripping this back through ageFromDob lands
+ * on the same age.
+ */
+export function ageToDateOfBirth(age: number): Date {
+  return new Date(Date.now() - age * 365.25 * 24 * 3600 * 1000);
+}
+
+/**
  * Always renders in IST, regardless of the viewer's own system timezone.
  * `toLocaleString("en-IN", ...)` alone does NOT do this — the "en-IN"
  * locale only controls formatting conventions (date order, comma

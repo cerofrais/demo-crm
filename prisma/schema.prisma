@@ -185,6 +185,11 @@ model Enquiry {
   isReturningFlag Boolean      @default(false)
   quotedPriceINR  Int?
   proposedDates   String?
+  /// The check-in date the guest ASKED for at intake — read off the website
+  /// enquiry form's "Preferred Check in Date". Their stated preference, not a
+  /// confirmed booking, and deliberately separate from `proposedDates` (free
+  /// text, currently unused anywhere in the app).
+  preferredCheckIn DateTime?
   lostReason      String?
   campaignLabel   String?
   /// Permanent idempotency key for inbound webhook leads (e.g. a Meta lead-gen
@@ -362,7 +367,7 @@ model Activity {
   actorSub   String
   actorRole  String
   actorName  String?
-  actionType String // stage_change | note | message_sent | task_created | doc_upload | assign | created | consent
+  actionType String // stage_change | note | message_sent | task_created | task_completed | task_cancelled | doc_upload | assign | created | consent
   metadata   Json     @default("{}")
   createdAt  DateTime @default(now())
 
@@ -588,6 +593,37 @@ model LeadDeletionSettings {
   updatedAt      DateTime @updatedAt
 }
 
+/// One generated daily marketing CSV. The file itself lives in object storage
+/// (same bucket as Documents); this row is the index the Reports > Marketing
+/// page lists, and the record of whether it reached the CEO.
+model MarketingReport {
+  id         String   @id @default(uuid())
+  /// The calendar DAY a SCHEDULED report covers (its leads' received date),
+  /// not when it ran — a re-run for the same day replaces that file rather
+  /// than adding a second. Null for a manually generated custom range, which
+  /// must not take a calendar day's slot; Postgres allows many NULLs under a
+  /// unique index, so the two kinds coexist.
+  reportDate DateTime? @unique @db.Date
+  /// The window actually covered, inclusive. Equal to the reportDate's own
+  /// bounds for a daily report; the user's picked range for a custom one.
+  rangeStart DateTime
+  rangeEnd   DateTime
+  filename   String
+  storageKey String
+  rowCount   Int
+  sizeBytes  Int
+  generatedAt DateTime @default(now())
+  /// Null until it's been emailed — the scheduled run sets this, and so does
+  /// the manual "email to CEO" button, so the page can show whether the CEO
+  /// actually has it.
+  emailedAt  DateTime?
+  emailedTo  String?
+  /// Last send failure, kept so a silent bounce doesn't look like "not sent yet".
+  emailError String?
+
+  @@index([reportDate])
+}
+
 /// Round-robin cursor for automatic new-lead assignment. `id` is either
 /// "singleton" (the default Sales->Reception pool) or a LeadAssignmentCategory
 /// value (a per-channel cursor once an admin restricts that channel to a
@@ -621,6 +657,24 @@ model LeadAssignmentSettings {
   strategy     LeadAssignmentStrategy @default(round_robin)
   eligibleSubs String[]               @default([])
   updatedAt    DateTime               @updatedAt
+}
+
+/// Per-campaign override for who a freshly auto-created lead gets assigned
+/// to — checked BEFORE the per-channel LeadAssignmentSettings above, since a
+/// campaign rule is more specific targeting than a generic channel. Only
+/// applies to enquiries carrying a campaignLabel (see Enquiry.campaignLabel).
+/// campaignSlug is slugifyTag(campaignLabel) — the same normalization the
+/// existing "campaign:<slug>" system tag already uses — so a rule set up
+/// once matches every enquiry for that campaign regardless of exact casing/
+/// spacing in the label as submitted.
+model CampaignAssignmentRule {
+  campaignSlug  String                 @id
+  /// Display label as an admin typed it, kept alongside the slug purely so
+  /// the settings UI can show something readable without a reverse lookup.
+  campaignLabel String
+  strategy      LeadAssignmentStrategy @default(round_robin)
+  eligibleSubs  String[]               @default([])
+  updatedAt     DateTime               @updatedAt
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +741,17 @@ model BroadcastJob {
   /// start (not per-recipient) and reused for every send in this job, since
   /// the same header media goes out to everyone.
   headerMediaId    String?
+  /// MARKETING | UTILITY | AUTHENTICATION, resolved from Meta at creation
+  /// time rather than taken from the client — it decides which send endpoint
+  /// this job uses, so it has to be authoritative. Null for a Baileys
+  /// (free-text) broadcast, or when the lookup couldn't be completed.
+  templateCategory String?
+  /// Whether this job actually went out over the Marketing Messages API
+  /// (/marketing_messages) rather than the Cloud API (/messages). Recorded
+  /// per job so delivery of the two paths can be compared after the fact —
+  /// the env kill-switch can be flipped between jobs, so the flag's current
+  /// value doesn't tell you how an old job was sent.
+  usedMarketingApi Boolean         @default(false)
   /// WhatsAppNumber.id to send from — null falls back to the org default number.
   numberId         String?
   /// seconds between sends — default 3s ≈ 20/minute
@@ -786,6 +851,10 @@ enum AiDecisionKind {
   guest_insight
   conversation_assist
   transcript_translation
+  /// Drafting a reply template from the questions guests actually ask — the
+  /// only model call in the inbound-question analysis (see
+  /// lib/ai/inbound-analysis.ts); the grouping itself is deterministic.
+  template_suggestion
 }
 
 /// Append-only. No DELETE for the app role, same posture as Activity.

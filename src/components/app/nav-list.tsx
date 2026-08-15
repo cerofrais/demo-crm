@@ -21,6 +21,7 @@ import {
   Shuffle,
   LayoutTemplate,
   History,
+  Trash2,
   Bot,
   LogOut,
   type LucideIcon,
@@ -28,6 +29,7 @@ import {
 import { cn } from "@/lib/utils";
 
 export const NAV_ICONS: Record<string, LucideIcon> = {
+  Trash2,
   LayoutDashboard,
   Users,
   UserSearch,

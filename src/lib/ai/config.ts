@@ -57,15 +57,23 @@ export function transcribeConfig(): TranscribeConfig | null {
 }
 
 /**
- * Candidate languages to transcribe each call in, when the ASR backend needs
- * an explicit language per request (e.g. IndicConformer has no "auto" mode
- * and no per-word language switching). Each call is transcribed once per
- * language; the LLM then reconciles the attempts and translates to English
- * — see src/lib/ai/transcript-translate.ts. Ignored by backends that already
- * auto-detect language (e.g. Whisper).
+ * Candidate languages to transcribe each call in. Each entry costs one full
+ * decode of the recording; the LLM then reconciles the attempts and translates
+ * to English — see src/lib/ai/transcript-translate.ts.
+ *
+ * `undefined` means "send no language and let the backend auto-detect", which
+ * is the default and the right setting for Whisper: it detects language itself
+ * and handles code-switched Indian English (the bulk of these calls) in a
+ * single pass. Measured on production recordings, pinning `en` produced
+ * byte-identical output to auto-detect, while forcing a wrong language is what
+ * drives Whisper into repetition loops — so auto is both cheaper and safer.
+ *
+ * Set ASR_LANGUAGES only for a backend that cannot auto-detect (e.g.
+ * IndicConformer, which has no auto mode and no English support at all).
  */
-export function asrLanguages(): string[] {
-  const raw = process.env.ASR_LANGUAGES ?? "te,hi";
+export function asrLanguages(): (string | undefined)[] {
+  const raw = process.env.ASR_LANGUAGES?.trim();
+  if (!raw) return [undefined]; // one pass, backend auto-detects
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
 

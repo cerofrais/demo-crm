@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { canSendEmail } from "./mailboxes";
 import {
+  ALL_ROLES,
+  NAV,
+  ROUTE_GUARDS,
   can,
   canAny,
   canDeleteDocuments,
@@ -9,6 +13,7 @@ import {
   canWorkLeadStage,
   isAdmin,
   mapRoles,
+  navFor,
   primaryRole,
 } from "./rbac";
 
@@ -208,5 +213,109 @@ describe("canMutateLeads", () => {
     expect(canMutateLeads(["STAFF"])).toBe(false);
     expect(canMutateLeads(["VIEWER"])).toBe(false);
     expect(canMutateLeads([])).toBe(false);
+  });
+});
+
+describe("Deleted Leads archive is admin-only", () => {
+  // The archive exposes a deleted lead's full message, call-recording and
+  // document history, so it is deliberately narrower than the Activity Log
+  // (reports.allStaff, which MANAGER also holds).
+  const ROLES = ["MANAGER", "RECEPTION", "SALES", "DOCTOR", "VIEWER"] as const;
+
+  it("grants the underlying permission to ADMIN only", () => {
+    expect(can(["ADMIN"], "leads.delete")).toBe(true);
+    for (const role of ROLES) {
+      expect(can([role], "leads.delete")).toBe(false);
+    }
+  });
+
+  it("shows the sidebar item to ADMIN only", () => {
+    const item = NAV.find((n) => n.href === "/deleted");
+    expect(item).toBeDefined();
+    expect(navFor(["ADMIN"]).some((n) => n.href === "/deleted")).toBe(true);
+    for (const role of ROLES) {
+      expect(navFor([role]).some((n) => n.href === "/deleted")).toBe(false);
+    }
+  });
+
+  it("guards the route in middleware, not just the sidebar", () => {
+    // Hiding the nav link alone would leave /deleted reachable by typing it.
+    const guard = ROUTE_GUARDS.find((g) => g.prefix === "/deleted");
+    expect(guard).toBeDefined();
+    expect(guard!.perm).toBe("leads.delete");
+  });
+});
+
+describe("Permissions page is admin-only", () => {
+  const NON_ADMIN = ["MANAGER", "RECEPTION", "SALES", "DOCTOR", "VIEWER"] as const;
+
+  it("is gated on users.manage, which only ADMIN holds", () => {
+    expect(can(["ADMIN"], "users.manage")).toBe(true);
+    for (const role of NON_ADMIN) {
+      expect(can([role], "users.manage")).toBe(false);
+    }
+  });
+
+  it("stays hidden from VIEWER, who does hold users.view", () => {
+    // The page spells out every sensitive capability and reassigns roles, so
+    // it is deliberately stricter than the Users list.
+    expect(can(["VIEWER"], "users.view")).toBe(true);
+    expect(navFor(["VIEWER"]).some((n) => n.href === "/permissions")).toBe(false);
+    expect(navFor(["ADMIN"]).some((n) => n.href === "/permissions")).toBe(true);
+  });
+
+  it("guards the route in middleware too", () => {
+    const guard = ROUTE_GUARDS.find((g) => g.prefix === "/permissions");
+    expect(guard).toBeDefined();
+    expect(guard!.perm).toBe("users.manage");
+  });
+});
+
+describe("canSendEmail follows the permission table", () => {
+  // Regression: this used to hardcode ADMIN/MANAGER/RECEPTION/DOCTOR and
+  // silently drifted when SALES gained messaging.send — that role could send
+  // WhatsApp (permission-guarded) but not email (list-guarded), which is how
+  // a Sales rep ended up unable to email at all.
+  it("matches messaging.send for every role, with no hardcoded list", () => {
+    for (const role of ALL_ROLES) {
+      expect(canSendEmail([role])).toBe(can([role], "messaging.send"));
+    }
+  });
+
+  it("every working role can send email", () => {
+    for (const role of ["ADMIN", "MANAGER", "DOCTOR", "RECEPTION", "SALES"] as const) {
+      expect(canSendEmail([role])).toBe(true);
+    }
+  });
+
+  it("only the view-only role cannot", () => {
+    expect(canSendEmail(["STAFF"])).toBe(true);
+    expect(canSendEmail(["VIEWER"])).toBe(false);
+  });
+});
+
+describe("messaging.broadcast is separate from messaging.send", () => {
+  // Mass-mailing the whole guest directory is a different power from replying
+  // to one guest. STAFF was given the second without the first.
+  it("STAFF can message a guest but not broadcast", () => {
+    expect(can(["STAFF"], "messaging.send")).toBe(true);
+    expect(can(["STAFF"], "messaging.broadcast")).toBe(false);
+  });
+
+  it("every other sending role keeps broadcast", () => {
+    for (const role of ["ADMIN", "MANAGER", "DOCTOR", "RECEPTION", "SALES"] as const) {
+      expect(can([role], "messaging.broadcast")).toBe(true);
+    }
+  });
+
+  it("the view-only role has neither", () => {
+    expect(can(["VIEWER"], "messaging.send")).toBe(false);
+    expect(can(["VIEWER"], "messaging.broadcast")).toBe(false);
+  });
+
+  it("broadcast always implies send — no role can mass-mail without 1:1", () => {
+    for (const role of ALL_ROLES) {
+      if (can([role], "messaging.broadcast")) expect(can([role], "messaging.send")).toBe(true);
+    }
   });
 });

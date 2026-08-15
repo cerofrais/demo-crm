@@ -4,6 +4,8 @@ import { can } from "@/lib/rbac";
 import { prisma } from "@/lib/prisma";
 import { ageFromDob, ageGroup } from "@/lib/utils";
 import { findReturningGuest } from "@/lib/enquiries";
+import { latestLeadByGuest } from "@/lib/guest-leads";
+import { reviveGuestIfDeleted } from "@/lib/guest-revive";
 import { createGuestSchema } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
@@ -73,21 +75,30 @@ export async function GET(req: NextRequest) {
       prisma.guest.count({ where }),
     ]);
 
+    const leads = await latestLeadByGuest(
+      guests.filter((g) => g._count.enquiries > 0).map((g) => g.id),
+    );
+
     return ok({
-      items: guests.map((g) => ({
-        id: g.id,
-        fullName: g.fullName,
-        phone: g.phone,
-        email: g.email,
-        city: g.city,
-        gender: g.gender,
-        ageGroup: ageGroup(ageFromDob(g.dateOfBirth)),
-        isReturning: g.isReturning,
-        isBlocked: g.isBlocked,
-        tags: g.tags,
-        enquiryCount: g._count.enquiries,
-        hasHealthProfile: Boolean(g.healthProfile),
-      })),
+      items: guests.map((g) => {
+        const lead = leads.get(g.id);
+        return {
+          id: g.id,
+          fullName: g.fullName,
+          phone: g.phone,
+          email: g.email,
+          city: g.city,
+          gender: g.gender,
+          ageGroup: ageGroup(ageFromDob(g.dateOfBirth)),
+          isReturning: g.isReturning,
+          isBlocked: g.isBlocked,
+          tags: g.tags,
+          enquiryCount: g._count.enquiries,
+          hasHealthProfile: Boolean(g.healthProfile),
+          latestLeadId: lead?.id ?? null,
+          latestLeadDeleted: lead?.deleted ?? false,
+        };
+      }),
       total,
     });
   });
@@ -106,7 +117,13 @@ export async function POST(req: NextRequest) {
     const city = input.city?.trim() || undefined;
     const dateOfBirth = input.dateOfBirth ? new Date(input.dateOfBirth) : undefined;
 
-    const existing = await findReturningGuest(phone, email);
+    // includeDeleted: without it, re-adding a soft-deleted guest by their own
+    // phone/email dies on the unique index instead of bringing the record
+    // back. `alreadyExisted` in the response tells the UI it was a match.
+    const existing = await findReturningGuest(phone, email, { includeDeleted: true });
+    if (existing?.deletedAt) {
+      await reviveGuestIfDeleted(existing.id, "re-added from the guest directory");
+    }
     const nameMismatch = Boolean(
       existing && existing.fullName.trim().toLowerCase() !== input.fullName.trim().toLowerCase(),
     );
@@ -128,6 +145,11 @@ export async function POST(req: NextRequest) {
           include: { _count: { select: { enquiries: true } }, healthProfile: { select: { id: true } } },
         });
 
+    // A brand-new guest has no lead; a deduped existing one may well have.
+    const lead = guest._count.enquiries > 0
+      ? (await latestLeadByGuest([guest.id])).get(guest.id)
+      : undefined;
+
     return ok(
       {
         id: guest.id,
@@ -142,6 +164,8 @@ export async function POST(req: NextRequest) {
         tags: guest.tags,
         enquiryCount: guest._count.enquiries,
         hasHealthProfile: Boolean(guest.healthProfile),
+        latestLeadId: lead?.id ?? null,
+        latestLeadDeleted: lead?.deleted ?? false,
         alreadyExisted: Boolean(existing),
         nameMismatch,
       },

@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   return handle(async () => {
-    await requireAllPermissions(["messaging.send", "guests.view"]);
+    await requireAllPermissions(["messaging.broadcast", "guests.view"]);
     const job = await getActiveBroadcast();
     if (!job) return ok(null);
     return ok({

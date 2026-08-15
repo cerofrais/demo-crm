@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import {
-  Send, Loader2, Trash2, ChevronDown, Check, X, Clock, AlertTriangle,
+  Send, Loader2, Trash2, ChevronDown, Check, X, Clock, AlertTriangle, Download,
 } from "lucide-react";
 import { Card, Badge, Button, Dialog } from "@/components/ui";
 import { api } from "@/lib/client";
@@ -13,6 +13,8 @@ interface BroadcastJobDTO {
   status: "queued" | "running" | "completed" | "cancelled" | "failed";
   message: string;
   templateName: string | null;
+  templateCategory: string | null;
+  usedMarketingApi: boolean;
   numberLabel: string;
   delaySec: number;
   totalCount: number;
@@ -59,6 +61,39 @@ function formatDateTime(iso: string): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function csvCell(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+/** Error rows are stored as "<code>: <message>" (see broadcast.ts / the
+ *  WhatsApp Cloud API status webhook) — split so the code sorts/filters
+ *  cleanly as its own CSV column instead of being buried in free text. */
+function splitErrorCode(errorDetail: string): { code: string; message: string } {
+  const idx = errorDetail.indexOf(":");
+  if (idx === -1) return { code: "", message: errorDetail };
+  return { code: errorDetail.slice(0, idx).trim(), message: errorDetail.trim() };
+}
+
+function downloadFailedRecipientsCsv(job: BroadcastJobDTO, recipients: RecipientDTO[]) {
+  const failed = recipients.filter((r) => r.status === "failed");
+  const header = ["Name", "Phone", "Error Code", "Error Message"];
+  const rows = failed.map((r) => {
+    const { code, message } = splitErrorCode(r.errorDetail ?? "");
+    return [r.guestName, r.guestPhone ?? "", code, message];
+  });
+  const csv = [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n");
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `broadcast-failures-${job.id.slice(0, 8)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 export function BroadcastStatusManager({ canDelete }: { canDelete: boolean }) {
@@ -138,6 +173,14 @@ export function BroadcastStatusManager({ canDelete }: { canDelete: boolean }) {
                     {job.templateName ? `Template: ${job.templateName}` : "Free text"}
                   </span>
                   <span className="text-xs text-muted-foreground">via {job.numberLabel}</span>
+                  {/* Which Meta endpoint this job used. Only shown when it's
+                      the Marketing Messages path, so existing Cloud API jobs
+                      read exactly as they did before. */}
+                  {job.usedMarketingApi && (
+                    <Badge className="bg-violet-100 text-[10px] font-medium text-violet-700">
+                      Marketing API
+                    </Badge>
+                  )}
                 </div>
                 <p className="mt-1 truncate text-xs text-muted-foreground">
                   {job.templateName ? job.message || "(template body)" : job.message}
@@ -184,32 +227,47 @@ export function BroadcastStatusManager({ canDelete }: { canDelete: boolean }) {
                     <Loader2 className="h-5 w-5 animate-spin" />
                   </div>
                 ) : (
-                  <div className="max-h-96 overflow-y-auto">
-                    {recipients.map((r) => {
-                      const s = RECIPIENT_STATUS[r.status];
-                      return (
-                        <div
-                          key={r.guestId}
-                          className="flex items-center gap-3 border-b border-border px-4 py-2 last:border-0"
+                  <>
+                    {recipients.some((r) => r.status === "failed") && (
+                      <div className="flex justify-end border-b border-border px-4 py-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => downloadFailedRecipientsCsv(job, recipients)}
+                          className="gap-1.5"
                         >
-                          <Badge className={cn("shrink-0 gap-1 text-xs", s.className)}>
-                            <s.icon className="h-3 w-3" /> {s.label}
-                          </Badge>
-                          <div className="min-w-0 flex-1">
-                            <div className="truncate text-sm text-foreground">
-                              {r.guestName} <span className="text-muted-foreground">· {r.guestPhone ?? "no phone"}</span>
+                          <Download className="h-3.5 w-3.5" />
+                          Download failed ({recipients.filter((r) => r.status === "failed").length}) as CSV
+                        </Button>
+                      </div>
+                    )}
+                    <div className="max-h-96 overflow-y-auto">
+                      {recipients.map((r) => {
+                        const s = RECIPIENT_STATUS[r.status];
+                        return (
+                          <div
+                            key={r.guestId}
+                            className="flex items-center gap-3 border-b border-border px-4 py-2 last:border-0"
+                          >
+                            <Badge className={cn("shrink-0 gap-1 text-xs", s.className)}>
+                              <s.icon className="h-3 w-3" /> {s.label}
+                            </Badge>
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate text-sm text-foreground">
+                                {r.guestName} <span className="text-muted-foreground">· {r.guestPhone ?? "no phone"}</span>
+                              </div>
+                              {r.errorDetail && (
+                                <div className="truncate text-xs text-destructive">{r.errorDetail}</div>
+                              )}
                             </div>
-                            {r.errorDetail && (
-                              <div className="truncate text-xs text-destructive">{r.errorDetail}</div>
+                            {r.sentAt && (
+                              <span className="shrink-0 text-xs text-muted-foreground">{formatDateTime(r.sentAt)}</span>
                             )}
                           </div>
-                          {r.sentAt && (
-                            <span className="shrink-0 text-xs text-muted-foreground">{formatDateTime(r.sentAt)}</span>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
+                        );
+                      })}
+                    </div>
+                  </>
                 )}
               </div>
             )}

@@ -20,16 +20,47 @@ export async function GET(req: NextRequest) {
     const guestId = sp.get("guestId");
     const enquiryId = sp.get("enquiryId");
     const category = sp.get("category");
-    const scope = sp.get("scope"); // "general" = unattached library files
-    if (guestId) where.guestId = guestId;
-    if (enquiryId) where.enquiryId = enquiryId;
+    // "general"    = unattached library files only
+    // "attachable" = what a message composer may attach: the shared library
+    //                PLUS this guest's own documents, in one list. Matches
+    //                findAttachableDocument()'s rule on the send routes, so
+    //                the picker can't offer something the send would refuse.
+    const scope = sp.get("scope");
+    if (scope !== "attachable") {
+      if (guestId) where.guestId = guestId;
+      if (enquiryId) where.enquiryId = enquiryId;
+    }
     if (category && allowed.includes(category as DocumentCategory)) {
       where.category = category as DocumentCategory;
     }
     if (scope === "general") {
       where.guestId = null;
       where.enquiryId = null;
+    } else if (scope === "attachable") {
+      // AND, not OR: the permission narrowing below owns `where.OR`, and
+      // assigning it here would silently replace that filter.
+      where.AND = [
+        {
+          OR: [
+            { guestId: null, enquiryId: null },
+            ...(guestId ? [{ guestId }] : []),
+          ],
+        },
+      ];
     }
+
+    // Identity lookup for the composer's attachment picker: "is this exact
+    // file already here?" Matched on filename + size + type, which is what
+    // the browser knows about a picked File without reading its bytes.
+    // Needed as a server-side filter rather than a scan of the list above,
+    // because that list is capped at 200 rows and a library past that cap
+    // would silently re-upload duplicates.
+    const filename = sp.get("filename");
+    const sizeBytes = sp.get("sizeBytes");
+    const mimeType = sp.get("mimeType");
+    if (filename) where.filename = filename;
+    if (sizeBytes && Number.isFinite(Number(sizeBytes))) where.sizeBytes = Number(sizeBytes);
+    if (mimeType) where.mimeType = mimeType;
 
     // F40: lead-scoped callers (Reception AND read-only Staff) must not see
     // documents attached to guests/enquiries that aren't assigned to them.

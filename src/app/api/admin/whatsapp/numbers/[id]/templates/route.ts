@@ -10,7 +10,8 @@
 import { handle, ok, requireSession, ApiError } from "@/lib/api";
 import { can } from "@/lib/rbac";
 import { prisma } from "@/lib/prisma";
-import { listMessageTemplates } from "@/lib/whatsapp-cloud-api";
+import { listMessageTemplates, marketingApiEnabled } from "@/lib/whatsapp-cloud-api";
+import { shouldUseMarketingApi } from "@/lib/broadcast";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -42,6 +43,11 @@ export async function GET(
         category: t.category,
         language: t.language,
         components: t.components,
+        // True when picking this template would send it over Meta's Marketing
+        // Messages API rather than the Cloud API. There's nothing to choose —
+        // routing is decided by category — so the composer surfaces it instead
+        // of asking, and staff aren't left guessing which path a send took.
+        viaMarketingApi: shouldUseMarketingApi(t.category, marketingApiEnabled()),
       })),
     );
   });

@@ -80,6 +80,12 @@ export interface DemoEnquiry {
   doctorDecisionAt: string | null;
   doctorDecisionNote: string | null;
   lostRequestPending: boolean;
+  /** Free-text check-in preference captured on the lead form (EnquiryDTO
+   *  .preferredCheckIn) — e.g. "Second week of November". */
+  preferredCheckIn: string | null;
+  /** Soft delete. A non-null value moves the lead into the Deleted archive
+   *  and out of every live board/list query. */
+  deletedAt: string | null;
   lastActivityAt: string;
   createdAt: string;
   updatedAt: string;
@@ -128,6 +134,8 @@ export interface DemoMessage {
   /** Mirrors MessageDTO.attachment — the demo has no document table, so the
    *  file's metadata is denormalised onto the message it was sent with. */
   attachment?: { id: string; filename: string; mimeType: string } | null;
+  /** The message this one replies to, quoted in the thread (MessageDTO.replyTo). */
+  replyToId?: string | null;
 }
 
 export interface DemoTask {
@@ -268,6 +276,44 @@ export interface DemoBroadcastJob {
   deletedAt: string | null;
 }
 
+/** A file in the Resources library — what the composer's attachment picker
+ *  offers instead of re-uploading, and what the Documents tab lists. */
+export interface DemoDocument {
+  id: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  category: "medical" | "consent" | "operational" | "marketing";
+  guestId: string | null;
+  enquiryId: string | null;
+  uploadedBySub: string;
+  createdAt: string;
+}
+
+/** Per-campaign round-robin/least-busy assignment rule (Lead Assignment). */
+export interface DemoCampaignRule {
+  campaignSlug: string;
+  campaignLabel: string;
+  strategy: "round_robin" | "least_busy";
+  eligibleSubs: string[];
+}
+
+/** A generated daily marketing CSV (Reports → Marketing). */
+export interface DemoMarketingReport {
+  id: string;
+  reportDate: string | null;
+  rangeStart: string;
+  rangeEnd: string;
+  custom: boolean;
+  filename: string;
+  rowCount: number;
+  sizeBytes: number;
+  generatedAt: string;
+  emailedAt: string | null;
+  emailedTo: string | null;
+  emailError: string | null;
+}
+
 export interface DemoData {
   version: number;
   users: DemoUser[];
@@ -286,4 +332,7 @@ export interface DemoData {
   autoReplies: DemoAutoReply[];
   messageTemplates: DemoMessageTemplate[];
   broadcastJobs: DemoBroadcastJob[];
+  documents: DemoDocument[];
+  campaignRules: DemoCampaignRule[];
+  marketingReports: DemoMarketingReport[];
 }

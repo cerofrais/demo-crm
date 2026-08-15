@@ -9,7 +9,7 @@ export async function POST(
   { params }: { params: { id: string } },
 ) {
   return handle(async () => {
-    await requireAllPermissions(["messaging.send", "guests.view"]);
+    await requireAllPermissions(["messaging.broadcast", "guests.view"]);
     await cancelBroadcast(params.id);
     return ok({ id: params.id, cancelled: true });
   });

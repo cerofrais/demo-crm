@@ -46,10 +46,19 @@ export const createEnquirySchema = z.object({
   email: z.string().email().optional().or(z.literal("")).transform((v) => v || undefined),
   city: z.string().optional(),
   gender: z.enum(["male", "female", "other"]).optional(),
+  /** Approximate — derived from a self-reported "Age" form field, not a real
+   *  birth date. Only ever used to backfill a guest that has none yet. */
+  dateOfBirth: z.coerce.date().nullable().optional(),
   source: z.enum(SOURCES),
   campaignLabel: z.string().optional(),
   referralCode: z.string().optional(),
+  /** Applied to the GUEST record (directory-level attributes). */
   tags: z.array(z.string()).optional(),
+  /** Applied to the LEAD card — e.g. the "package:mini-detox" preference tag
+   *  read off an enquiry form. Merged under the computed system tags. */
+  enquiryTags: z.array(z.string()).optional(),
+  /** Check-in date the guest asked for. ISO yyyy-mm-dd or a full timestamp. */
+  preferredCheckIn: z.coerce.date().nullable().optional(),
   note: z.string().optional(),
 });
 export type CreateEnquiryInput = z.infer<typeof createEnquirySchema>;
@@ -123,6 +132,14 @@ export const updateEnquirySchema = z.object({
   stage: z.enum(STAGE_IDS as [string, ...string[]]).optional(),
   needsAttention: z.boolean().optional(),
   intakeNotes: z.string().nullable().optional(),
+  // "" clears it — the drawer's date input sends an empty string when the
+  // rep blanks the field, and z.coerce.date() would turn that into an
+  // Invalid Date rather than a null.
+  preferredCheckIn: z
+    .union([z.coerce.date(), z.literal("")])
+    .nullable()
+    .optional()
+    .transform((v) => (v === "" ? null : v)),
 });
 
 export const tagMutationSchema = z
@@ -187,6 +204,11 @@ export const enquiryWebhookSchema = z.object({
   // deprecated alias so older integrations aren't broken.
   intakeNotes: z.string().optional(),
   message: z.string().optional(),
+  /** Check-in date the guest asked for, ISO yyyy-mm-dd. */
+  preferredCheckIn: z.coerce.date().optional(),
+  /** Free text as the form captured it ("Mini Detox") — becomes a
+   *  package:<slug> tag on the card, same as the website-form email path. */
+  packagePreference: z.string().optional(),
 });
 
 // ---------------------------------------------------------------------------

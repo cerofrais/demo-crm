@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { X, Clock, Calendar, MessageSquare, FileText, FolderOpen, Mail, MessageCircle, Loader2, Plus, Phone, Sparkles, Trash2, Ban, Paperclip, Download } from "lucide-react";
+import { X, Clock, Calendar, MessageSquare, FileText, FolderOpen, Mail, MessageCircle, Loader2, Plus, Phone, Sparkles, Trash2, Ban, Paperclip, Download, CheckCircle2, XCircle } from "lucide-react";
 import { Button, Input, Select, Textarea, Badge, Sheet, Dialog, ScrollableTabs, type TabItem } from "@/components/ui";
 import { AudioRecordButton } from "@/components/ui/audio-record-button";
 import { STAGES, STAGE_MAP } from "@/lib/kanban";
@@ -19,6 +19,7 @@ import { AssistPanel } from "@/components/ai/assist-panel";
 import { OwnerPicker } from "@/components/leads/owner-picker";
 import type { EnquiryDTO, TimelineItemDTO } from "@/lib/types";
 import type { EnquiryStage } from "@prisma/client";
+import { useRouter } from "next/navigation";
 
 type Tab = "details" | "remarks" | "conversation" | "whatsapp" | "calls" | "ai" | "documents" | "activity";
 
@@ -52,8 +53,12 @@ export function LeadDrawer({
   onClose,
   onUpdated,
   onDeleted,
+  initialTab,
 }: {
   enquiry: EnquiryDTO | null;
+  /** Open straight onto a tab — the notification dropdown sends you to the
+   *  channel the new message arrived on, not to Details. */
+  initialTab?: Tab;
   canManage: boolean;
   /** Can mutate this lead at all — field edits, remarks, tasks, tags. False
    *  for a read-only Viewer. */
@@ -75,6 +80,7 @@ export function LeadDrawer({
   const [remarkUploadCategory, setRemarkUploadCategory] = useState<string | null>(null);
   const remarkFileRef = useRef<HTMLInputElement>(null);
   const [saving, setSaving] = useState(false);
+  const router = useRouter();
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState<"soft" | "hard" | null>(null);
   const [form, setForm] = useState({
@@ -85,6 +91,7 @@ export function LeadDrawer({
     quotedPriceINR: "",
     stage: "new_lead" as EnquiryStage,
     intakeNotes: "",
+    preferredCheckIn: "",
   });
   const [vocab, setVocab] = useState<string[]>([]);
   const [tagInput, setTagInput] = useState("");
@@ -107,7 +114,8 @@ export function LeadDrawer({
 
   useEffect(() => {
     if (!enquiry) return;
-    setTab("details");
+    // Whatever the opener asked for, else back to Details for a fresh open.
+    setTab(initialTab ?? "details");
     setDetailsError(null);
     setRemarkError(null);
     setDeleteError(null);
@@ -119,6 +127,10 @@ export function LeadDrawer({
       quotedPriceINR: enquiry.quotedPriceINR?.toString() ?? "",
       stage: enquiry.stage,
       intakeNotes: enquiry.intakeNotes ?? "",
+      // Stored at UTC midnight for the guest's calendar date, so slicing the
+      // ISO string gives the <input type="date"> value back unchanged. Going
+      // via local time here would shift it a day for anyone west of UTC.
+      preferredCheckIn: enquiry.preferredCheckIn?.slice(0, 10) ?? "",
     });
     // Clear the attention flag as soon as a rep opens the drawer.
     if (enquiry.needsAttention && canWorkLeads) {
@@ -127,7 +139,7 @@ export function LeadDrawer({
         .then(onUpdated)
         .catch(() => null);
     }
-  }, [enquiry?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [enquiry?.id, initialTab]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     api.get<string[]>("/api/tags").then(setVocab).catch(() => {});
@@ -167,6 +179,8 @@ export function LeadDrawer({
         quotedPriceINR: form.quotedPriceINR ? Number(form.quotedPriceINR) : null,
         stage: form.stage,
         intakeNotes: form.intakeNotes,
+        // "" clears the date; the schema maps it to null.
+        preferredCheckIn: form.preferredCheckIn,
       });
       onUpdated(updated);
     } catch (e) {
@@ -703,6 +717,16 @@ export function LeadDrawer({
                   onChange={(e) => setForm((f) => ({ ...f, city: e.target.value }))}
                 />
               </Field>
+              <Field label="Preferred check-in">
+                <Input
+                  type="date"
+                  value={form.preferredCheckIn}
+                  disabled={!canWorkLeads}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, preferredCheckIn: e.target.value }))
+                  }
+                />
+              </Field>
               <Field label="Quoted price (INR)">
                 <Input
                   type="number"
@@ -730,6 +754,14 @@ export function LeadDrawer({
                 <Meta label="Age group" value={g.ageGroup ?? "—"} />
                 <Meta label="Gender" value={g.gender ?? "—"} />
                 <Meta label="Current quote" value={formatINR(enquiry.quotedPriceINR)} />
+                <Meta
+                  label="Preferred check-in"
+                  value={
+                    enquiry.preferredCheckIn
+                      ? formatIST(enquiry.preferredCheckIn, { dateStyle: "medium" })
+                      : "—"
+                  }
+                />
               </div>
               {detailsError && (
                 <div className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -891,9 +923,22 @@ export function LeadDrawer({
               )}
               {timeline.map((item) => {
                 const isAdminNote = item.kind === "note" && item.actorRole === "ADMIN";
+                // "Task created/completed/cancelled" entries all carry the
+                // task's id in their metadata, so the timeline can hand you
+                // straight to it rather than leaving you to find it in the
+                // Tasks tab yourself.
+                const taskId =
+                  (item.actionType === "task_created" ||
+                    item.actionType === "task_completed" ||
+                    item.actionType === "task_cancelled") &&
+                  typeof item.meta?.taskId === "string"
+                    ? item.meta.taskId
+                    : null;
                 return (
                   <div
                     key={item.id}
+                    onClick={taskId ? () => router.push(`/tasks?task=${taskId}`) : undefined}
+                    title={taskId ? "Open this task in Tasks & Reminders" : undefined}
                     className={cn(
                       "rounded-lg border p-3",
                       isAdminNote
@@ -901,6 +946,7 @@ export function LeadDrawer({
                         : item.kind === "note"
                           ? "border-border bg-brand-50/60"
                           : "border-border",
+                      taskId && "cursor-pointer transition-colors hover:border-brand-300 hover:bg-brand-50/40",
                     )}
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -908,6 +954,16 @@ export function LeadDrawer({
                         {item.actorName}
                         {isAdminNote && (
                           <Badge className="bg-indigo-100 text-indigo-700">Admin</Badge>
+                        )}
+                        {item.actionType === "task_completed" && (
+                          <Badge className="flex items-center gap-1 bg-emerald-100 text-emerald-700">
+                            <CheckCircle2 className="h-3 w-3" /> Done
+                          </Badge>
+                        )}
+                        {item.actionType === "task_cancelled" && (
+                          <Badge className="flex items-center gap-1 bg-muted text-muted-foreground">
+                            <XCircle className="h-3 w-3" /> Cancelled
+                          </Badge>
                         )}
                       </span>
                       <span className="shrink-0 text-xs text-muted-foreground">

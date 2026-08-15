@@ -44,6 +44,7 @@ export async function GET(
       ...activities.map((a): TimelineItemDTO => ({
         id: a.id,
         kind: "activity",
+        actionType: a.actionType,
         actorName: a.actorName ?? "System",
         text: describeActivity(a.actionType, a.metadata as Record<string, unknown>),
         createdAt: a.createdAt.toISOString(),
@@ -83,6 +84,10 @@ function describeActivity(
       return "Added a remark";
     case "task_created":
       return `Added task: ${meta.title ?? "a reminder"}`;
+    case "task_completed":
+      return `Completed task: ${meta.title ?? "a reminder"}`;
+    case "task_cancelled":
+      return `Cancelled task: ${meta.title ?? "a reminder"}`;
     case "message_sent": {
       const channel = typeof meta.channel === "string" ? meta.channel : "a message";
       const via = typeof meta.numberLabel === "string" ? ` via ${meta.numberLabel}` : "";

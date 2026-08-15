@@ -4,8 +4,11 @@ import { prisma } from "./prisma";
 import { logger } from "./logger";
 import { createEnquiry } from "./enquiry-service";
 import { reviveEnquiryIfDeleted } from "./enquiries";
+import { reviveGuestIfDeleted } from "./guest-revive";
 import { configuredMailboxes, type MailboxConfig } from "./mailboxes";
-import { formatWebsiteFormNotes, parseWebsiteFormEmail, type WebsiteFormLead } from "./website-form-parser";
+import { formatWebsiteFormNotes, parseWebsiteFormEmail, parseFormDate, type WebsiteFormLead } from "./website-form-parser";
+import { ageToDateOfBirth } from "./utils";
+import { packageTag } from "./lead-tags";
 import { formatMedicalFormNotes, parseMedicalScreeningForm, type MedicalFormSubmission } from "./medical-form-parser";
 import { upsertHealthRecordBackfill } from "./health-ingest";
 
@@ -54,6 +57,13 @@ async function resolveWebsiteFormLead(
   form: WebsiteFormLead,
 ): Promise<{ guestId: string; enquiryId?: string; needsReview: boolean }> {
   const note = formatWebsiteFormNotes(form);
+  // "Package Preference: Mini Detox" -> a package:mini-detox tag on the card,
+  // so it's filterable/visible at a glance instead of buried in intake notes
+  // (where it still appears, alongside the fields that have no column).
+  const pkgTag = form.package ? packageTag(form.package) : null;
+  // Only a parseable date reaches the column; anything else ("flexible",
+  // "mid-August") stays in the notes rather than being guessed at.
+  const checkIn = form.checkinDate ? parseFormDate(form.checkinDate) : null;
   try {
     const result = await createEnquiry({
       fullName: form.fullName,
@@ -61,6 +71,12 @@ async function resolveWebsiteFormLead(
       email: form.email ?? undefined,
       city: form.city ?? undefined,
       source: "website_form",
+      preferredCheckIn: checkIn,
+      // Self-reported, not a real DOB — only ever backfills a guest that has
+      // none yet (see createEnquiry), so a more precise DOB from elsewhere
+      // (e.g. the medical screening form) is never clobbered by this.
+      dateOfBirth: form.age != null ? ageToDateOfBirth(form.age) : undefined,
+      enquiryTags: pkgTag ? [pkgTag] : undefined,
       note,
     });
     return {
@@ -105,10 +121,13 @@ async function resolveMedicalFormGuest(
   const { contact, health } = submission;
   const phone = contact.phone!; // parseMedicalScreeningForm() requires this to be non-null
 
+  // Soft-deleted guests included — see resolveGuestId()'s note; the phone is
+  // still unique against the hidden row, so a filtered miss becomes a P2002.
   const existing = await prisma.guest.findFirst({
-    where: { phone, deletedAt: null },
+    where: { phone },
     select: {
       id: true,
+      deletedAt: true,
       email: true,
       city: true,
       gender: true,
@@ -118,6 +137,9 @@ async function resolveMedicalFormGuest(
   });
 
   if (existing) {
+    if (existing.deletedAt) {
+      await reviveGuestIfDeleted(existing.id, "medical screening form submitted");
+    }
     await prisma.guest.update({
       where: { id: existing.id },
       data: {
@@ -222,14 +244,19 @@ async function resolveGuestId(
 
   // 4) Sender → existing guest by email.
   if (fromEmail) {
+    // Soft-deleted guests included: they still own this address on the unique
+    // index, so skipping them means a create that P2002s. Revive instead —
+    // blocked senders were already dropped by processMessage().
     const guest = await prisma.guest.findFirst({
-      where: { email: fromEmail, deletedAt: null },
+      where: { email: fromEmail },
       select: {
         id: true,
+        deletedAt: true,
         enquiries: { orderBy: { lastActivityAt: "desc" }, take: 1, select: { id: true } },
       },
     });
     if (guest) {
+      if (guest.deletedAt) await reviveGuestIfDeleted(guest.id, "inbound email");
       return {
         guestId: guest.id,
         enquiryId: guest.enquiries[0]?.id,
@@ -259,6 +286,9 @@ async function resolveGuestId(
     };
   } catch (err) {
     logger.error({ err, mailbox: mailbox.id, fromEmail }, "inbound auto-enquiry failed; falling back to guest-only capture");
+    // Matches on email alone, so it can land on a soft-deleted guest and file
+    // the mail against a record nobody can see — revive, same as the WhatsApp
+    // fallback.
     const guest = fromEmail
       ? await prisma.guest.upsert({
           where: { email: fromEmail },
@@ -270,6 +300,9 @@ async function resolveGuestId(
           data: { fullName: displayName },
           select: { id: true },
         });
+    if (fromEmail) {
+      await reviveGuestIfDeleted(guest.id, "inbound email (enquiry creation failed)");
+    }
     return { guestId: guest.id, needsReview: true };
   }
 }
@@ -292,8 +325,11 @@ async function processMessage(mailbox: MailboxConfig, source: Buffer): Promise<v
   // already exists. Same reasoning/placement as the WhatsApp webhook's
   // equivalent check.
   if (fromEmail) {
+    // No deletedAt filter — a guest blocked and then soft-deleted stays
+    // blocked, and never reaches the revive in resolveGuestId(). Same
+    // reasoning as the WhatsApp webhook's equivalent check.
     const blockedGuest = await prisma.guest.findFirst({
-      where: { email: fromEmail, deletedAt: null, isBlocked: true },
+      where: { email: fromEmail, isBlocked: true },
       select: { id: true },
     });
     if (blockedGuest) {

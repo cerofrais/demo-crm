@@ -11,6 +11,7 @@ import { chatJSON } from "./provider";
 import { transcribeAudio, transcriptionEnabled } from "./transcribe";
 import { reconcileTranscript, type TranscriptAttempt } from "./transcript-translate";
 import { asrLanguages } from "./config";
+import { collapseRepetitions, isUsableTranscript } from "./transcript-quality";
 import { logAiDecision } from "./audit";
 import { DATA_FENCE_RULES, fence, llmNumber, llmString, llmStringArray, parseLlm } from "./safety";
 
@@ -103,7 +104,26 @@ export async function analyzeCall(
   // upgraded the next time it's processed.
   let transcript = call.transcript;
   let transcriptEnglish = call.transcriptEnglish;
-  if (!transcriptEnglish && call.recordingUrl && transcriptionEnabled()) {
+
+  // A no_answer call still has a recording: Plivo bridges the rep's leg first,
+  // so the file contains the "Connecting your customer now…" announcement and
+  // then ringing. There is no conversation in it to transcribe.
+  //
+  // Measured over 50 recordings >30s: 21 were no_answer, and feeding them to
+  // ASR produced 12 repetition loops ("Hello. Hello. Hello…" for two minutes)
+  // which then went on to the summariser as if they were real calls. Skipping
+  // them removes that whole class of garbage and ~15 minutes of CPU per 50.
+  //
+  // Deliberately only no_answer: `voicemail` recordings do contain speech, and
+  // the call is still analysed from its notes below either way.
+  const answered = call.status !== "no_answer";
+  if (!answered && call.recordingUrl) {
+    logger.info(
+      { callId, status: call.status },
+      "ai: skipping transcription — call was never answered, recording is ringing only",
+    );
+  }
+  if (!transcriptEnglish && call.recordingUrl && answered && transcriptionEnabled()) {
     const upstream = await fetchRecording(call.recordingUrl);
     if (upstream.ok) {
       const audio = await upstream.arrayBuffer();
@@ -111,7 +131,16 @@ export async function analyzeCall(
       for (const lang of asrLanguages()) {
         try {
           const text = await transcribeAudio(audio, `call-${call.id}.mp3`, lang);
-          attempts.push({ language: lang, text });
+          // A dead decode returns "" or a couple of syllables rather than an
+          // error. Drop it here so it never counts as a usable attempt.
+          if (isUsableTranscript(text)) {
+            attempts.push({ language: lang ?? "auto", text });
+          } else {
+            logger.warn(
+              { callId, lang, chars: text.trim().length },
+              "ai: transcription attempt returned no usable speech",
+            );
+          }
         } catch (err) {
           logger.warn({ callId, lang, err }, "ai: transcription attempt failed");
         }
@@ -121,12 +150,16 @@ export async function analyzeCall(
           callId: call.id,
           enquiryId: call.enquiryId ?? undefined,
         });
-        transcript = reconciled.nativeText;
-        transcriptEnglish = reconciled.englishText;
-        await prisma.call.update({
-          where: { id: call.id },
-          data: { transcript, transcriptEnglish, transcriptLanguage: reconciled.language },
-        });
+        if (reconciled) {
+          transcript = collapseRepetitions(reconciled.nativeText);
+          transcriptEnglish = collapseRepetitions(reconciled.englishText);
+          await prisma.call.update({
+            where: { id: call.id },
+            data: { transcript, transcriptEnglish, transcriptLanguage: reconciled.language },
+          });
+        } else {
+          logger.warn({ callId }, "ai: transcript unrecoverable, leaving call untranscribed");
+        }
       } else {
         logger.warn({ callId }, "ai: all transcription attempts failed");
       }

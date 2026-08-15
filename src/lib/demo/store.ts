@@ -5,9 +5,13 @@ import { generateSeed } from "./seed";
 
 const STORAGE_KEY = "meridian_demo_data_v1";
 // v2 — added seeded email threads (previously WhatsApp-only), so anyone
-// carrying a v1 payload in localStorage gets reseeded rather than landing on
-// an empty Email tab.
-const SEED_VERSION = 2;
+//      carrying a v1 payload gets reseeded rather than landing on an empty
+//      Email tab.
+// v3 — deleted-lead archive, Resources documents, campaign assignment rules
+//      and marketing reports, for the features merged from main.
+// Bumping forces a reseed; without it a stale payload renders the new pages
+// empty, which reads as a bug rather than as an out-of-date cache.
+const SEED_VERSION = 3;
 
 let cache: DemoData | null = null;
 const listeners = new Set<() => void>();

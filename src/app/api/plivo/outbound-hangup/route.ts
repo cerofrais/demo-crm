@@ -4,6 +4,7 @@
  */
 import { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { touchLead } from "@/lib/enquiries";
 import { verifyPlivoRequest, formToParams, isSafeRecordingUrl } from "@/lib/plivo";
 import { logger } from "@/lib/logger";
 import type { CallStatus } from "@prisma/client";
@@ -69,6 +70,11 @@ export async function POST(req: NextRequest) {
       ...(callUUID && { callUUID }),
     },
   }).catch(() => null);
+
+  // A finished call is activity on the lead — float its card to the top of
+  // the board column, the same as an inbound message does. This is the
+  // outbound rep-initiated leg, which is the common case.
+  await touchLead(current?.enquiryId);
 
   // The rep placing the call is a staff action worth showing up in the
   // Activity Log/Performance report — previously only a MISSED call ever

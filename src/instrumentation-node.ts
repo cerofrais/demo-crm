@@ -9,6 +9,7 @@ import { runAiPipeline } from "@/lib/ai/pipeline";
 import { aiPipelineEnabled, aiPipelineIntervalSec } from "@/lib/ai/config";
 import { runDeletionSweep } from "@/lib/lead-deletion";
 import { tickBroadcast } from "@/lib/broadcast";
+import { tickDailyMarketingReport } from "@/lib/marketing-report";
 import { logger } from "@/lib/logger";
 
 const g = globalThis as unknown as {
@@ -16,6 +17,7 @@ const g = globalThis as unknown as {
   __treAiPipelineStarted?: boolean;
   __treDeletionSweepStarted?: boolean;
   __treBroadcastStarted?: boolean;
+  __treMarketingReportStarted?: boolean;
 };
 
 if (process.env.EMAIL_INBOUND_ENABLED === "true" && !g.__treInboundStarted) {
@@ -56,4 +58,18 @@ if (!g.__treBroadcastStarted) {
     void tickBroadcast();
     setInterval(() => void tickBroadcast(), intervalSec * 1000);
   }, 15_000);
+}
+
+if (!g.__treMarketingReportStarted) {
+  g.__treMarketingReportStarted = true;
+  // Ticked every 15 minutes; the tick itself does nothing until the configured
+  // IST hour, and nothing at all once the day's report has been emailed. The
+  // "already done" check is the MarketingReport row, not this timer, so a
+  // restart or a second instance can't re-send to the CEO.
+  const intervalSec = 900;
+  logger.info({ intervalSec }, "daily marketing report scheduler starting");
+  setTimeout(() => {
+    void tickDailyMarketingReport();
+    setInterval(() => void tickDailyMarketingReport(), intervalSec * 1000);
+  }, 45_000);
 }

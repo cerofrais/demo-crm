@@ -245,3 +245,48 @@ per-number "view templates" action on `/whatsapp-numbers`) but not in the
 broadcast picker. `hello_world` is Meta's default template on every new
 WABA — the fastest way to prove a number can actually send before your own
 templates finish review.
+
+### Marketing Messages API (MM Lite) — `WHATSAPP_MM_API_ENABLED`
+
+Meta's Cloud API sends marketing templates without regard for whether the
+recipient is likely to engage, and gates them after the fact with error
+**131049** ("in order to maintain a healthy ecosystem engagement, the message
+failed to be delivered"). On this deployment that single code accounted for
+**495 of 649** outbound WhatsApp failures over ten days — a 63% failure rate
+on the Cloud API number, rising day over day (1 → 177 → 317) as Meta throttled
+harder.
+
+The Marketing Messages API (formerly MM Lite) is Meta's answer to exactly
+that: the same request body posted to `POST /{phone-number-id}/marketing_messages`
+instead of `/messages`, run through the engagement ranking behind Meta's ads
+ecosystem. Same WABA, same approved templates, no migration — it runs
+*parallel* to the Cloud API rather than replacing it, and Meta has signalled
+that marketing will eventually move to it exclusively.
+
+Wiring here:
+
+- `WHATSAPP_MM_API_ENABLED=true` turns it on. It is a kill switch, not a
+  migration — set it back to `false` and everything returns to `/messages`
+  without a deploy.
+- **Only `MARKETING` templates are eligible.** Meta rejects utility,
+  authentication and service templates on that endpoint, so
+  `shouldUseMarketingApi()` in `src/lib/broadcast.ts` fails closed: anything
+  that isn't a confirmed `MARKETING` category — including a category lookup
+  that failed — stays on the Cloud API path.
+- The category is resolved **server-side from Meta** at job creation
+  (`listMessageTemplates`), never taken from the request body: it decides
+  which endpoint real sends go to, so a client-supplied value would be a way
+  to have every message rejected.
+- `BroadcastJob.templateCategory` and `BroadcastJob.usedMarketingApi` record
+  the decision per job. The flag is read once at creation, so flipping the env
+  mid-run can't split one job across both endpoints, and an old job's path
+  stays attributable after the env changes. The Broadcast Status page shows a
+  "Marketing API" badge on jobs that used it.
+
+**What it does not fix.** 131049 is the bulk of the failures but not all of
+them: 131047 (24h window expired — needs a template, not free text), 131026
+(undeliverable number) and 130472 (recipient in a Meta experiment) are
+unaffected. Meta's own A/B test claims up to 9% better delivery, so expect an
+improvement, not an elimination — a 63% rejection rate also points at audience
+quality and send pacing (`BroadcastJob.delaySec`, currently 1s), which no API
+change addresses.

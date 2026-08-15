@@ -3,6 +3,7 @@ import { prisma } from "./prisma";
 import { logger } from "./logger";
 import { createEnquiry } from "./enquiry-service";
 import { reviveEnquiryIfDeleted } from "./enquiries";
+import { reviveGuestIfDeleted } from "./guest-revive";
 import { sendText, sendMedia, sendAudio, type WhatsAppMediaType } from "./whatsapp-admin";
 
 /** WhatsApp JID ("919876543210@s.whatsapp.net") -> our E.164 phone format. */
@@ -78,15 +79,136 @@ function extFor(mimetype: string): string {
   return EXT_BY_MIME[mimetype] ?? mimetype.split("/")[1]?.split(";")[0] ?? "bin";
 }
 
+/** A quoted-reply pointer. Evolution normalises a reply to `{contextInfo:
+ * {stanzaId}}` alongside the reply's own content, where stanzaId is the
+ * WhatsApp id of the message being replied to. Baileys also nests the same
+ * contextInfo inside the typed message (extendedTextMessage, imageMessage…),
+ * so both shapes are read. */
+interface WaContextInfo {
+  stanzaId?: string;
+  quotedMessage?: WaMessageContent;
+}
+
 export interface WaMessageContent {
   conversation?: string;
-  extendedTextMessage?: { text?: string };
-  imageMessage?: { caption?: string; mimetype?: string };
-  videoMessage?: { caption?: string; mimetype?: string };
-  audioMessage?: { mimetype?: string };
-  documentMessage?: { caption?: string; mimetype?: string; fileName?: string };
+  contextInfo?: WaContextInfo;
+  extendedTextMessage?: { text?: string; contextInfo?: WaContextInfo };
+  imageMessage?: { caption?: string; mimetype?: string; contextInfo?: WaContextInfo };
+  videoMessage?: { caption?: string; mimetype?: string; contextInfo?: WaContextInfo };
+  audioMessage?: { mimetype?: string; contextInfo?: WaContextInfo };
+  documentMessage?: { caption?: string; mimetype?: string; fileName?: string; contextInfo?: WaContextInfo };
   documentWithCaptionMessage?: { message?: { documentMessage?: { caption?: string; mimetype?: string; fileName?: string } } };
-  stickerMessage?: { mimetype?: string };
+  stickerMessage?: { mimetype?: string; contextInfo?: WaContextInfo };
+  // Types below carry no downloadable media; they're rendered as a text label
+  // by describeNonMediaMessage() rather than becoming a Document.
+  reactionMessage?: { text?: string; key?: { id?: string } };
+  locationMessage?: { degreesLatitude?: number; degreesLongitude?: number; name?: string; address?: string };
+  liveLocationMessage?: { degreesLatitude?: number; degreesLongitude?: number };
+  contactMessage?: { displayName?: string };
+  contactsArrayMessage?: { displayName?: string; contacts?: unknown[] };
+  albumMessage?: { expectedImageCount?: number; expectedVideoCount?: number };
+  pollCreationMessage?: { name?: string };
+  pollCreationMessageV3?: { name?: string };
+  eventMessage?: { name?: string };
+  orderMessage?: { itemCount?: number };
+  listMessage?: { title?: string };
+  templateMessage?: unknown;
+  interactiveMessage?: unknown;
+  buttonsMessage?: unknown;
+  listResponseMessage?: { title?: string };
+  buttonsResponseMessage?: { selectedDisplayText?: string };
+  templateButtonReplyMessage?: { selectedDisplayText?: string };
+  secretEncryptedMessage?: unknown;
+}
+
+/**
+ * The WhatsApp id of the message this one replies to, or null when it isn't a
+ * reply. Checked at the top level (Evolution's normalised shape) and inside
+ * each typed message (Baileys' native shape) — a reply can carry media, so
+ * this is deliberately independent of detectInboundMedia().
+ */
+export function quotedMessageId(message: WaMessageContent): string | null {
+  const candidates = [
+    message.contextInfo,
+    message.extendedTextMessage?.contextInfo,
+    message.imageMessage?.contextInfo,
+    message.videoMessage?.contextInfo,
+    message.audioMessage?.contextInfo,
+    message.documentMessage?.contextInfo,
+    message.stickerMessage?.contextInfo,
+  ];
+  for (const ctx of candidates) {
+    const id = ctx?.stanzaId?.trim();
+    if (id) return id;
+  }
+  return null;
+}
+
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * Human-readable label for a message that carries no downloadable media and
+ * isn't plain text — reactions, locations, shared contacts, polls, order and
+ * button/list replies. Without this every one of them was stored as the
+ * useless "[Unsupported message type]"; 130 rows on this deployment, the
+ * largest groups being reactions, albums and locations.
+ *
+ * Returns null for anything genuinely unrecognised, so the caller keeps its
+ * existing fallback rather than inventing a label.
+ */
+export function describeNonMediaMessage(message: WaMessageContent): string | null {
+  if (message.reactionMessage) {
+    const emoji = message.reactionMessage.text?.trim();
+    // An empty reaction body is WhatsApp's "reaction removed" signal.
+    return emoji ? `Reacted ${emoji}` : "Removed a reaction";
+  }
+  const loc = message.locationMessage ?? message.liveLocationMessage;
+  if (loc) {
+    const named = message.locationMessage?.name ?? message.locationMessage?.address;
+    const coords =
+      loc.degreesLatitude != null && loc.degreesLongitude != null
+        ? `${loc.degreesLatitude.toFixed(5)}, ${loc.degreesLongitude.toFixed(5)}`
+        : null;
+    const live = message.liveLocationMessage ? "Live location" : "Location";
+    return `📍 ${live}${named ? `: ${named}` : ""}${coords ? ` (${coords})` : ""}`;
+  }
+  if (message.contactMessage || message.contactsArrayMessage) {
+    const name = message.contactMessage?.displayName ?? message.contactsArrayMessage?.displayName;
+    const count = message.contactsArrayMessage?.contacts?.length;
+    if (count && count > 1) return `👤 Shared ${plural(count, "contact")}`;
+    return `👤 Shared contact${name ? `: ${name}` : ""}`;
+  }
+  if (message.albumMessage) {
+    const images = message.albumMessage.expectedImageCount ?? 0;
+    const videos = message.albumMessage.expectedVideoCount ?? 0;
+    const total = images + videos;
+    // The album header arrives first; the individual items follow as their own
+    // messages and are stored separately, so this is a marker, not a loss.
+    return total ? `🖼️ Album (${plural(total, "item")})` : "🖼️ Album";
+  }
+  const poll = message.pollCreationMessage ?? message.pollCreationMessageV3;
+  if (poll) return `📊 Poll${poll.name ? `: ${poll.name}` : ""}`;
+  if (message.eventMessage) {
+    return `📅 Event${message.eventMessage.name ? `: ${message.eventMessage.name}` : ""}`;
+  }
+  if (message.orderMessage) {
+    const n = message.orderMessage.itemCount;
+    return `🛒 Order${n ? ` (${plural(n, "item")})` : ""}`;
+  }
+  const buttonReply =
+    message.buttonsResponseMessage?.selectedDisplayText ??
+    message.templateButtonReplyMessage?.selectedDisplayText ??
+    message.listResponseMessage?.title;
+  if (buttonReply) return buttonReply;
+  if (message.listMessage?.title) return `📋 ${message.listMessage.title}`;
+  if (message.templateMessage || message.interactiveMessage || message.buttonsMessage) {
+    return "[Interactive message]";
+  }
+  // WhatsApp couldn't decrypt this for us; nothing is recoverable.
+  if (message.secretEncryptedMessage) return "[Encrypted message — not readable]";
+  return null;
 }
 
 /** Detects a media type from a messages.upsert `data.message` object, or
@@ -192,13 +314,16 @@ export async function resolveGuestByPhone(
   phone: string,
   pushName: string | null,
 ): Promise<{ guestId: string; enquiryId?: string }> {
+  // Includes soft-deleted GUESTS as well as soft-deleted enquiries — a
+  // re-engaging guest revives their hidden record and ticket instead of
+  // getting a silent duplicate opened underneath them (or, for the guest,
+  // a P2002 on the still-unique phone number). Blocked guests never reach
+  // here: the webhook drops them before this call.
   const guest = await prisma.guest.findFirst({
-    where: { phone, deletedAt: null },
+    where: { phone },
     select: {
       id: true,
-      // Includes soft-deleted enquiries — a re-engaging guest revives their
-      // hidden ticket (reviveEnquiryIfDeleted below) instead of getting a
-      // silent duplicate opened underneath it.
+      deletedAt: true,
       enquiries: {
         orderBy: { lastActivityAt: "desc" },
         take: 1,
@@ -206,6 +331,9 @@ export async function resolveGuestByPhone(
       },
     },
   });
+  if (guest?.deletedAt) {
+    await reviveGuestIfDeleted(guest.id, "inbound WhatsApp message");
+  }
   if (guest?.enquiries[0]) {
     const enquiry = guest.enquiries[0];
     if (enquiry.deletedAt) await reviveEnquiryIfDeleted(enquiry.id);
@@ -226,12 +354,17 @@ export async function resolveGuestByPhone(
     return { guestId: result.enquiry.guest.id, enquiryId: result.enquiry.id };
   } catch (err) {
     logger.error({ err, phone }, "whatsapp auto-enquiry failed; falling back to guest-only capture");
+    // This upsert matches on phone alone, so it can land on a soft-deleted
+    // guest — which would file the message against a record nobody can see.
+    // Revive here too: whatever made createEnquiry fail, the message itself
+    // is real inbound contact.
     const fallback = await prisma.guest.upsert({
       where: { phone },
       update: {},
       create: { fullName: pushName?.trim() || phone, phone },
       select: { id: true },
     });
+    await reviveGuestIfDeleted(fallback.id, "inbound WhatsApp message (enquiry creation failed)");
     return { guestId: fallback.id };
   }
 }

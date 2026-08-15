@@ -9,6 +9,7 @@ import { formatPackageForEmail } from "@/lib/packages";
 import { personalizeTemplate } from "@/lib/message-templates";
 import { sanitizeEmailHtml, extractCidImageIds, buildInlineImageAttachments } from "@/lib/mail-html";
 import { getObjectBuffer, headObject } from "@/lib/storage";
+import { findBroadcastableDocument } from "@/lib/attachment-access";
 import { logger } from "@/lib/logger";
 import { redis } from "@/lib/redis";
 import { rateLimit, rateLimitResponse, type RateLimitResult } from "@/lib/rate-limit";
@@ -50,8 +51,11 @@ const schema = z.object({
 export async function POST(req: NextRequest) {
   return handle(async () => {
     const ctx = await requireSession();
-    if (!canSendEmail(ctx.roles)) {
-      throw new ApiError("FORBIDDEN", "You cannot send email", 403);
+    // messaging.broadcast, not messaging.send: this mails every guest in the
+    // selection at once. A role allowed to reply to one guest is not
+    // automatically allowed to mail the whole directory.
+    if (!can(ctx.roles, "messaging.broadcast") || !canSendEmail(ctx.roles)) {
+      throw new ApiError("FORBIDDEN", "You cannot send bulk email", 403);
     }
     const mailbox = mailboxForRoles(ctx.roles);
     if (!mailbox || !mailbox.configured) {
@@ -101,7 +105,10 @@ export async function POST(req: NextRequest) {
     // once here rather than re-downloading it from storage per send.
     let sharedAttachment: { filename: string; content: Buffer; contentType?: string } | null = null;
     if (attachmentDocumentId) {
-      const doc = await prisma.document.findUnique({ where: { id: attachmentDocumentId } });
+      // Library files only, and only in a category this sender may read. An
+      // unscoped lookup here would take ANY document id in the system — one
+      // guest's medical scan, attached by id and mailed to a whole list.
+      const doc = await findBroadcastableDocument(attachmentDocumentId, ctx.roles);
       if (!doc) throw new ApiError("NOT_FOUND", "Attachment not found", 404);
       const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
       const head = await headObject(doc.storageKey);

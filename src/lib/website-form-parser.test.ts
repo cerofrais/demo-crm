@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatWebsiteFormNotes, parseWebsiteFormEmail } from "./website-form-parser";
+import { formatWebsiteFormNotes, parseFormDate, parseWebsiteFormEmail } from "./website-form-parser";
 
 // Real sample bodies from trewellness.in's Contact/Accommodation/Therapies
 // forms (identical shape) — Name, Age, Email, Phone, City, Preferred Check
@@ -106,5 +106,44 @@ describe("formatWebsiteFormNotes", () => {
   it("returns undefined when there's nothing left to note", () => {
     const lead = parseWebsiteFormEmail("Name : Sejal Parmar Email : info@stwi.in")!;
     expect(formatWebsiteFormNotes(lead)).toBeUndefined();
+  });
+});
+
+describe("parseFormDate", () => {
+  it("reads the form's own ISO format", () => {
+    expect(parseFormDate("2026-08-15")?.toISOString()).toBe("2026-08-15T00:00:00.000Z");
+  });
+
+  it("reads day-first numeric dates (Indian convention)", () => {
+    expect(parseFormDate("15/08/2026")?.toISOString()).toBe("2026-08-15T00:00:00.000Z");
+    expect(parseFormDate("5-8-26")?.toISOString()).toBe("2026-08-05T00:00:00.000Z");
+  });
+
+  it("reads written months either way round", () => {
+    expect(parseFormDate("15 Aug 2026")?.toISOString()).toBe("2026-08-15T00:00:00.000Z");
+    expect(parseFormDate("15 August 2026")?.toISOString()).toBe("2026-08-15T00:00:00.000Z");
+    expect(parseFormDate("Aug 15, 2026")?.toISOString()).toBe("2026-08-15T00:00:00.000Z");
+  });
+
+  // UTC midnight is the point: IST is UTC+5:30, so the stored instant lands
+  // on the same calendar day in the only timezone this CRM renders.
+  it("anchors at UTC midnight so the IST calendar day matches", () => {
+    const d = parseFormDate("2026-08-15")!;
+    const ist = new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata",
+      year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(d);
+    expect(ist).toBe("15/08/2026");
+  });
+
+  it("declines free text rather than guessing — it stays in the notes", () => {
+    expect(parseFormDate("flexible")).toBeNull();
+    expect(parseFormDate("mid August")).toBeNull();
+    expect(parseFormDate("")).toBeNull();
+  });
+
+  it("rejects an impossible date instead of rolling it forward", () => {
+    expect(parseFormDate("31/02/2026")).toBeNull();
+    expect(parseFormDate("2026-13-01")).toBeNull();
   });
 });

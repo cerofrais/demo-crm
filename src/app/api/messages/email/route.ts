@@ -6,7 +6,9 @@ import { prisma } from "@/lib/prisma";
 import { mailboxForRoles, canSendEmail } from "@/lib/mailboxes";
 import { sendEmail } from "@/lib/mailer";
 import { toMessageDTO, replySubject } from "@/lib/messages";
+import { touchLead } from "@/lib/enquiries";
 import { getObjectBuffer, headObject } from "@/lib/storage";
+import { findAttachableDocument } from "@/lib/attachment-access";
 import { sanitizeEmailHtml, extractCidImageIds, buildInlineImageAttachments } from "@/lib/mail-html";
 import { logger } from "@/lib/logger";
 
@@ -92,13 +94,12 @@ export async function POST(req: NextRequest) {
 
     // The attachment is a Document already created by the upload-url/confirm
     // flow (so it's already visible in the guest/enquiry's Documents tab) —
-    // only fetch its bytes here to hand to nodemailer. Scoped to this guest
-    // so a caller can't attach someone else's document.
+    // only fetch its bytes here to hand to nodemailer. Restricted to this
+    // guest's own documents or a shared Resources-library file, so a caller
+    // can't attach someone else's document.
     let attachments: { filename: string; content: Buffer; contentType?: string; cid?: string }[] | undefined;
     if (input.attachmentDocumentId) {
-      const doc = await prisma.document.findFirst({
-        where: { id: input.attachmentDocumentId, guestId: guest.id },
-      });
+      const doc = await findAttachableDocument(input.attachmentDocumentId, guest.id, ctx.roles);
       if (!doc) throw new ApiError("NOT_FOUND", "Attachment not found", 404);
       // F38: HEAD the object before buffering — a multi-GB object would OOM the
       // pod via Buffer.concat. Cap at ~20MB (headroom under Gmail's 25MB limit).
@@ -165,6 +166,8 @@ export async function POST(req: NextRequest) {
           metadata: { channel: "email", mailbox: mailbox.id, to: guest.email },
         },
       });
+      // Sending is activity on the lead — float it to the top of its column.
+      await touchLead(input.enquiryId);
       return ok(toMessageDTO(msg), undefined, 201);
     } catch (err) {
       logger.error({ err, guestId: guest.id, mailbox: mailbox.id }, "email send failed");

@@ -144,6 +144,7 @@ export async function PATCH(
         stage: (input.stage as EnquiryStage) ?? undefined,
         needsAttention: input.needsAttention ?? undefined,
         intakeNotes: input.intakeNotes !== undefined ? (input.intakeNotes || null) : undefined,
+        preferredCheckIn: input.preferredCheckIn !== undefined ? input.preferredCheckIn : undefined,
         lastActivityAt: new Date(),
         // A lead can be moved OUT of Lost/Dead this way (entering it directly
         // is rejected above) — clear the auto-delete clock so a later
@@ -285,6 +286,11 @@ export async function DELETE(
         "lead ticket hard-deleted — guest history wiped",
       );
     } else {
+      // Freeze the correct system tags (revisit/source/age/campaign) in
+      // before the card disappears from the pipeline — a lead deleted right
+      // after creation, before any edit ever synced its tags, would
+      // otherwise carry a stale tags column into the archive forever.
+      await syncEnquiryTags(params.id);
       await prisma.enquiry.update({
         where: { id: params.id },
         data: { deletedAt: new Date() },

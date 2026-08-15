@@ -1,20 +1,54 @@
 # dependencies
 /node_modules
+/.pnp
+.pnp.js
 
 # next.js
 /.next/
 /out/
 next-env.d.ts
 
-# build artifacts
-tsconfig.tsbuildinfo
-/test-results
+# production
+/build
 
-# local env
+# env & secrets
 .env
 .env*.local
+!.env.example
 
-# editor / tooling
-.claude/
-.DS_Store
+# logs
 *.log
+npm-debug.log*
+
+# os / editor
+.DS_Store
+*.pem
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# docker volumes (if bind-mounted locally)
+/infra/.volumes
+
+# prisma
+/prisma/*.db
+
+# misc
+/coverage
+/playwright-report
+/test-results
+.claude/worktrees/
+
+# Per-box compose overrides. docker-compose.yml hardcodes the production
+# hostname for the browser-facing URLs, so a second box (zotac) needs its own
+# override to point those at itself. That file is machine-specific by
+# definition and must never be committed — ignoring it here rather than only
+# on that machine keeps the box's working tree clean, so `git pull` can't
+# abort on a local .gitignore edit.
+docker-compose.override.yml
+
+# build info — regenerated on every typecheck, no value in tracking it
+tsconfig.tsbuildinfo
+
+# local agent/editor scratch
+.claude/

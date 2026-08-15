@@ -1,13 +1,25 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Loader2, Check, X, Phone, AlarmClock, CalendarClock, CheckCircle2, ChevronDown } from "lucide-react";
-import { Card, Badge, Select } from "@/components/ui";
+import { Loader2, Check, X, Phone, AlarmClock, CalendarClock, CheckCircle2, ChevronDown, UserPlus, Search, MessageSquare } from "lucide-react";
+import { Card, Badge, Select, Input } from "@/components/ui";
 import { api } from "@/lib/client";
 import { cn, formatIST } from "@/lib/utils";
-import { stageLabel } from "@/lib/kanban";
+import { STAGES, stageLabel } from "@/lib/kanban";
 import type { EnquiryStage } from "@prisma/client";
+
+/** Mirrors the leads board's own source filter, minus its "" placeholder. */
+const SOURCE_OPTIONS = [
+  ["website_form", "Website"],
+  ["whatsapp", "WhatsApp"],
+  ["instagram", "Instagram"],
+  ["facebook", "Facebook"],
+  ["referral", "Referral"],
+  ["walk_in", "Walk-in"],
+  ["phone", "Phone"],
+  ["google_sheets", "Google Sheets"],
+] as const;
 
 interface AssignableUser {
   id: string;
@@ -27,6 +39,13 @@ interface TaskDTO {
   guestName: string;
   guestPhone: string;
   stage: EnquiryStage;
+  /** False when this task belongs to someone else but sits on a lead you own. */
+  mine: boolean;
+  assignedToName: string | null;
+  /** Set only when someone other than the assignee asked for the task. */
+  createdByName: string | null;
+  /** Most recent remark on the lead — context for the call, trimmed server-side. */
+  lastRemark: { body: string; authorName: string | null; createdAt: string } | null;
 }
 
 export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
@@ -37,6 +56,34 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
   const [person, setPerson] = useState("");
   const [assignableUsers, setAssignableUsers] = useState<AssignableUser[]>([]);
   const [loading, setLoading] = useState(true);
+  // Lead-shaped filters: a follow-up is really "work on that lead", so these
+  // describe the lead rather than the task.
+  const [stage, setStage] = useState("");
+  const [source, setSource] = useState("");
+  const [q, setQ] = useState("");
+  // ?task=<id> from a "Task created" entry in a lead's activity timeline.
+  const [focusId, setFocusId] = useState<string | null>(null);
+  const [focusMissing, setFocusMissing] = useState(false);
+  const router = useRouter();
+  const debounce = useRef<ReturnType<typeof setTimeout>>();
+
+  // Read off window.location rather than useSearchParams() so this page
+  // doesn't need a Suspense boundary — same reasoning as GuestSearch's ?q=.
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get("task");
+    if (!id) return;
+    setFocusId(id);
+    // Tasks now belong to the LEAD OWNER, not whoever created them — so an
+    // Admin/Manager clicking "Task created" in a lead's Activity tab is
+    // almost always looking at someone else's task. Defaulting to "My
+    // follow-ups" would land on "isn't in this list" for exactly the people
+    // who came here to see it. Jump straight to All staff (Everyone) so the
+    // deep link finds it in one hop, same as the notification bell already does.
+    if (canSeeAll) setScope("all");
+    // Strip it immediately: the highlight is a one-shot, and a refresh or a
+    // later Back shouldn't re-trigger the scroll.
+    router.replace("/tasks", { scroll: false });
+  }, [router, canSeeAll]);
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({
     Overdue: true,
     Upcoming: true,
@@ -55,18 +102,38 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const params = new URLSearchParams({ scope, status: "open" });
+      // A deep-linked task may already be done, and the list normally fetches
+      // open ones only — widen to "all" just for that case so the target can
+      // actually be found, then split by status below.
+      const params = new URLSearchParams({ scope, status: focusId ? "all" : "open" });
       if (scope === "all" && person) params.set("assignee", person);
-      setTasks(await api.get<TaskDTO[]>(`/api/tasks?${params}`));
-      setCompleted([]);
+      if (stage) params.set("stage", stage);
+      if (source) params.set("source", source);
+      if (q.trim().length >= 2) params.set("q", q.trim());
+      const all = await api.get<TaskDTO[]>(`/api/tasks?${params}`);
+      setTasks(all.filter((t) => t.status !== "done" && t.status !== "cancelled"));
+      setCompleted(focusId ? all.filter((t) => t.status === "done" || t.status === "cancelled") : []);
+      if (focusId) setFocusMissing(!all.some((t) => t.id === focusId));
     } finally {
       setLoading(false);
     }
-  }, [scope, person]);
+  }, [scope, person, stage, source, q, focusId]);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    // Debounced only for the search box; the selects settle immediately.
+    clearTimeout(debounce.current);
+    debounce.current = setTimeout(load, q ? 300 : 0);
+    return () => clearTimeout(debounce.current);
+  }, [load, q]);
+
+  // Scroll the deep-linked task into view once it's rendered, and leave a
+  // ring on it so it's obvious which of a long list was meant.
+  useEffect(() => {
+    if (!focusId || loading) return;
+    const el = document.getElementById(`task-${focusId}`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [focusId, loading, tasks, completed]);
 
   async function complete(id: string) {
     const task = tasks.find((t) => t.id === id);
@@ -126,6 +193,55 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
         </div>
       )}
 
+      {/* Lead-shaped filters — a follow-up is work on a lead, so these narrow
+          by the lead's column and where it came from, matching how the board
+          is filtered. Available to everyone, not just reports.allStaff. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative min-w-[12rem] flex-1 sm:max-w-xs">
+          <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search guest name or phone…"
+            className="h-9 pl-8 text-sm"
+          />
+        </div>
+        <Select value={stage} onChange={(e) => setStage(e.target.value)} className="w-44">
+          <option value="">All columns</option>
+          {STAGES.map((s) => (
+            <option key={s.id} value={s.id}>{s.label}</option>
+          ))}
+        </Select>
+        <Select value={source} onChange={(e) => setSource(e.target.value)} className="w-40">
+          <option value="">All sources</option>
+          {SOURCE_OPTIONS.map(([value, label]) => (
+            <option key={value} value={value}>{label}</option>
+          ))}
+        </Select>
+        {(stage || source || q) && (
+          <button
+            onClick={() => { setStage(""); setSource(""); setQ(""); }}
+            className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+          >
+            Clear filters
+          </button>
+        )}
+      </div>
+
+      {focusMissing && (
+        <Card className="border-amber-200 bg-amber-50/70 p-3 text-sm text-amber-900">
+          {/* canSeeAll already lands here in All-staff/Everyone scope (see the
+              ?task= effect above), so a miss there isn't a scope problem — most
+              likely the task was completed/cancelled or the lead was deleted.
+              A non-canSeeAll rep has no "All staff" to switch to, so their
+              message stays about ownership rather than suggesting a toggle
+              that isn't on their screen. */}
+          {canSeeAll
+            ? "That task isn't in this list — it may have been completed, cancelled, or the lead was deleted."
+            : "That task isn't in this list — it may belong to another staff member."}
+        </Card>
+      )}
+
       {loading ? (
         <div className="flex justify-center py-16 text-muted-foreground">
           <Loader2 className="h-6 w-6 animate-spin" />
@@ -146,6 +262,7 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
               onToggle={() => toggleSection("Overdue")}
               onComplete={complete}
               onDecide={decide}
+              focusId={focusId}
             />
           )}
           {upcoming.length > 0 && (
@@ -158,6 +275,7 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
               onToggle={() => toggleSection("Upcoming")}
               onComplete={complete}
               onDecide={decide}
+              focusId={focusId}
             />
           )}
           {completed.length > 0 && (
@@ -170,6 +288,7 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
               onToggle={() => toggleSection("Completed")}
               onComplete={() => {}}
               onDecide={() => {}}
+              focusId={focusId}
               dimmed
             />
           )}
@@ -188,6 +307,7 @@ function Section({
   onToggle,
   onComplete,
   onDecide,
+  focusId = null,
   dimmed = false,
 }: {
   title: string;
@@ -198,6 +318,8 @@ function Section({
   onToggle: () => void;
   onComplete: (id: string) => void;
   onDecide: (id: string, approved: boolean) => void;
+  /** Task deep-linked from a lead's activity timeline — ringed and scrolled to. */
+  focusId?: string | null;
   dimmed?: boolean;
 }) {
   const iconColor =
@@ -230,12 +352,15 @@ function Section({
           {tasks.map((t) => (
             <Card
               key={t.id}
+              id={`task-${t.id}`}
               onClick={() => router.push(`/leads?lead=${t.enquiryId}`)}
               title="Open this lead"
               className={cn(
                 "flex cursor-pointer items-center gap-3 p-3 transition-opacity hover:bg-secondary/40",
                 t.overdue && !dimmed && "border-rose-200 bg-rose-50/40",
                 dimmed && "opacity-55",
+                // Arrived here from a lead's timeline — say which one was meant.
+                t.id === focusId && "border-brand-400 ring-2 ring-brand-300 ring-offset-1",
               )}
             >
               {t.kind === "deletion_approval" ? (
@@ -317,7 +442,43 @@ function Section({
                   <Badge className="bg-secondary text-secondary-foreground">
                     {stageLabel(t.stage)}
                   </Badge>
+                  {/* Shown only for someone else's task — you now see tasks on
+                      leads you own whoever created them, and without this
+                      there's no way to tell those apart from your own. */}
+                  {!t.mine && (
+                    <Badge className="bg-amber-100 text-amber-800">
+                      for {t.assignedToName ?? "unassigned"}
+                    </Badge>
+                  )}
+                  {/* A follow-up lands in the LEAD OWNER's queue whoever typed
+                      it, so this is the only thing saying who asked. */}
+                  {t.createdByName && (
+                    <span className="inline-flex items-center gap-1">
+                      <UserPlus className="h-3 w-3" />
+                      added by {t.createdByName}
+                    </span>
+                  )}
                 </div>
+                {/* The lead's latest remark — the thing you'd otherwise open
+                    the lead to read before picking up the phone. One line;
+                    the full text is on the lead. */}
+                {t.lastRemark && (
+                  <div className="mt-1 flex items-start gap-1.5 text-xs text-muted-foreground">
+                    <MessageSquare className="mt-0.5 h-3 w-3 shrink-0" />
+                    <span className="min-w-0 flex-1 truncate italic" title={t.lastRemark.body}>
+                      &ldquo;{t.lastRemark.body}&rdquo;
+                    </span>
+                    <span className="shrink-0 not-italic">
+                      {t.lastRemark.authorName ? `— ${t.lastRemark.authorName} · ` : ""}
+                      {formatIST(t.lastRemark.createdAt, {
+                        day: "numeric",
+                        month: "short",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </span>
+                  </div>
+                )}
               </div>
               {t.dueAt && (
                 <div

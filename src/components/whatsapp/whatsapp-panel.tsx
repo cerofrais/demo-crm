@@ -5,10 +5,12 @@ import { Loader2, Send, ChevronUp, MessageCircle, AlertTriangle, Paperclip, X, F
 import { Button, Textarea, Select, Badge } from "@/components/ui";
 import { AudioRecordButton } from "@/components/ui/audio-record-button";
 import { api } from "@/lib/client";
+import { MessageBody } from "@/components/messaging/message-body";
 import { cn, formatIST } from "@/lib/utils";
 import type { MessageDTO } from "@/lib/types";
 import { TemplatePicker } from "@/components/messaging/template-picker";
 import { PackagePicker } from "@/components/messaging/package-picker";
+import { AttachmentPicker, type AttachmentSelection } from "@/components/messaging/attachment-picker";
 import { personalizeTemplate } from "@/lib/message-templates";
 
 interface NumberOption {
@@ -79,6 +81,24 @@ function DeliveryTicks({ status }: { status: string }) {
   return null;
 }
 
+/**
+ * The quoted message shown above a reply, mirroring WhatsApp's own layout: a
+ * left accent bar, who was being quoted, and a one-line excerpt. Rendered
+ * inside the bubble so it stays visually attached to the reply itself.
+ */
+function QuotedReply({ replyTo }: { replyTo: NonNullable<MessageDTO["replyTo"]> }) {
+  return (
+    <div className="mb-1 rounded-md border-l-[3px] border-primary/60 bg-foreground/[0.06] px-2 py-1">
+      <div className="text-[11px] font-medium text-primary/90">
+        {replyTo.direction === "outbound" ? "You" : "Them"}
+      </div>
+      <div className="line-clamp-2 whitespace-pre-wrap break-words text-xs text-muted-foreground">
+        {replyTo.body}
+      </div>
+    </div>
+  );
+}
+
 function Attachment({ attachment }: { attachment: NonNullable<MessageDTO["attachment"]> }) {
   if (attachment.mimeType.startsWith("image/")) {
     return (
@@ -136,10 +156,10 @@ export function WhatsAppPanel({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [body, setBody] = useState("");
-  const [attachFile, setAttachFile] = useState<File | null>(null);
+  const [attachment, setAttachment] = useState<AttachmentSelection | null>(null);
+  const [attachNote, setAttachNote] = useState<string | null>(null);
   const [uploadCategory, setUploadCategory] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
   const [messageBusy, setMessageBusy] = useState<string | null>(null);
@@ -192,12 +212,17 @@ export function WhatsAppPanel({
   }
 
   async function send() {
-    if ((!body.trim() && !attachFile) || !numberId) return;
+    if ((!body.trim() && !attachment) || !numberId) return;
     setSending(true);
     setError(null);
     try {
       let attachmentDocumentId: string | undefined;
-      if (attachFile && uploadCategory) {
+      // An existing pick (Resources library, or a file already on this
+      // guest's thread) is already a Document — nothing to upload.
+      if (attachment?.kind === "existing") {
+        attachmentDocumentId = attachment.doc.id;
+      } else if (attachment?.kind === "new" && uploadCategory) {
+        const attachFile = attachment.file;
         const { url, storageKey } = await api.post<{ url: string; storageKey: string }>(
           "/api/files/upload-url",
           {
@@ -236,8 +261,8 @@ export function WhatsAppPanel({
       });
       setItems((prev) => [...prev, msg]);
       setBody("");
-      setAttachFile(null);
-      if (fileRef.current) fileRef.current.value = "";
+      setAttachment(null);
+      setAttachNote(null);
       if (msg.status === "failed") setError("The message failed to send. Check the number's connection.");
       setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }), 50);
     } catch (e) {
@@ -442,8 +467,9 @@ export function WhatsAppPanel({
                       </div>
                     ) : (
                       <>
+                        {m.replyTo && <QuotedReply replyTo={m.replyTo} />}
                         {m.attachment && <Attachment attachment={m.attachment} />}
-                        {m.body && <div className="whitespace-pre-wrap break-words text-foreground">{m.body}</div>}
+                        {m.body && <MessageBody body={m.body} />}
                       </>
                     )}
                   </div>
@@ -462,13 +488,17 @@ export function WhatsAppPanel({
       {/* compose */}
       {meta?.canSend ? (
         <div className="mt-2 space-y-2">
-          {attachFile && (
+          {attachment && (
             <div className="flex items-center gap-2 rounded-md border border-border bg-secondary/50 px-2.5 py-1.5 text-xs">
               <Paperclip className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              <span className="truncate">{attachFile.name}</span>
-              <span className="shrink-0 text-muted-foreground">{humanSize(attachFile.size)}</span>
+              <span className="truncate">
+                {attachment.kind === "new" ? attachment.file.name : attachment.doc.filename}
+              </span>
+              <span className="shrink-0 text-muted-foreground">
+                {humanSize(attachment.kind === "new" ? attachment.file.size : attachment.doc.sizeBytes)}
+              </span>
               <button
-                onClick={() => { setAttachFile(null); if (fileRef.current) fileRef.current.value = ""; }}
+                onClick={() => { setAttachment(null); setAttachNote(null); }}
                 className="ml-auto shrink-0 text-muted-foreground hover:text-foreground"
                 title="Remove attachment"
               >
@@ -476,31 +506,28 @@ export function WhatsAppPanel({
               </button>
             </div>
           )}
+          {attachNote && (
+            <p className="px-0.5 text-[11px] text-muted-foreground">{attachNote}</p>
+          )}
           <div className="flex items-end gap-2">
-            <input
-              ref={fileRef}
-              type="file"
-              className="hidden"
-              onChange={(e) => setAttachFile(e.target.files?.[0] ?? null)}
-            />
             {uploadCategory && (
-              <Button
-                variant="outline"
-                size="icon"
-                onClick={() => fileRef.current?.click()}
-                disabled={sending || Boolean(attachFile)}
-                title="Attach a photo, voice note, or document"
-                type="button"
-              >
-                <Paperclip className="h-4 w-4" />
-              </Button>
+              <AttachmentPicker
+                guestId={guestId}
+                openUpward
+                disabled={sending || Boolean(attachment)}
+                title="Attach from Resources, or upload a new file"
+                onSelect={(sel, note) => {
+                  setAttachment(sel);
+                  setAttachNote(note ?? null);
+                }}
+              />
             )}
-            {uploadCategory && !attachFile && (
+            {uploadCategory && !attachment && (
               <AudioRecordButton
                 disabled={sending}
                 onRecorded={(file) => {
-                  setAttachFile(file);
-                  if (fileRef.current) fileRef.current.value = "";
+                  setAttachment({ kind: "new", file });
+                  setAttachNote(null);
                 }}
               />
             )}
@@ -523,7 +550,7 @@ export function WhatsAppPanel({
               placeholder="Write a WhatsApp message…"
               className="min-h-[64px] flex-1"
             />
-            <Button onClick={send} disabled={sending || (!body.trim() && !attachFile)} className="shrink-0">
+            <Button onClick={send} disabled={sending || (!body.trim() && !attachment)} className="shrink-0">
               {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
               Send
             </Button>

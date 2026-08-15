@@ -1,4 +1,4 @@
-import type { AppRole } from "./rbac";
+import { can, type AppRole } from "./rbac";
 
 /**
  * Role-based mailbox registry (env-driven).
@@ -113,12 +113,17 @@ export function visibleMailboxIds(roles: AppRole[]): MailboxId[] {
   return [mailboxIdForRoles(roles)];
 }
 
-/** Sending is allowed for sales roles (messaging.send) and the doctor. */
+/**
+ * Sending is allowed for anyone holding `messaging.send` — every working
+ * role (Admin, Manager, Doctor, Reception, Sales), and nobody read-only
+ * (Staff, Viewer).
+ *
+ * This deliberately delegates to the permission table rather than listing
+ * roles. It used to hardcode ADMIN/MANAGER/RECEPTION/DOCTOR, which silently
+ * drifted when SALES was given `messaging.send`: that role could send
+ * WhatsApp (guarded by the permission) but not email (guarded by this list),
+ * with no reason a user could see. One source of truth avoids repeating that.
+ */
 export function canSendEmail(roles: AppRole[]): boolean {
-  return (
-    roles.includes("ADMIN") ||
-    roles.includes("MANAGER") ||
-    roles.includes("RECEPTION") ||
-    roles.includes("DOCTOR")
-  );
+  return can(roles, "messaging.send");
 }

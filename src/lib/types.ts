@@ -36,6 +36,8 @@ export interface EnquiryDTO {
   campaignLabel: string | null;
   /** Free-text captured at intake (e.g. lead-gen form Q&A) — distinct from the remarks timeline. */
   intakeNotes: string | null;
+  /** Check-in date the guest asked for at intake. ISO; date-only in meaning. */
+  preferredCheckIn: string | null;
   boardPosition: number;
   needsAttention: boolean;
   aiScore: number | null;
@@ -76,11 +78,20 @@ export interface MessageDTO {
   /** CRM-side correction/redaction tag — never touches WhatsApp itself. */
   editedAt: string | null;
   deletedAt: string | null;
+  /** WhatsApp only — the message this one was sent as a reply to, resolved
+   * from the quoted id. Null when it isn't a reply, or when the quoted message
+   * predates this conversation in the CRM (WhatsApp lets you reply to
+   * anything, including messages we never stored). */
+  replyTo: { id: string; body: string; direction: "inbound" | "outbound" } | null;
 }
 
 export interface TimelineItemDTO {
   id: string;
   kind: "activity" | "note";
+  /** Raw Activity.actionType — only on "activity" items. Lets the client
+   *  recognise specific entries (e.g. task_created, which links to the task)
+   *  instead of pattern-matching the rendered sentence. */
+  actionType?: string | null;
   actorName: string;
   /** Only populated for "note" items — the author's primary role at write
    *  time (e.g. "ADMIN"), used to style an admin's remark differently. */

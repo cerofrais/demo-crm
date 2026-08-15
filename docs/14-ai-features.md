@@ -65,27 +65,50 @@ full transcript" toggle) and as a score column on **/calls**. Manual
 
 ```bash
 # optional — OpenAI-compatible /audio/transcriptions endpoint
-AI_TRANSCRIBE_BASE_URL=http://indic-asr:8001/v1   # live default — see below
+AI_TRANSCRIBE_BASE_URL=http://whisper:8000/v1     # live default — see below
 AI_TRANSCRIBE_API_KEY=
-AI_TRANSCRIBE_MODEL=ai4bharat/indic-conformer-600m-multilingual
+AI_TRANSCRIBE_MODEL=Systran/faster-whisper-small
+ASR_LANGUAGES=                                    # empty = let Whisper auto-detect
 ```
 
-**Live default: `indic-asr` (AI4Bharat IndicConformer).** Compose ships a
-`whisper` (faster-whisper) service too, but `Systran/faster-whisper-small`
-hallucinated badly on Telugu/code-switched call audio — repeating a single
-token instead of transcribing — so `indic-asr` is the active backend as of
-2026-07-04.
+**Live default: `whisper` (faster-whisper small), as of 2026-08-08.**
+
+This reverses the 2026-07-04 decision to run `indic-asr` as the default. That
+switch was made because `faster-whisper-small` was seen "repeating a single
+token instead of transcribing" — the observation was real, but the diagnosis
+was wrong. The repetition loop is what Whisper does when it is told to decode
+audio as a language that isn't being spoken; these calls are predominantly
+code-switched Indian **English**, and the config at the time forced a
+Telugu/Hindi language per request. Left to auto-detect, the same model
+transcribes the same audio cleanly.
+
+Measured head-to-head on real production recordings (same file, same box):
+
+| backend | output | repeated clauses |
+|---|---|---|
+| `indic-asr` (IndicConformer, full file) | **0 chars** | — |
+| `whisper-small`, auto-detect | 6320 chars, 69 sentences | 1 |
+| `whisper-medium`, forced `en` | 6327 chars | 57 |
+| `whisper-medium`, auto-detect | 1522 chars | one token, looped |
+
+IndicConformer returned an **empty string** for a 388-second call — it is
+trained on utterance-length audio and silently produces nothing for a whole
+recording rather than erroring. That empty output is what the reconciliation
+LLM was then asked to turn into "a clean transcript", which is where the
+fabricated transcripts came from (see the guard in
+`src/lib/ai/transcript-quality.ts`). Note also that **bigger is not better
+here**: `medium` degenerates into repetition loops on 8 kHz telephony audio
+and is ~4x slower, so `small` is the deliberate choice, not a cost compromise.
 
 ### Alternative: whisper / faster-whisper
 
 `docker compose --profile ai up -d whisper`, then
 `AI_TRANSCRIBE_BASE_URL=http://whisper:8000/v1` and restart the app. Model
-downloads on first request (~500 MB for `faster-whisper-small`). Only
-worth switching back to for English-heavy or non-Indian-language calls — bump
-to `Systran/faster-whisper-large-v3` if you go this route, `small` is what
-was hallucinating.
+downloads on first request (~500 MB for `faster-whisper-small`). Leave
+`ASR_LANGUAGES` empty so Whisper auto-detects — pinning a language is what
+triggers the repetition-loop failure above.
 
-### Live: AI4Bharat IndicConformer (Indian regional languages)
+### Alternative: AI4Bharat IndicConformer (Indian regional languages)
 
 `infra/indic-asr/` wraps [AI4Bharat's IndicConformer](https://huggingface.co/ai4bharat/indic-conformer-600m-multilingual)
 (MIT-licensed, conformer-based, all 22 official Indian languages) behind the
@@ -99,9 +122,14 @@ does not switch per word. On a call with English/Telugu code-switching, an
 attempt decoded as `te` renders English words as **phonetic Telugu-script
 transliteration** ("test" → `టెస్ట్`), not literal English text.
 
+Note the server decodes in **25-second windows** (`ASR_CHUNK_SECONDS`) and
+stitches the pieces: handed a whole call in one pass the model returns an
+empty string, which is exactly how multi-minute recordings ended up with no
+transcript at all.
+
 **How the multi-language + translation step handles this:** since reps also
 sometimes speak Hindi, `call-analysis.ts` transcribes each recording **once
-per language in `ASR_LANGUAGES`** (default `te,hi`), then hands all attempts
+per language in `ASR_LANGUAGES`**, then hands all attempts
 to the LLM (`src/lib/ai/transcript-translate.ts`) to reconcile: determine the
 actual spoken language (or a genuine mix), produce one corrected native-script
 transcript, and a fluent English translation. Both are stored
@@ -113,8 +141,13 @@ model changes. This reconciliation call is itself audited as an
 `AiDecision` (kind `transcript_translation` — see below).
 
 ```bash
-ASR_LANGUAGES=te,hi   # comma-separated candidate languages, tried per call
+ASR_LANGUAGES=te,hi   # comma-separated; ONLY for a backend that can't auto-detect
 ```
+
+With Whisper this must be left **empty** — one auto-detected pass. A single
+Latin-script attempt then skips the reconciliation LLM entirely (there is
+nothing to reconcile or translate), which also avoids the model truncating a
+long, already-correct transcript.
 
 Note this **doubles (or more) ASR compute per call** — one pass per
 candidate language, plus the reconciliation LLM call. Fine for a background

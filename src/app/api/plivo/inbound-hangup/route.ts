@@ -6,6 +6,7 @@
  */
 import { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { touchLead } from "@/lib/enquiries";
 import {
   verifyPlivoRequest,
   formToParams,
@@ -168,6 +169,11 @@ export async function POST(req: NextRequest) {
       ...(recordingUrl && { recordingUrl, recordingDurSec: duration }),
     },
   }).catch(() => null);
+
+  // A guest ringing in is activity on their lead whether or not anyone
+  // reached them — float the card to the top of its column. Guarded on the
+  // genuine finalization so a replayed webhook doesn't keep re-floating it.
+  if (!alreadyClassified) await touchLead(current?.enquiryId);
 
   // Only on the genuine finalization moment, not a replayed/duplicate
   // webhook for a call that was already accounted for.

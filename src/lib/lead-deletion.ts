@@ -1,5 +1,6 @@
 import { prisma } from "./prisma";
 import { logger } from "./logger";
+import { syncEnquiryTags } from "./tags-service";
 
 export async function getLeadDeletionSettings(): Promise<{ autoDeleteDays: number }> {
   const row = await prisma.leadDeletionSettings.upsert({
@@ -44,6 +45,11 @@ export async function runDeletionSweep(): Promise<void> {
 
   for (const enquiry of due) {
     try {
+      // A lead sitting untouched in Lost/Dead until the sweep catches it may
+      // never have had a write trigger syncEnquiryTags — freeze the correct
+      // system tags (revisit/source/age/campaign) in now, or the archive's
+      // tag filter permanently loses them the moment this soft-deletes it.
+      await syncEnquiryTags(enquiry.id);
       await prisma.enquiry.update({
         where: { id: enquiry.id },
         data: { deletedAt: new Date() },

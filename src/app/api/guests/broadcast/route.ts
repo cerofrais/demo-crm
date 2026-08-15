@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
     // WhatsApp broadcast is a Guests-page feature — messaging.send alone
     // isn't enough (Sales holds it for per-lead chat but has no guests.view
     // and shouldn't be able to reach this via a direct API call).
-    const ctx = await requireAllPermissions(["messaging.send", "guests.view"]);
+    const ctx = await requireAllPermissions(["messaging.broadcast", "guests.view"]);
     const input = postSchema.parse(await req.json());
 
     // Restrict to guests that actually have a phone — anything else would

@@ -81,6 +81,61 @@ function normalizeFormPhone(raw: string): string | null {
   return /^\+[1-9]\d{6,14}$/.test(withPlus) ? withPlus : null;
 }
 
+const MONTHS: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+
+/**
+ * The form's date field into a real Date, or null when it's free text
+ * ("sometime in August", "flexible") — the raw string is kept in the intake
+ * notes either way, so nothing is lost by declining to guess.
+ *
+ * Anchored at UTC midnight. Every date here is a calendar date with no time
+ * of day, and IST is UTC+5:30, so UTC midnight renders as the same calendar
+ * day in IST — which is the only timezone this CRM displays.
+ *
+ * Ambiguous numeric dates are read DAY-first (15/08/2026), matching Indian
+ * convention and the rest of the app. A value that can't be day-first (a
+ * first component above 12, e.g. 2026-08-15) is read as ISO year-first.
+ */
+export function parseFormDate(raw: string): Date | null {
+  const s = raw.trim();
+  if (!s) return null;
+
+  // ISO: 2026-08-15
+  const iso = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/.exec(s);
+  if (iso) return utcDate(+iso[1], +iso[2], +iso[3]);
+
+  // Day-first numeric: 15/08/2026, 15-8-26
+  const dmy = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/.exec(s);
+  if (dmy) {
+    const year = +dmy[3] < 100 ? 2000 + +dmy[3] : +dmy[3];
+    return utcDate(year, +dmy[2], +dmy[1]);
+  }
+
+  // "15 Aug 2026" / "15 August 2026" / "Aug 15, 2026"
+  const dMon = /^(\d{1,2})\s+([a-z]{3,})\.?,?\s+(\d{4})$/i.exec(s);
+  if (dMon) {
+    const mo = MONTHS[dMon[2].slice(0, 3).toLowerCase()];
+    if (mo) return utcDate(+dMon[3], mo, +dMon[1]);
+  }
+  const monD = /^([a-z]{3,})\.?\s+(\d{1,2}),?\s+(\d{4})$/i.exec(s);
+  if (monD) {
+    const mo = MONTHS[monD[1].slice(0, 3).toLowerCase()];
+    if (mo) return utcDate(+monD[3], mo, +monD[2]);
+  }
+
+  return null;
+}
+
+/** Rejects impossible dates (31 Feb) — Date would roll them into next month. */
+function utcDate(year: number, month: number, day: number): Date | null {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCMonth() === month - 1 && d.getUTCDate() === day ? d : null;
+}
+
 /**
  * Returns null when the body doesn't look like one of these form emails
  * (must have at least a Name and an Email) — callers fall back to normal

@@ -1,5 +1,6 @@
 import { prisma } from "./prisma";
 import { assignNextRep } from "./lead-routing";
+import { slugifyTag } from "./lead-tags";
 import type { LeadAssignmentCategory, LeadAssignmentStrategy } from "@prisma/client";
 
 export type { LeadAssignmentCategory, LeadAssignmentStrategy };
@@ -39,6 +40,85 @@ export async function setLeadAssignmentSettings(
 export async function getCallCategoryAssignmentSettings(): Promise<LeadAssignmentSettingsDTO> {
   const row = await prisma.leadAssignmentSettings.findUnique({ where: { category: "call" } });
   return { category: "call", strategy: row?.strategy ?? "round_robin", eligibleSubs: row?.eligibleSubs ?? [] };
+}
+
+export interface CampaignAssignmentRuleDTO {
+  campaignSlug: string;
+  campaignLabel: string;
+  strategy: LeadAssignmentStrategy;
+  eligibleSubs: string[];
+}
+
+export async function getAllCampaignAssignmentRules(): Promise<CampaignAssignmentRuleDTO[]> {
+  const rows = await prisma.campaignAssignmentRule.findMany({ orderBy: { campaignLabel: "asc" } });
+  return rows.map((r) => ({
+    campaignSlug: r.campaignSlug,
+    campaignLabel: r.campaignLabel,
+    strategy: r.strategy,
+    eligibleSubs: r.eligibleSubs,
+  }));
+}
+
+/**
+ * Create/update a campaign's assignment rule, or remove it when
+ * `eligibleSubs` is cleared back to empty — unlike the four fixed channel
+ * rows in LeadAssignmentSettings, campaign rules are a growable, admin-typed
+ * list, so an emptied-out rule is deleted rather than left behind as a
+ * do-nothing row that would otherwise accumulate from experimentation.
+ */
+export async function setCampaignAssignmentRule(
+  campaignLabel: string,
+  strategy: LeadAssignmentStrategy,
+  eligibleSubs: string[],
+): Promise<CampaignAssignmentRuleDTO | null> {
+  const campaignSlug = slugifyTag(campaignLabel);
+  if (!campaignSlug) return null;
+
+  if (eligibleSubs.length === 0) {
+    await prisma.campaignAssignmentRule.deleteMany({ where: { campaignSlug } });
+    return null;
+  }
+
+  const row = await prisma.campaignAssignmentRule.upsert({
+    where: { campaignSlug },
+    create: { campaignSlug, campaignLabel, strategy, eligibleSubs },
+    update: { strategy, eligibleSubs },
+  });
+  return {
+    campaignSlug: row.campaignSlug,
+    campaignLabel: row.campaignLabel,
+    strategy: row.strategy,
+    eligibleSubs: row.eligibleSubs,
+  };
+}
+
+export async function deleteCampaignAssignmentRule(campaignSlug: string): Promise<void> {
+  await prisma.campaignAssignmentRule.deleteMany({ where: { campaignSlug } });
+}
+
+/**
+ * Resolve who a freshly auto-created lead should go to based on its
+ * campaign, checked BEFORE the per-channel category (see
+ * pickAssigneeForCategory) — a campaign is more specific targeting than a
+ * generic channel, so it wins when both are configured. Returns null (no
+ * campaign rule configured, or none for this campaign) so the caller falls
+ * through to channel-based/default assignment.
+ */
+export async function pickAssigneeForCampaign(
+  campaignLabel: string | null | undefined,
+): Promise<{ sub: string; name: string } | null> {
+  if (!campaignLabel) return null;
+  const campaignSlug = slugifyTag(campaignLabel);
+  if (!campaignSlug) return null;
+
+  const rule = await prisma.campaignAssignmentRule.findUnique({ where: { campaignSlug } });
+  if (!rule || rule.eligibleSubs.length === 0) return null;
+
+  const candidates = await prisma.staffProfile.findMany({
+    where: { keycloakId: { in: rule.eligibleSubs } },
+    select: { keycloakId: true, displayName: true },
+  });
+  return pickFromEligiblePool(`campaign:${campaignSlug}`, rule.strategy, candidates);
 }
 
 interface Candidate {

@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   return handle(async () => {
-    await requirePermission("messaging.send");
+    await requirePermission("messaging.broadcast");
 
     const jobs = await prisma.broadcastJob.findMany({
       where: { deletedAt: null },
@@ -38,6 +38,10 @@ export async function GET() {
         status: j.status,
         message: j.message,
         templateName: j.templateName,
+        templateCategory: j.templateCategory,
+        // Which Meta endpoint this job actually went out over — needed to
+        // compare delivery between the two paths after the fact.
+        usedMarketingApi: j.usedMarketingApi,
         numberLabel: j.numberId ? (numberLabelById.get(j.numberId) ?? "Unknown number") : "Org default",
         delaySec: j.delaySec,
         totalCount: j.totalCount,

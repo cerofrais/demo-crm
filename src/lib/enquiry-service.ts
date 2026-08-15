@@ -1,9 +1,10 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { findReturningGuest, toEnquiryDTO, withCurrentAssigneeName } from "./enquiries";
+import { reviveGuestIfDeleted } from "./guest-revive";
 import { syncEnquiryTags } from "./tags-service";
 import { assignNextRep } from "./lead-routing";
-import { pickAssigneeForCategory } from "./lead-assignment";
+import { pickAssigneeForCategory, pickAssigneeForCampaign } from "./lead-assignment";
 import { slugifyTag } from "./lead-tags";
 import type { CreateEnquiryInput } from "./validation";
 import type { EnquiryDTO } from "./types";
@@ -15,9 +16,17 @@ import type { EnquiryDTO } from "./types";
 // as the same lead event and folded into the first card instead.
 const DUPLICATE_MERGE_WINDOW_MS = 30 * 60 * 1000;
 
-/** WhatsApp/email/Google Sheets can be restricted to specific staff via the
- *  admin lead-assignment page; every other source keeps the default pool. */
-function resolveAutoAssignee(source: string): Promise<{ sub: string; name: string } | null> {
+/** A campaign rule (if the lead's campaignLabel matches one) wins over the
+ *  channel default — it's more specific targeting. WhatsApp/email/Google
+ *  Sheets can also be restricted to specific staff via the admin
+ *  lead-assignment page; every other source/uncovered campaign keeps the
+ *  default pool. */
+async function resolveAutoAssignee(
+  source: string,
+  campaignLabel?: string | null,
+): Promise<{ sub: string; name: string } | null> {
+  const byCampaign = await pickAssigneeForCampaign(campaignLabel);
+  if (byCampaign) return byCampaign;
   return source === "whatsapp" || source === "email" || source === "google_sheets"
     ? pickAssigneeForCategory(source)
     : assignNextRep();
@@ -50,6 +59,8 @@ interface MergeInput {
   source: string;
   campaignLabel?: string | null;
   note?: string | null;
+  preferredCheckIn?: Date | null;
+  enquiryTags?: string[];
 }
 
 /**
@@ -57,22 +68,60 @@ interface MergeInput {
  * card for it — appends the extra source/campaign to the card's notes and a
  * lightweight tag so the second channel isn't silently lost, and backfills
  * campaignLabel only if the card didn't already have one.
+ *
+ * It also carries over what the guest actually said the second time: their
+ * check-in date, any package tag, and the second form's own intake notes.
+ * Those used to be dropped on the floor — a guest resubmitting with a new
+ * date left the card showing the original.
  */
 async function mergeDuplicateSubmission(
-  target: { id: string; guestId: string; tags: string[]; intakeNotes: string | null; campaignLabel: string | null; stage: string },
+  target: {
+    id: string;
+    guestId: string;
+    tags: string[];
+    intakeNotes: string | null;
+    campaignLabel: string | null;
+    stage: string;
+    preferredCheckIn: Date | null;
+  },
   input: MergeInput,
   actor?: Actor | null,
 ): Promise<CreateResult> {
   const dupTag = slugifyTag(`also ${input.source}`);
   const detail = input.campaignLabel ? ` (campaign: ${input.campaignLabel})` : "";
-  const noteLine = `[duplicate merged] ${new Date().toISOString()} — also submitted via ${input.source}${detail}`;
+
+  // The newer submission wins on the date. This only runs for an untouched
+  // new_lead card inside the 30-minute window, so there is no rep edit to
+  // clobber — and the guest correcting their own date minutes later is
+  // exactly the case worth honouring. The old value goes into the note so
+  // the change is visible rather than silent.
+  const newDate = input.preferredCheckIn ?? null;
+  const dateChanged =
+    newDate != null && target.preferredCheckIn?.getTime() !== newDate.getTime();
+  const dateNote = dateChanged
+    ? target.preferredCheckIn
+      ? ` — check-in updated to ${newDate.toISOString().slice(0, 10)} (was ${target.preferredCheckIn.toISOString().slice(0, 10)})`
+      : ` — check-in ${newDate.toISOString().slice(0, 10)}`
+    : "";
+
+  const noteLine = `[duplicate merged] ${new Date().toISOString()} — also submitted via ${input.source}${detail}${dateNote}`;
+  // The second form's own answers (wellness focus, message, …). Skipped when
+  // identical to what's already on the card, which is the common case for a
+  // true double-submit and would otherwise duplicate the whole block.
+  const extraNote =
+    input.note && input.note.trim() && !target.intakeNotes?.includes(input.note.trim())
+      ? `\n${input.note.trim()}`
+      : "";
 
   const updated = await prisma.enquiry.update({
     where: { id: target.id },
     data: {
-      tags: Array.from(new Set([...target.tags, dupTag])),
-      intakeNotes: target.intakeNotes ? `${target.intakeNotes}\n${noteLine}` : noteLine,
+      // Union, so a second submission naming a different package leaves BOTH
+      // on the card — the guest is weighing two, which the rep should see.
+      tags: Array.from(new Set([...target.tags, dupTag, ...(input.enquiryTags ?? [])])),
+      intakeNotes: (target.intakeNotes ? `${target.intakeNotes}\n${noteLine}` : noteLine) + extraNote,
       campaignLabel: target.campaignLabel ?? input.campaignLabel ?? undefined,
+      ...(dateChanged ? { preferredCheckIn: newDate } : {}),
       lastActivityAt: new Date(),
     },
     include: { guest: true },
@@ -86,7 +135,15 @@ async function mergeDuplicateSubmission(
       actorRole: actor?.role ?? "system",
       actorName: actor?.name ?? "Inbound",
       actionType: "duplicate_merged",
-      metadata: { source: input.source, campaignLabel: input.campaignLabel ?? null },
+      metadata: {
+        source: input.source,
+        campaignLabel: input.campaignLabel ?? null,
+        // What the merge actually carried across, so the audit trail explains
+        // a changed date rather than it just appearing.
+        preferredCheckIn: dateChanged ? newDate!.toISOString() : null,
+        previousCheckIn: dateChanged ? (target.preferredCheckIn?.toISOString() ?? null) : null,
+        tagsAdded: input.enquiryTags?.filter((t) => !target.tags.includes(t)) ?? [],
+      },
     },
   });
 
@@ -147,7 +204,16 @@ export async function createEnquiry(
     }
   }
 
-  const existing = await findReturningGuest(input.phone, input.email);
+  // includeDeleted: a soft-deleted guest still owns their phone/email on the
+  // unique index, so ignoring them here means falling through to a create that
+  // dies on a P2002. Matching them and reviving keeps the guest's whole
+  // history — tags, health record, past conversations — on one record.
+  const existing = await findReturningGuest(input.phone, input.email, {
+    includeDeleted: true,
+  });
+  if (existing?.deletedAt) {
+    await reviveGuestIfDeleted(existing.id, `new ${input.source} enquiry`);
+  }
 
   const referral = input.referralCode
     ? await prisma.referralCode.findUnique({ where: { code: input.referralCode.toUpperCase() } })
@@ -170,6 +236,7 @@ export async function createEnquiry(
         isReturning: true,
         email: existing.email ?? input.email,
         city: existing.city ?? input.city,
+        dateOfBirth: existing.dateOfBirth ?? input.dateOfBirth,
         tags: input.tags?.length
           ? Array.from(new Set([...existing.tags, ...input.tags]))
           : existing.tags,
@@ -202,6 +269,7 @@ export async function createEnquiry(
         email: input.email,
         city: input.city,
         gender: input.gender,
+        dateOfBirth: input.dateOfBirth ?? undefined,
         tags: input.tags ?? [],
         referralCodeUsed: referral?.code,
       },
@@ -209,7 +277,7 @@ export async function createEnquiry(
     guestId = guest.id;
   }
 
-  const rep = input.assignedTo ?? (await resolveAutoAssignee(input.source).catch(() => null));
+  const rep = input.assignedTo ?? (await resolveAutoAssignee(input.source, input.campaignLabel).catch(() => null));
 
   let enquiry;
   try {
@@ -224,6 +292,11 @@ export async function createEnquiry(
         // public enquiry-form webhook) to fill in without a second write, and
         // doesn't clutter the remarks timeline with machine-generated text.
         intakeNotes: input.note || undefined,
+        preferredCheckIn: input.preferredCheckIn ?? null,
+        // Seeded before syncEnquiryTags() runs below — mergeLeadTags keeps
+        // anything that isn't a system tag, so these survive and the computed
+        // age/source/revisit tags are layered on top.
+        tags: input.enquiryTags ?? [],
         referralCodeId: referral?.id,
         lastActivityAt: new Date(),
         assignedToSub: rep?.sub ?? null,
@@ -281,6 +354,19 @@ export async function createEnquiry(
         actionType: "assign",
         metadata: { to: rep.name },
       },
+    });
+  }
+
+  // Register any ingested tag (e.g. a package preference off the enquiry
+  // form) in the shared vocabulary, so it shows up in the tag picker as ONE
+  // entry that staff then reuse — rather than a value that exists on cards
+  // but not in the list, which is how you end up with two chips meaning the
+  // same thing. Upsert, so an existing staff-created tag is left untouched.
+  for (const tag of input.enquiryTags ?? []) {
+    await prisma.tag.upsert({
+      where: { value: tag },
+      update: {},
+      create: { value: tag, category: "custom", createdBy: "system" },
     });
   }
 

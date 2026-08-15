@@ -1,7 +1,13 @@
 import { prisma } from "./prisma";
 import { logger } from "./logger";
 import { sendWhatsAppMessage, sendWhatsAppMedia } from "./whatsapp";
-import { sendTemplateMessage, uploadMedia, type TemplateSendComponent } from "./whatsapp-cloud-api";
+import {
+  listMessageTemplates,
+  marketingApiEnabled,
+  sendTemplateMessage,
+  uploadMedia,
+  type TemplateSendComponent,
+} from "./whatsapp-cloud-api";
 import { getObjectBuffer } from "./storage";
 import { personalizeTemplate } from "./message-templates";
 import type { BroadcastJob, BroadcastStatus } from "@prisma/client";
@@ -32,6 +38,18 @@ export async function getActiveBroadcast(): Promise<BroadcastJob | null> {
   });
 }
 
+/**
+ * Whether a job may use Meta's Marketing Messages API.
+ *
+ * Meta accepts only MARKETING templates on /marketing_messages and rejects
+ * UTILITY / AUTHENTICATION / SERVICE outright, so this fails closed: anything
+ * other than a confirmed MARKETING category — including a null category from
+ * a failed lookup — stays on the Cloud API path it used before.
+ */
+export function shouldUseMarketingApi(templateCategory: string | null, enabled: boolean): boolean {
+  return enabled && templateCategory === "MARKETING";
+}
+
 export async function startBroadcast(input: StartBroadcastInput): Promise<BroadcastJob> {
   const active = await getActiveBroadcast();
   if (active) {
@@ -42,7 +60,8 @@ export async function startBroadcast(input: StartBroadcastInput): Promise<Broadc
   // broadcasts (no `template`) send imageDocumentId inline per-recipient
   // instead (see sendOne). Uploaded once here, reused for every recipient.
   let headerMediaId: string | null = null;
-  if (input.template && input.imageDocumentId) {
+  let templateCategory: string | null = null;
+  if (input.template) {
     const number = input.numberId
       ? await prisma.whatsAppNumber.findUnique({ where: { id: input.numberId } })
       : await prisma.whatsAppNumber.findFirst({
@@ -50,14 +69,38 @@ export async function startBroadcast(input: StartBroadcastInput): Promise<Broadc
           orderBy: [{ isDefault: "desc" }, { label: "asc" }],
         });
     if (number?.integration === "cloud_api" && number.metaPhoneNumberId && number.metaAccessToken) {
-      const doc = await prisma.document.findUnique({ where: { id: input.imageDocumentId } });
-      if (doc) {
-        const buffer = await getObjectBuffer(doc.storageKey);
-        const uploaded = await uploadMedia(number.metaPhoneNumberId, number.metaAccessToken, buffer, doc.mimeType, doc.filename);
-        headerMediaId = uploaded.mediaId;
+      // Resolved from Meta rather than taken from the request: the category
+      // decides which endpoint the job sends over, and only MARKETING may use
+      // /marketing_messages, so a client-supplied value would be a way to
+      // push the wrong template type at it and have every send rejected.
+      if (number.wabaId) {
+        try {
+          const templates = await listMessageTemplates(number.wabaId, number.metaAccessToken);
+          templateCategory =
+            templates.find(
+              (t) => t.name === input.template!.name && t.language === input.template!.language,
+            )?.category ?? null;
+        } catch (err) {
+          // Non-fatal: an unknown category just means this job stays on the
+          // Cloud API path, which is the pre-existing behaviour.
+          logger.warn({ err, template: input.template.name }, "broadcast: template category lookup failed");
+        }
+      }
+      if (input.imageDocumentId) {
+        const doc = await prisma.document.findUnique({ where: { id: input.imageDocumentId } });
+        if (doc) {
+          const buffer = await getObjectBuffer(doc.storageKey);
+          const uploaded = await uploadMedia(number.metaPhoneNumberId, number.metaAccessToken, buffer, doc.mimeType, doc.filename);
+          headerMediaId = uploaded.mediaId;
+        }
       }
     }
   }
+
+  // Decided once, at creation, so every recipient in a job takes the same
+  // path — a job split across both endpoints would make its delivery numbers
+  // impossible to attribute.
+  const usedMarketingApi = shouldUseMarketingApi(templateCategory, marketingApiEnabled());
 
   return prisma.broadcastJob.create({
     data: {
@@ -72,6 +115,8 @@ export async function startBroadcast(input: StartBroadcastInput): Promise<Broadc
       totalCount: input.guestIds.length,
       templateName: input.template?.name ?? null,
       templateLanguage: input.template?.language ?? null,
+      templateCategory,
+      usedMarketingApi,
       templateBodyParams: input.template ? input.template.bodyParams : undefined,
       templateParamNames: input.template?.bodyParamNames?.length ? input.template.bodyParamNames : undefined,
     },
@@ -209,6 +254,10 @@ async function sendOne(job: BroadcastJob, guestId: string): Promise<void> {
         job.templateName!,
         job.templateLanguage ?? "en_US",
         components,
+        // Fixed at job creation — see startBroadcast. Deliberately not
+        // re-evaluated per recipient, so flipping the env mid-run can't
+        // split one job across both endpoints.
+        job.usedMarketingApi,
       );
     } else if (attachment) {
       res = await sendWhatsAppMedia(number, guest.phone, { ...attachment, caption: text });

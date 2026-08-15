@@ -4,7 +4,9 @@ import { prisma } from "@/lib/prisma";
 import { sendWhatsAppMessageSchema } from "@/lib/validation";
 import { sendWhatsAppMessage, sendWhatsAppMedia } from "@/lib/whatsapp";
 import { getObjectBuffer } from "@/lib/storage";
+import { findAttachableDocument } from "@/lib/attachment-access";
 import { toMessageDTO } from "@/lib/messages";
+import { touchLead } from "@/lib/enquiries";
 import { logger } from "@/lib/logger";
 
 export const dynamic = "force-dynamic";
@@ -33,13 +35,13 @@ export async function POST(req: NextRequest) {
     }
 
     // The attachment is a Document already created by the upload-url/confirm
-    // flow (so it's already visible in the guest/enquiry's Documents tab) —
-    // scoped to this guest so a caller can't attach someone else's document.
+    // flow (so it's already visible in the guest/enquiry's Documents tab), or
+    // a shared Resources-library file picked in the composer.
     let attachment: { mimeType: string; fileName: string; base64: string } | null = null;
     if (input.attachmentDocumentId) {
-      const doc = await prisma.document.findFirst({
-        where: { id: input.attachmentDocumentId, guestId: guest.id },
-      });
+      // This guest's own documents, or a shared Resources-library file — see
+      // findAttachableDocument. Never another guest's.
+      const doc = await findAttachableDocument(input.attachmentDocumentId, guest.id, ctx.roles);
       if (!doc) throw new ApiError("NOT_FOUND", "Attachment not found", 404);
       const buffer = await getObjectBuffer(doc.storageKey);
       attachment = { mimeType: doc.mimeType, fileName: doc.filename, base64: buffer.toString("base64") };
@@ -82,6 +84,8 @@ export async function POST(req: NextRequest) {
           },
         },
       });
+      // Sending is activity on the lead — float it to the top of its column.
+      await touchLead(input.enquiryId);
       return ok(toMessageDTO(msg, number.label), undefined, 201);
     } catch (err) {
       logger.error({ err, guestId: guest.id, numberId: number.id }, "whatsapp send failed");
