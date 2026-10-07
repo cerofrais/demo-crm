@@ -80,6 +80,75 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // ONE FILE PER NAME, per place — the shared Resources library, or one
+    // guest's own documents. Re-uploading a name that is already here is
+    // either a deliberate replacement or an accident; without this check it
+    // was always an accident, and the library ended up holding 34 identical
+    // copies of one broadcast image (every send re-uploaded it).
+    //
+    // Scope is guest/enquiry, NOT category: two files can't share a name in
+    // one place just because they were filed differently, or the picker shows
+    // the staff member the same name twice with no way to tell them apart.
+    const clash = await prisma.document.findFirst({
+      where: {
+        filename: input.filename,
+        guestId: binding.guestId ?? null,
+        enquiryId: binding.enquiryId ?? null,
+      },
+      orderBy: { createdAt: "asc" },
+    });
+
+    if (clash && input.replaceDocumentId !== clash.id) {
+      // The object stays put and the binding is NOT consumed, so the client
+      // can confirm again with replaceDocumentId the moment the staff member
+      // picks "Replace" — no second upload of the same bytes.
+      throw new ApiError(
+        "DUPLICATE_FILENAME",
+        `A file named "${input.filename}" is already here. Replace it, or upload it under a different name.`,
+        409,
+      );
+    }
+
+    // REPLACE reuses the existing row rather than creating a new one, so
+    // every message, auto-reply, welcome email and broadcast already pointing
+    // at this document keeps resolving — to the new file. Creating a new row
+    // and deleting the old one would break all of them.
+    if (clash) {
+      const supersededKey = clash.storageKey;
+      const replaced = await prisma.document.update({
+        where: { id: clash.id },
+        data: {
+          category: binding.category as DocumentCategory,
+          mimeType: binding.mime,
+          storageKey: input.storageKey,
+          sizeBytes: head.contentLength || input.sizeBytes,
+          uploadedBy: ctx.sub,
+        },
+      });
+      if (supersededKey !== input.storageKey) {
+        await deleteObject(supersededKey).catch(() => {});
+      }
+      await clearUploadBinding(input.storageKey);
+
+      await prisma.activity.create({
+        data: {
+          guestId: input.guestId,
+          enquiryId: input.enquiryId,
+          actorSub: ctx.sub,
+          actorRole: ctx.roles[0] ?? "STAFF",
+          actorName: ctx.name,
+          actionType: "doc_replace",
+          metadata: {
+            documentId: replaced.id,
+            category: input.category,
+            filename: input.filename,
+          },
+        },
+      });
+
+      return ok({ id: replaced.id, replaced: true });
+    }
+
     const doc = await prisma.document.create({
       data: {
         // Persist the trusted minted values / real size, not raw client input.

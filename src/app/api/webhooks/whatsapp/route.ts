@@ -29,20 +29,18 @@ import crypto from "node:crypto";
 import { env } from "@/lib/env";
 import { logger } from "@/lib/logger";
 import { prisma } from "@/lib/prisma";
-import { buildStorageKey, putObjectBuffer } from "@/lib/storage";
 import { getMediaBase64, getConnectionState } from "@/lib/whatsapp-admin";
+import { ingestWhatsAppMessage } from "@/lib/whatsapp-ingest";
 import {
   fromWhatsAppJid,
-  resolveGuestByPhone,
-  isInternalPhone,
   detectInboundMedia,
   describeInboundMedia,
   describeNonMediaMessage,
   quotedMessageId,
   applyWhatsAppStatusUpdate,
+  sentAtFrom,
   type WaMessageContent,
 } from "@/lib/whatsapp";
-import { maybeSendAutoReply } from "@/lib/whatsapp-autoreply";
 
 export const dynamic = "force-dynamic";
 
@@ -58,6 +56,8 @@ interface UpsertData {
   key?: { remoteJid?: string; remoteJidAlt?: string; fromMe?: boolean; id?: string };
   pushName?: string;
   message?: WaMessageContent;
+  /** WhatsApp's own send time, Unix SECONDS. See sentAtFrom(). */
+  messageTimestamp?: number | string;
 }
 
 async function handleMessagesUpsert(instanceName: string, data: UpsertData) {
@@ -77,164 +77,51 @@ async function handleMessagesUpsert(instanceName: string, data: UpsertData) {
     return;
   }
 
-  const dup = await prisma.message.findFirst({ where: { channel: "whatsapp", externalId: messageId } });
-  if (dup) return; // webhook retry, or the echo of a message we already stored via our own send API
-
-  const phone = fromWhatsAppJid(jid);
   const fromMe = data.key?.fromMe === true;
-
-  // A staff member's personal number (or one of our own connected business
-  // numbers) on the other end — never a real guest. Most commonly happens
-  // when someone pairs their own phone as a WhatsApp Number for testing;
-  // don't let that traffic get onboarded as a lead. See isInternalPhone().
-  if (await isInternalPhone(phone)) {
-    logger.info({ instanceName, phone, fromMe }, "whatsapp webhook: internal number, skipping");
-    return;
-  }
-
-  let guestId: string;
-  let enquiryId: string | undefined;
-  const pushName = data.pushName?.trim() || null;
-
-  if (fromMe) {
-    // Sent from the linked phone's native WhatsApp app, not through the CRM.
-    // Only sync it onto a conversation that already exists — never
-    // auto-create a lead from an outbound-only contact, same reasoning as
-    // isInternalPhone: an admin/rep texting someone from their own phone
-    // shouldn't spawn a fake lead.
-    const existing = await prisma.guest.findFirst({
-      where: { phone, deletedAt: null },
-      select: { id: true, enquiries: { orderBy: { lastActivityAt: "desc" }, take: 1, select: { id: true } } },
-    });
-    if (!existing) return;
-    guestId = existing.id;
-    enquiryId = existing.enquiries[0]?.id;
-  } else {
-    // A blocked guest's incoming message is dropped here, before anything
-    // is stored — checked against phone directly rather than through
-    // resolveGuestByPhone, since blocking only ever applies to a guest that
-    // already exists (you can't block someone before they're a guest), and
-    // this way a blocked guest never gets a Message/Activity row or a
-    // needsAttention flip out of an inbound message we're supposed to ignore.
-    // No deletedAt filter: a guest who was blocked and THEN soft-deleted must
-    // stay blocked on the way back in. Scoping this to live guests would let
-    // their next message through and — now that resolveGuestByPhone revives a
-    // soft-deleted guest — quietly un-hide them too.
-    const existingByPhone = await prisma.guest.findFirst({
-      where: { phone },
-      select: { id: true, isBlocked: true },
-    });
-    if (existingByPhone?.isBlocked) {
-      logger.info({ instanceName, phone }, "whatsapp webhook: inbound from blocked guest, ignoring");
-      return;
-    }
-    const resolved = await resolveGuestByPhone(phone, pushName);
-    guestId = resolved.guestId;
-    enquiryId = resolved.enquiryId;
-  }
 
   // Text is the common case — cheap to resolve without a second API call.
   const textOnly = data.message?.conversation || data.message?.extendedTextMessage?.text || null;
   const media = textOnly ? null : detectInboundMedia(data.message ?? {});
 
-  let attachmentDocumentId: string | null = null;
-  let body: string;
-
-  if (media) {
-    try {
-      // Use the ORIGINAL remoteJid (rawJid, possibly @lid) here, not the
-      // @lid-resolved `jid` — Evolution/Baileys keys its message cache by
-      // whatever remoteJid the event actually reported, so that's what a
-      // media lookup for this specific message needs to match.
-      const { base64 } = await getMediaBase64(instanceName, {
-        id: messageId,
-        remoteJid: rawJid ?? jid,
-        fromMe,
-      });
-      const buffer = Buffer.from(base64, "base64");
-      const storageKey = buildStorageKey({
-        category: "operational",
-        filename: media.fileName,
-        guestId,
-        enquiryId,
-      });
-      await putObjectBuffer(storageKey, buffer, media.mimetype);
-      const doc = await prisma.document.create({
-        data: {
-          category: "operational",
-          filename: media.fileName,
+  await ingestWhatsAppMessage(number, {
+    externalId: messageId,
+    phone: fromWhatsAppJid(jid),
+    fromMe,
+    pushName: data.pushName?.trim() || null,
+    sentAt: sentAtFrom(data.messageTimestamp),
+    // A reply points at the message it quotes. Reuse `inReplyTo` (email uses
+    // it for the RFC Message-ID) to hold the quoted message's WhatsApp id, so
+    // the thread can show what was being replied to.
+    inReplyTo: quotedMessageId(data.message ?? {}),
+    body: media
+      ? describeInboundMedia(media)
+      : // Reactions, locations, shared contacts, polls, button/list replies and
+        // friends carry no downloadable media but are perfectly describable —
+        // before this they all collapsed into "[Unsupported message type]".
+        textOnly || describeNonMediaMessage(data.message ?? {}) || "[Unsupported message type]",
+    media: media
+      ? {
           mimeType: media.mimetype,
-          storageKey,
-          sizeBytes: buffer.byteLength,
-          uploadedBy: "inbound-whatsapp",
-          guestId,
-          enquiryId,
-        },
-      });
-      attachmentDocumentId = doc.id;
-      body = describeInboundMedia(media);
-    } catch (err) {
-      logger.error({ err, instanceName, messageId }, "whatsapp media download failed");
-      body = "[Media message — download failed]";
-    }
-  } else {
-    // Reactions, locations, shared contacts, polls, button/list replies and
-    // friends carry no downloadable media but are perfectly describable —
-    // before this they all collapsed into "[Unsupported message type]".
-    body = textOnly || describeNonMediaMessage(data.message ?? {}) || "[Unsupported message type]";
-  }
-
-  // A reply points at the message it quotes. Reuse `inReplyTo` (email uses it
-  // for the RFC Message-ID) to hold the quoted message's WhatsApp id, so the
-  // thread can show what was being replied to.
-  const inReplyTo = quotedMessageId(data.message ?? {});
-
-  await prisma.message.create({
-    data: {
-      guestId,
-      enquiryId: enquiryId ?? null,
-      mailboxId: instanceName,
-      channel: "whatsapp",
-      direction: fromMe ? "outbound" : "inbound",
-      body,
-      fromEmail: fromMe ? number.phoneNumber : phone,
-      toEmail: fromMe ? phone : number.phoneNumber,
-      externalId: messageId,
-      inReplyTo,
-      attachmentDocumentId,
-      status: fromMe ? "sent" : "received",
-    },
+          fileName: media.fileName,
+          download: async () => {
+            // Use the ORIGINAL remoteJid (rawJid, possibly @lid) here, not the
+            // @lid-resolved `jid` — Evolution/Baileys keys its message cache by
+            // whatever remoteJid the event actually reported, so that's what a
+            // media lookup for this specific message needs to match.
+            const { base64 } = await getMediaBase64(instanceName, {
+              id: messageId,
+              remoteJid: rawJid ?? jid,
+              fromMe,
+            });
+            // No mimeType returned on purpose — the stored type stays the one
+            // detectInboundMedia() read off the payload, which is what this
+            // path has always used. Evolution reports its own alongside the
+            // bytes and the two can disagree.
+            return { buffer: Buffer.from(base64, "base64") };
+          },
+        }
+      : null,
   });
-
-  await prisma.activity.create({
-    data: {
-      guestId,
-      enquiryId: enquiryId ?? null,
-      actorSub: fromMe ? "whatsapp-mobile" : "inbound",
-      actorRole: "system",
-      actorName: fromMe ? "WhatsApp mobile app" : (pushName ?? phone),
-      actionType: fromMe ? "message_sent" : "message_received",
-      metadata: { channel: "whatsapp", instance: instanceName, numberLabel: number.label },
-    },
-  });
-
-  // Outbound (whether sent via the CRM or, here, from the phone directly)
-  // doesn't flip needsAttention — that's reserved for things waiting on a
-  // reply. Matches how /api/messages/whatsapp's own CRM-sent path behaves.
-  if (!fromMe && enquiryId) {
-    await prisma.enquiry.update({
-      where: { id: enquiryId },
-      data: { needsAttention: true, lastActivityAt: new Date() },
-    }).catch(() => null);
-  }
-
-  // Auto-reply only ever fires on a genuine inbound guest message — never on
-  // fromMe (a rep's own phone) traffic. maybeSendAutoReply() never throws.
-  if (!fromMe) {
-    await maybeSendAutoReply({ number, guestId, enquiryId, phone, body });
-  }
-
-  logger.info({ instanceName, phone, fromMe }, fromMe ? "whatsapp mobile-app send synced" : "whatsapp inbound stored");
 }
 
 interface UpdateData {
@@ -247,12 +134,10 @@ interface UpdateData {
 
 /**
  * A message we sent progressing sent -> delivered -> read, or failing after
- * the fact — for Baileys (QR-paired) numbers, which Evolution normalizes and
- * relays here correctly. Cloud API numbers' status events don't reach this
- * handler — Evolution's own re-normalization of those crashes internally
- * before it can relay them — see the whatsapp-cloud-relay route, which
- * parses Meta's webhook directly instead. Requires
- * WEBHOOK_EVENTS_MESSAGES_UPDATE enabled in docker-compose.yml.
+ * the fact — for Baileys (QR-paired) numbers only, which Evolution normalizes
+ * and relays here correctly. Cloud API numbers never reach this handler at
+ * all: Meta reports their statuses to /api/webhooks/whatsapp-cloud directly.
+ * Requires WEBHOOK_EVENTS_MESSAGES_UPDATE enabled in docker-compose.yml.
  */
 async function handleMessagesUpdate(data: UpdateData) {
   // Logged unconditionally while this is new/unverified against live

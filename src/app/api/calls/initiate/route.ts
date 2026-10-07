@@ -7,7 +7,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { can, type AppRole } from "@/lib/rbac";
 import { prisma } from "@/lib/prisma";
-import { createCall, plivoConfigured, isE164 } from "@/lib/plivo";
+import { createCall, plivoConfigured, isE164, plivoWebhookBases } from "@/lib/plivo";
 import { completeNextRnrTask } from "@/lib/tasks";
 import { logger } from "@/lib/logger";
 
@@ -50,7 +50,9 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const appUrl = process.env.PLIVO_WEBHOOK_BASE_URL ?? process.env.NEXTAUTH_URL ?? "";
+  // Primary origin, plus a second one handed to Plivo as fallback_url so a
+  // tunnel outage can't take out every call (see plivoWebhookBases).
+  const [appUrl, fallbackUrl] = plivoWebhookBases();
 
   // Create the Call record first so we have an ID for customData
   const call = await prisma.call.create({
@@ -79,6 +81,7 @@ export async function POST(req: NextRequest) {
     const result = await createCall({
       to: profile.phone,
       answerUrl: `${appUrl}/api/plivo/outbound-answer`,
+      ...(fallbackUrl ? { fallbackUrl: `${fallbackUrl}/api/plivo/outbound-answer` } : {}),
       hangupUrl: `${appUrl}/api/plivo/outbound-hangup`,
       customData: JSON.stringify({ callId: call.id, customerPhone }),
     });

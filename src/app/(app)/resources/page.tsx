@@ -10,7 +10,11 @@ export default async function ResourcesPage() {
   const session = await auth();
   if (!session?.user) redirect("/login");
   const roles = session.roles ?? [];
-  if (!can(roles, "documents.operational") && !can(roles, "documents.medical")) {
+  if (
+    !can(roles, "documents.operational") &&
+    !can(roles, "documents.medical") &&
+    !can(roles, "documents.private")
+  ) {
     redirect("/");
   }
 

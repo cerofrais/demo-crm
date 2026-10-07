@@ -29,6 +29,9 @@ export interface KeycloakUserDTO {
   lastName: string | null;
   fullName: string;
   phone: string | null;
+  /** E.164 WhatsApp lines this person may send from; empty = every line their
+   *  role allows. Stored on StaffProfile, not Keycloak. */
+  allowedWhatsAppNumbers: string[];
   enabled: boolean;
   role: CrmRole | null;
   appRole: AppRole | null;
@@ -179,6 +182,7 @@ function toDTO(
   role: CrmRole | null,
   phone: string | null = null,
   roleFetchError = false,
+  allowedWhatsAppNumbers: string[] = [],
 ): KeycloakUserDTO {
   const fullName = [u.firstName, u.lastName].filter(Boolean).join(" ") || u.username;
   return {
@@ -189,6 +193,7 @@ function toDTO(
     lastName: u.lastName ?? null,
     fullName,
     phone,
+    allowedWhatsAppNumbers,
     enabled: u.enabled,
     role,
     appRole: role ? CRM_ROLE_TO_APP_ROLE[role] : null,
@@ -238,8 +243,11 @@ export async function listUsers(): Promise<KeycloakUserDTO[]> {
   const users: RawKeycloakUser[] = await res.json();
   // service accounts show up as regular users — filter out ours.
   const staff = users.filter((u) => !u.username.startsWith("service-account-"));
-  const profiles = await prisma.staffProfile.findMany({ select: { keycloakId: true, phone: true } });
+  const profiles = await prisma.staffProfile.findMany({
+    select: { keycloakId: true, phone: true, allowedWhatsAppNumbers: true },
+  });
   const phoneById = new Map(profiles.map((p) => [p.keycloakId, p.phone]));
+  const allowedById = new Map(profiles.map((p) => [p.keycloakId, p.allowedWhatsAppNumbers]));
   const dtos = await Promise.all(
     staff.map(async (u) => {
       // F42: distinguish a transient role-fetch failure (roleFetchError) from a
@@ -268,7 +276,7 @@ export async function listUsers(): Promise<KeycloakUserDTO[]> {
           update: { role: CRM_ROLE_TO_APP_ROLE[role] },
         }).catch(() => null);
       }
-      return toDTO(u, role, phoneById.get(u.id) ?? null, roleFetchError);
+      return toDTO(u, role, phoneById.get(u.id) ?? null, roleFetchError, allowedById.get(u.id) ?? []);
     }),
   );
 
@@ -354,7 +362,7 @@ export async function createUser(input: CreateUserInput): Promise<CreateUserResu
 
   await invalidateUserListCache(); // F23: new user must appear immediately.
   logger.info({ userId: id, username: input.username, role: input.role }, "keycloak: user created");
-  return { user: toDTO(raw, input.role, profile.phone), temporaryPassword };
+  return { user: toDTO(raw, input.role, profile.phone, false, profile.allowedWhatsAppNumbers), temporaryPassword };
 }
 
 export interface UpdateUserInput {
@@ -365,10 +373,16 @@ export interface UpdateUserInput {
   role?: CrmRole;
   /** E.164/Indian phone — "" clears it. Stored on StaffProfile, not Keycloak. */
   phone?: string;
+  /** E.164 WhatsApp lines; [] removes the restriction. StaffProfile only. */
+  allowedWhatsAppNumbers?: string[];
 }
 
 export async function updateUser(id: string, input: UpdateUserInput): Promise<KeycloakUserDTO> {
-  const { role, phone, ...profile } = input;
+  // Everything that is ours rather than Keycloak's is pulled out before the
+  // rest is PUT to Keycloak — an unknown attribute there is at best ignored
+  // and at worst rejects the whole update.
+  const { role, phone, allowedWhatsAppNumbers, ...profile } = input;
+  const allowedList = allowedWhatsAppNumbers === undefined ? undefined : [...new Set(allowedWhatsAppNumbers)];
   if (Object.keys(profile).length > 0) {
     await adminFetchOk(`/users/${id}`, { method: "PUT", body: JSON.stringify(profile) });
   }
@@ -391,10 +405,18 @@ export async function updateUser(id: string, input: UpdateUserInput): Promise<Ke
   // actually removes them from routing, not just from being able to log in.
   const profileRow = await prisma.staffProfile.upsert({
     where: { keycloakId: id },
-    create: { keycloakId: id, displayName, phone: phone || null, role: appRole ?? null, isOnline: input.enabled !== false },
+    create: {
+      keycloakId: id,
+      displayName,
+      phone: phone || null,
+      role: appRole ?? null,
+      isOnline: input.enabled !== false,
+      allowedWhatsAppNumbers: allowedList ?? [],
+    },
     update: {
       displayName,
       ...(phone !== undefined && { phone: phone || null }),
+      ...(allowedList !== undefined && { allowedWhatsAppNumbers: allowedList }),
       ...(appRole !== undefined && { role: appRole }),
       ...(input.enabled === false && { isOnline: false }),
     },
@@ -404,7 +426,7 @@ export async function updateUser(id: string, input: UpdateUserInput): Promise<Ke
   // F25 (DPDP PII): log only which fields changed, never the values
   // (firstName/lastName/email/phone).
   logger.info({ userId: id, updatedFields: Object.keys(input) }, "keycloak: user updated");
-  return toDTO(raw, currentRole, profileRow.phone);
+  return toDTO(raw, currentRole, profileRow.phone, false, profileRow.allowedWhatsAppNumbers);
 }
 
 export async function deleteUser(id: string): Promise<void> {

@@ -91,6 +91,7 @@ export const config = {
     "/users/:path*",
     "/whatsapp-numbers/:path*",
     "/lead-assignment/:path*",
+    "/sheet-check/:path*",
     "/message-templates/:path*",
   ],
 };

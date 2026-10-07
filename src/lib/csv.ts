@@ -1,3 +1,19 @@
+/** RFC-4180 cell: always quoted, embedded quotes doubled. Newlines inside a
+ *  cell are legal and preserved — remarks routinely contain them. */
+function csvCell(value: string | number | null | undefined): string {
+  const s = value == null ? "" : String(value);
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+/** Build a CSV Excel will open correctly. */
+export function toCsv(headers: string[], rows: (string | number | null)[][]): string {
+  const lines = [headers.map(csvCell).join(",")];
+  for (const row of rows) lines.push(row.map(csvCell).join(","));
+  // CRLF + a UTF-8 BOM: Excel on Windows otherwise mangles the ₹ sign and any
+  // non-ASCII guest name, which is most of them here.
+  return "\ufeff" + lines.join("\r\n");
+}
+
 /**
  * Minimal RFC4180-ish CSV parser — handles quoted fields (embedded commas,
  * newlines, escaped "" quotes). No dependency needed for a format this

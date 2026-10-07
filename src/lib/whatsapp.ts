@@ -5,6 +5,8 @@ import { createEnquiry } from "./enquiry-service";
 import { reviveEnquiryIfDeleted } from "./enquiries";
 import { reviveGuestIfDeleted } from "./guest-revive";
 import { sendText, sendMedia, sendAudio, type WhatsAppMediaType } from "./whatsapp-admin";
+import { cloudApiCredsOf, sendCloudApiText, sendCloudApiMedia } from "./whatsapp-cloud-api";
+import { tagBroadcastFailure, clearBroadcastFailureTag } from "./broadcast-failed-tag";
 
 /** WhatsApp JID ("919876543210@s.whatsapp.net") -> our E.164 phone format. */
 export function fromWhatsAppJid(jid: string): string {
@@ -17,11 +19,21 @@ export function toWhatsAppNumber(e164: string): string {
   return e164.replace(/^\+/, "");
 }
 
+/** True for a number on the official Meta Cloud API rather than QR-paired
+ *  Baileys. The two take completely different send paths — Meta's Graph API
+ *  directly vs Evolution API — so this is checked at every send site. */
+export function isCloudApi(number: Pick<WhatsAppNumber, "integration">): boolean {
+  return number.integration === "cloud_api";
+}
+
 export async function sendWhatsAppMessage(
   number: WhatsAppNumber,
   to: string,
   text: string,
 ): Promise<{ externalId: string | null }> {
+  if (isCloudApi(number)) {
+    return sendCloudApiText(cloudApiCredsOf(number), to, text);
+  }
   return sendText(number.instanceName, to, text);
 }
 
@@ -33,6 +45,11 @@ export async function sendWhatsAppMedia(
   to: string,
   opts: { mimeType: string; fileName: string; base64: string; caption?: string },
 ): Promise<{ externalId: string | null }> {
+  if (isCloudApi(number)) {
+    // Meta's own contract picks the voice-note vs image vs document shape
+    // from the mime type too — that branch lives in sendCloudApiMedia.
+    return sendCloudApiMedia(cloudApiCredsOf(number), to, opts);
+  }
   if (opts.mimeType.startsWith("audio/")) {
     return sendAudio(number.instanceName, to, opts.base64);
   }
@@ -75,7 +92,10 @@ const EXT_BY_MIME: Record<string, string> = {
   "application/pdf": "pdf",
 };
 
-function extFor(mimetype: string): string {
+/** Filename extension for a WhatsApp media mime type. Exported because the
+ *  Cloud API inbound path has to invent filenames from the same table —
+ *  Meta supplies one only for documents, exactly as Baileys does. */
+export function extFor(mimetype: string): string {
   return EXT_BY_MIME[mimetype] ?? mimetype.split("/")[1]?.split(";")[0] ?? "bin";
 }
 
@@ -254,7 +274,7 @@ export function detectInboundMedia(message: WaMessageContent): InboundMediaInfo 
   return null;
 }
 
-const MEDIA_LABEL: Record<InboundMediaInfo["kind"], string> = {
+export const MEDIA_LABEL: Record<InboundMediaInfo["kind"], string> = {
   image: "📷 Photo",
   video: "🎥 Video",
   audio: "🎤 Voice message",
@@ -313,7 +333,11 @@ export async function resolveMyWhatsAppNumberId(sub: string): Promise<string | n
 export async function resolveGuestByPhone(
   phone: string,
   pushName: string | null,
-): Promise<{ guestId: string; enquiryId?: string }> {
+  /** Our own number that received the message, E.164 — routes the new lead
+   *  to whoever owns that line (WhatsAppNumberAssignmentRule). Optional so
+   *  callers that genuinely don't know it still work. */
+  ourNumber?: string | null,
+): Promise<{ guestId: string; enquiryId?: string; created?: boolean }> {
   // Includes soft-deleted GUESTS as well as soft-deleted enquiries — a
   // re-engaging guest revives their hidden record and ticket instead of
   // getting a silent duplicate opened underneath them (or, for the guest,
@@ -344,14 +368,19 @@ export async function resolveGuestByPhone(
   // createEnquiry() does its own returning-guest lookup by phone, so an
   // existing guest record (with zero enquiries at all) is reused rather
   // than duplicated.
+  // `created: true` on both branches below: the phone lookup above already
+  // proved this number has no guest record (soft-deleted included), so
+  // whatever record leaves this block was made for this message — the
+  // signal the per-number WhatsApp welcome auto-reply keys off.
   try {
     const result = await createEnquiry({
       fullName: pushName?.trim() || phone,
       phone,
       source: "whatsapp",
       note: "Inbound WhatsApp message",
+      ourWhatsAppNumber: ourNumber ?? null,
     });
-    return { guestId: result.enquiry.guest.id, enquiryId: result.enquiry.id };
+    return { guestId: result.enquiry.guest.id, enquiryId: result.enquiry.id, created: true };
   } catch (err) {
     logger.error({ err, phone }, "whatsapp auto-enquiry failed; falling back to guest-only capture");
     // This upsert matches on phone alone, so it can land on a soft-deleted
@@ -365,7 +394,7 @@ export async function resolveGuestByPhone(
       select: { id: true },
     });
     await reviveGuestIfDeleted(fallback.id, "inbound WhatsApp message (enquiry creation failed)");
-    return { guestId: fallback.id };
+    return { guestId: fallback.id, created: true };
   }
 }
 
@@ -428,5 +457,44 @@ export async function applyWhatsAppStatusUpdate(
       ? { status: "failed", errorDetail: errorDetail ?? message.errorDetail ?? "Delivery failed after being sent" }
       : { status: next },
   });
+
+  // Keep the guest's "failed" worklist tag in step with what actually
+  // happened. Only broadcast messages put the tag ON (a 1:1 message failing
+  // is a rep's own conversation to retry, not a campaign to re-run), but ANY
+  // message getting through takes it off — reaching them is reaching them,
+  // whichever way it happened. Never throws.
+  if (next === "failed" && message.broadcastJobId) {
+    await tagBroadcastFailure(message.guestId);
+  } else if (next === "delivered" || next === "read") {
+    await clearBroadcastFailureTag(message.guestId, message.createdAt);
+  }
+
   logger.info({ externalId, status: next }, "whatsapp: message delivery status updated");
+}
+
+/**
+ * When WhatsApp says the message was sent, not when we happened to store it.
+ *
+ * These are normally seconds apart, so it looks academic — until delivery is
+ * delayed. Meta retries a webhook it could not deliver, and while our relay
+ * was down one guest's reply arrived a day and a half after they sent it. We
+ * stamped it with arrival time, so the thread read as if they had just
+ * written; the rep answered inside what looked like a 7-hour-old window and
+ * Meta refused it with 131047, because Meta measures the customer-service
+ * window from the REAL send time. The thread said one thing and the platform
+ * another, with no way to see why.
+ *
+ * Ignored when absent or implausible — more than a minute in the future
+ * (clock skew) or older than 30 days — so a malformed payload can never
+ * bury a live message far up the history.
+ */
+export function sentAtFrom(raw: number | string | undefined): Date | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const secs = typeof raw === "string" ? Number(raw) : raw;
+  if (!Number.isFinite(secs) || secs <= 0) return undefined;
+  const at = new Date(secs * 1000);
+  const now = Date.now();
+  if (at.getTime() > now + 60_000) return undefined;
+  if (at.getTime() < now - 30 * 24 * 60 * 60 * 1000) return undefined;
+  return at;
 }

@@ -6,6 +6,8 @@ import {
   Copy, Check, ShieldAlert, Search, PhoneIncoming, Trash,
 } from "lucide-react";
 import { PageHeader } from "@/components/app/page-header";
+import { lastActive } from "@/lib/last-active";
+import { UsersTabs } from "./users-tabs";
 import { Card, Badge, Button, Input, Select, Dialog } from "@/components/ui";
 import { api } from "@/lib/client";
 import { cn, copyToClipboard } from "@/lib/utils";
@@ -36,15 +38,20 @@ interface StaffUser {
   lastName: string | null;
   fullName: string;
   phone: string | null;
+  /** E.164 lines this person may send WhatsApp from; empty or absent = all. */
+  allowedWhatsAppNumbers?: string[];
   enabled: boolean;
   role: CrmRole | null;
   appRole: string | null;
   createdAt: string | null;
+  /** Latest activity-log action, or null if they've never done anything. */
+  lastActiveAt?: string | null;
 }
 
 const ROLE_LABEL: Record<CrmRole, string> = {
   "crm-admin": "Admin",
   "crm-doctor": "Doctor",
+  "crm-doctoradmin": "Doctor Admin",
   "crm-manager": "Manager",
   "crm-reception": "Reception",
   "crm-sales": "Sales",
@@ -55,6 +62,7 @@ const ROLE_LABEL: Record<CrmRole, string> = {
 const ROLE_COLOR: Record<CrmRole, string> = {
   "crm-admin": "bg-rose-100 text-rose-800",
   "crm-doctor": "bg-purple-100 text-purple-800",
+  "crm-doctoradmin": "bg-violet-200 text-violet-900",
   "crm-manager": "bg-blue-100 text-blue-800",
   "crm-reception": "bg-brand-100 text-brand-700",
   "crm-sales": "bg-amber-100 text-amber-800",
@@ -62,7 +70,7 @@ const ROLE_COLOR: Record<CrmRole, string> = {
   "crm-viewer": "bg-slate-100 text-slate-700",
 };
 
-const ROLES: CrmRole[] = ["crm-admin", "crm-manager", "crm-reception", "crm-sales", "crm-doctor", "crm-staff", "crm-viewer"];
+const ROLES: CrmRole[] = ["crm-admin", "crm-manager", "crm-reception", "crm-sales", "crm-doctor", "crm-doctoradmin", "crm-staff", "crm-viewer"];
 
 function RoleBadge({ role }: { role: CrmRole | null }) {
   if (!role) return <span className="text-xs text-muted-foreground">No role</span>;
@@ -109,6 +117,18 @@ export function UsersManager({ canManage }: { canManage: boolean }) {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  // Keep "Last active" current while the page is open: re-read the times every
+  // two minutes (quietly, no spinner) and re-word them every minute.
+  const [, setClock] = useState(0);
+  useEffect(() => {
+    const tick = setInterval(() => setClock((c) => c + 1), 60_000);
+    const refresh = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      api.get<StaffUser[]>("/api/admin/users").then(setUsers).catch(() => {});
+    }, 120_000);
+    return () => { clearInterval(tick); clearInterval(refresh); };
+  }, []);
   useEffect(() => {
     api.get<{ scope: CallRoutingScope }>("/api/admin/call-routing").then(setCallRouting).catch(() => {});
     api.get<{ autoDeleteDays: number }>("/api/admin/lead-deletion").then((s) => {
@@ -186,6 +206,7 @@ export function UsersManager({ canManage }: { canManage: boolean }) {
             : "Read-only view of staff accounts and their roles. Backed by Keycloak — identity lives there, not in the CRM database."
         }
       />
+      <UsersTabs active="users" />
 
       <div className="flex flex-wrap items-center justify-between gap-3 p-4 pb-0 md:p-6 md:pb-0">
         <p className="order-2 shrink-0 text-xs text-muted-foreground md:order-1">
@@ -316,10 +337,12 @@ export function UsersManager({ canManage }: { canManage: boolean }) {
                     </div>
                     <RoleBadge role={u.role} />
                   </div>
+                  <div className="mt-1"><LastActive at={u.lastActiveAt} /></div>
                   {(u.email || u.phone) && (
                     <div className="mt-1 space-y-0.5 text-xs text-muted-foreground">
                       {u.email && <p className="truncate">{u.email}</p>}
                       {u.phone && <p>{u.phone}</p>}
+                      <WhatsAppPin numbers={u.allowedWhatsAppNumbers} />
                     </div>
                   )}
                   <div className="mt-2 flex items-center justify-between">
@@ -358,7 +381,7 @@ export function UsersManager({ canManage }: { canManage: boolean }) {
               <table className="w-full text-sm">
                 <thead className="border-b border-border bg-muted/40">
                   <tr>
-                    {["Name", "Username", "Email", "Phone", "Role", "Status", ...(canManage ? ["Actions"] : [])].map((h) => (
+                    {["Name", "Username", "Email", "Phone", "Role", "Last active", "Status", ...(canManage ? ["Actions"] : [])].map((h) => (
                       <th key={h} className="px-3 py-2 text-left text-xs font-semibold text-muted-foreground">{h}</th>
                     ))}
                   </tr>
@@ -366,11 +389,15 @@ export function UsersManager({ canManage }: { canManage: boolean }) {
                 <tbody className="divide-y divide-border">
                   {filtered.map((u) => (
                     <tr key={u.id} className="hover:bg-muted/20">
-                      <td className="px-3 py-2.5 font-medium">{u.fullName}</td>
+                      <td className="px-3 py-2.5 font-medium">
+                        {u.fullName}
+                        <WhatsAppPin numbers={u.allowedWhatsAppNumbers} />
+                      </td>
                       <td className="px-3 py-2.5 text-xs text-muted-foreground">{u.username}</td>
                       <td className="px-3 py-2.5 text-xs text-muted-foreground">{u.email ?? "—"}</td>
                       <td className="px-3 py-2.5 text-xs text-muted-foreground">{u.phone ?? "—"}</td>
                       <td className="px-3 py-2.5"><RoleBadge role={u.role} /></td>
+                      <td className="whitespace-nowrap px-3 py-2.5"><LastActive at={u.lastActiveAt} /></td>
                       <td className="px-3 py-2.5">
                         <button
                           onClick={() => toggleEnabled(u)}
@@ -459,6 +486,27 @@ export function UsersManager({ canManage }: { canManage: boolean }) {
   );
 }
 
+/**
+ * Shown on the list itself, not only inside the edit dialog: a person who
+ * can suddenly only send from one line is exactly the thing an admin needs
+ * to see at a glance when someone reports "WhatsApp won't let me send".
+ */
+function WhatsAppPin({ numbers }: { numbers?: string[] }) {
+  if (!numbers?.length) return null;
+  return (
+    <span className="mt-0.5 block text-[11px] font-normal text-muted-foreground" title={numbers.join(", ")}>
+      WhatsApp: {numbers.length === 1 ? `${numbers[0]} only` : `${numbers.length} numbers only`}
+    </span>
+  );
+}
+
+interface WhatsAppLine {
+  phoneNumber: string;
+  label: string;
+  connected: boolean;
+  integration: string;
+}
+
 function UserFormModal({
   title, user, onClose, onSaved,
 }: {
@@ -476,6 +524,25 @@ function UserFormModal({
   const [phone, setPhone] = useState(user?.phone ?? "");
   const [phoneError, setPhoneError] = useState<string | null>(null);
   const [role, setRole] = useState<CrmRole>(user?.role ?? "crm-reception");
+  const [allowedNumbers, setAllowedNumbers] = useState<string[]>(user?.allowedWhatsAppNumbers ?? []);
+  const [lines, setLines] = useState<WhatsAppLine[] | null>(null);
+
+  useEffect(() => {
+    if (!isEdit) return;
+    api.get<WhatsAppLine[]>("/api/admin/users/whatsapp-lines").then(setLines).catch(() => setLines([]));
+  }, [isEdit]);
+
+  // A pinned number that has since been removed from WhatsApp setup is still
+  // enforced, so it has to stay visible and untickable-by-accident here —
+  // otherwise an admin could never see, or remove, the thing locking someone out.
+  const shownLines: WhatsAppLine[] | null = lines
+    ? [
+        ...lines,
+        ...allowedNumbers
+          .filter((n) => !lines.some((l) => l.phoneNumber === n))
+          .map((n) => ({ phoneNumber: n, label: "No longer set up", connected: false, integration: "baileys" })),
+      ]
+    : null;
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -492,7 +559,9 @@ function UserFormModal({
     setError(null);
     try {
       if (isEdit && user) {
-        await api.patch(`/api/admin/users/${user.id}`, { firstName, lastName, email, role, phone });
+        await api.patch(`/api/admin/users/${user.id}`, {
+          firstName, lastName, email, role, phone, allowedWhatsAppNumbers: allowedNumbers,
+        });
         onSaved(null, user.username);
       } else {
         const result = await api.post<{ temporaryPassword: string }>("/api/admin/users", {
@@ -555,6 +624,40 @@ function UserFormModal({
               ))}
             </Select>
           </Field>
+          {isEdit && (
+            <Field label="WhatsApp numbers">
+              {shownLines === null ? (
+                <p className="text-xs text-muted-foreground">Loading…</p>
+              ) : shownLines.length === 0 ? (
+                <p className="text-xs text-muted-foreground">No WhatsApp numbers are set up yet.</p>
+              ) : (
+                <div className="space-y-1.5 rounded-md border border-border p-2.5">
+                  {shownLines.map((l) => (
+                    <label key={l.phoneNumber} className="flex cursor-pointer items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={allowedNumbers.includes(l.phoneNumber)}
+                        onChange={(e) =>
+                          setAllowedNumbers((prev) =>
+                            e.target.checked ? [...prev, l.phoneNumber] : prev.filter((n) => n !== l.phoneNumber),
+                          )
+                        }
+                        className="h-3.5 w-3.5 rounded border-input accent-brand-600"
+                      />
+                      <span className="min-w-0 flex-1 truncate">{l.label}</span>
+                      <span className="text-xs text-muted-foreground">{l.phoneNumber}</span>
+                      {!l.connected && <span className="text-[11px] text-amber-700">not connected</span>}
+                    </label>
+                  ))}
+                </div>
+              )}
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {allowedNumbers.length === 0
+                  ? "None ticked: they can send from every number their role allows."
+                  : `They can send WhatsApp only from ${allowedNumbers.length === 1 ? "the ticked number" : `these ${allowedNumbers.length} numbers`}, and can still read every conversation. The official Cloud API number stays Admin, Manager and Doctor only whatever is ticked.`}
+              </p>
+            </Field>
+          )}
           {!isEdit && (
             <p className="text-xs text-muted-foreground">
               A temporary password will be generated and shown once after creation — the new user must
@@ -665,5 +768,22 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
       {children}
     </label>
+  );
+}
+
+/** Latest activity-log action, worded relative to now. */
+function LastActive({ at }: { at?: string | null }) {
+  const la = lastActive(at);
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 text-xs",
+        la.state === "now" ? "font-medium text-foreground" : la.state === "never" ? "text-muted-foreground/70" : "text-muted-foreground",
+      )}
+      title={la.exact ? `Last action: ${la.exact} IST` : "No actions in the activity log"}
+    >
+      {la.state === "now" && <span className="h-2 w-2 rounded-full bg-emerald-500" aria-hidden />}
+      {la.label}
+    </span>
   );
 }

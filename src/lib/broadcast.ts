@@ -1,6 +1,8 @@
 import { prisma } from "./prisma";
 import { logger } from "./logger";
+import { tagBroadcastFailure } from "./broadcast-failed-tag";
 import { sendWhatsAppMessage, sendWhatsAppMedia } from "./whatsapp";
+import { tagWhatsAppNumberUsed } from "./whatsapp-number-tag";
 import {
   listMessageTemplates,
   marketingApiEnabled,
@@ -9,8 +11,11 @@ import {
   type TemplateSendComponent,
 } from "./whatsapp-cloud-api";
 import { getObjectBuffer } from "./storage";
+import { templateBodyParams } from "./whatsapp-template";
+import { fillTemplateBody } from "./whatsapp-template-fill";
 import { personalizeTemplate } from "./message-templates";
-import type { BroadcastJob, BroadcastStatus } from "@prisma/client";
+import { materializeFollowUp } from "./broadcast-followup";
+import type { BroadcastJob, BroadcastStatus, Prisma } from "@prisma/client";
 
 const ACTIVE_STATUSES: BroadcastStatus[] = ["queued", "running"];
 
@@ -21,6 +26,20 @@ export interface StartBroadcastInput {
   delaySec: number;
   numberId?: string | null;
   createdBySub: string;
+  /** Slugified tag applied to a lead when that guest replies — see lib/reply-tag.ts. */
+  replyTag?: string | null;
+  /** Hold the send until this time. Null/omitted = start immediately. */
+  scheduledAt?: Date | null;
+  /** Parent campaign this follows up; its audience is resolved at start. */
+  followUpOfJobId?: string | null;
+  /** Only guests whose reply contained this text (i.e. tapped that button). */
+  followUpTrigger?: string | null;
+  /** Skip anyone contacted within this many hours. In rolling mode this is
+   *  also the per-guest delay — see followUpRollingUntil. */
+  followUpQuietHours?: number | null;
+  /** Chase each guest on their own clock until this time, instead of sending
+   *  one batch. Omitted = the original one-shot behaviour. */
+  followUpRollingUntil?: Date | null;
   /** Cloud API numbers only — send this approved template instead of
    *  `message` (free text isn't allowed outside an open 24h window).
    *  `bodyParamNames` is set only for a NAMED-parameter template (e.g.
@@ -31,10 +50,41 @@ export interface StartBroadcastInput {
 }
 
 /** The one job currently queued or running, if any — used to enforce "one at a time" and for progress polling. */
+/**
+ * Jobs that are runnable NOW. A job queued behind a future `scheduledAt` is
+ * deliberately excluded: a follow-up sitting 48 hours out must not count as
+ * "a broadcast is already running" and block every send for two days, and it
+ * shouldn't drive the live progress bar either.
+ */
+function dueNow(): Prisma.BroadcastJobWhereInput {
+  return {
+    status: { in: ACTIVE_STATUSES },
+    OR: [{ scheduledAt: null }, { scheduledAt: { lte: new Date() } }],
+  };
+}
+
 export async function getActiveBroadcast(): Promise<BroadcastJob | null> {
   return prisma.broadcastJob.findFirst({
-    where: { status: { in: ACTIVE_STATUSES } },
+    where: dueNow(),
     orderBy: { createdAt: "desc" },
+  });
+}
+
+/** Every job running right now. Plural since broadcasts stopped being
+ *  one-at-a-time — the Guests page shows them all rather than pretending the
+ *  newest is the only one. */
+export async function listActiveBroadcasts(): Promise<BroadcastJob[]> {
+  return prisma.broadcastJob.findMany({
+    where: dueNow(),
+    orderBy: { createdAt: "asc" },
+  });
+}
+
+/** Queued jobs still waiting for their scheduled time — shown as "scheduled". */
+export async function listScheduledBroadcasts(): Promise<BroadcastJob[]> {
+  return prisma.broadcastJob.findMany({
+    where: { status: "queued", scheduledAt: { gt: new Date() }, deletedAt: null },
+    orderBy: { scheduledAt: "asc" },
   });
 }
 
@@ -46,21 +96,44 @@ export async function getActiveBroadcast(): Promise<BroadcastJob | null> {
  * other than a confirmed MARKETING category — including a null category from
  * a failed lookup — stays on the Cloud API path it used before.
  */
+/**
+ * The template as this guest will read it: approved wording, placeholders
+ * filled with the job's parameters, personalised the same way the parameters
+ * themselves are when they are sent to Meta.
+ */
+export function renderTemplateForGuest(
+  job: { templateBody: string | null; templateBodyParams: unknown },
+  fullName: string,
+  gender: string | null,
+): string | null {
+  if (!job.templateBody) return null;
+  const raw = (job.templateBodyParams as string[] | null) ?? [];
+  const { names } = templateBodyParams({ components: [{ type: "BODY", text: job.templateBody }] });
+  return fillTemplateBody(
+    job.templateBody,
+    names,
+    names.map((_, i) => personalize(raw[i] ?? "", fullName, gender)),
+  );
+}
+
 export function shouldUseMarketingApi(templateCategory: string | null, enabled: boolean): boolean {
   return enabled && templateCategory === "MARKETING";
 }
 
 export async function startBroadcast(input: StartBroadcastInput): Promise<BroadcastJob> {
-  const active = await getActiveBroadcast();
-  if (active) {
-    throw new Error("A broadcast is already running. Wait for it to finish or cancel it first.");
-  }
-
+  // Broadcasts used to be one-at-a-time: starting a second while one was in
+  // flight threw, so a 3,000-recipient send blocked the console for the best
+  // part of an hour. They now run side by side — the worker advances every
+  // due job each tick — and progress is followed on the Broadcast Status
+  // page rather than by waiting on the compose dialog.
   // Only a Cloud API template send ever needs a HEADER image — Baileys
   // broadcasts (no `template`) send imageDocumentId inline per-recipient
   // instead (see sendOne). Uploaded once here, reused for every recipient.
   let headerMediaId: string | null = null;
   let templateCategory: string | null = null;
+  // The words the template actually says, kept with the job so every message
+  // can store what the guest read instead of the template's name.
+  let templateBody: string | null = null;
   if (input.template) {
     const number = input.numberId
       ? await prisma.whatsAppNumber.findUnique({ where: { id: input.numberId } })
@@ -76,10 +149,11 @@ export async function startBroadcast(input: StartBroadcastInput): Promise<Broadc
       if (number.wabaId) {
         try {
           const templates = await listMessageTemplates(number.wabaId, number.metaAccessToken);
-          templateCategory =
-            templates.find(
-              (t) => t.name === input.template!.name && t.language === input.template!.language,
-            )?.category ?? null;
+          const approved = templates.find(
+            (t) => t.name === input.template!.name && t.language === input.template!.language,
+          );
+          templateCategory = approved?.category ?? null;
+          templateBody = approved?.components.find((c) => c.type === "BODY")?.text ?? null;
         } catch (err) {
           // Non-fatal: an unknown category just means this job stays on the
           // Cloud API path, which is the pre-existing behaviour.
@@ -117,7 +191,14 @@ export async function startBroadcast(input: StartBroadcastInput): Promise<Broadc
       templateLanguage: input.template?.language ?? null,
       templateCategory,
       usedMarketingApi,
+      replyTag: input.replyTag ?? null,
+      scheduledAt: input.scheduledAt ?? null,
+      followUpOfJobId: input.followUpOfJobId ?? null,
+      followUpTrigger: input.followUpTrigger ?? null,
+      followUpQuietHours: input.followUpQuietHours ?? null,
+      followUpRollingUntil: input.followUpRollingUntil ?? null,
       templateBodyParams: input.template ? input.template.bodyParams : undefined,
+      templateBody,
       templateParamNames: input.template?.bodyParamNames?.length ? input.template.bodyParamNames : undefined,
     },
   });
@@ -139,43 +220,127 @@ export function personalize(template: string, fullName: string, gender?: string 
 
 let ticking = false;
 
+/** How often a rolling follow-up re-checks who has become due. Small enough
+ *  that "48 hours after our last message" lands within the hour, large enough
+ *  that a two-week chase is a few hundred audience queries, not tens of
+ *  thousands. */
+const ROLLING_RECHECK_MIN = 15;
+
+/** Park a rolling follow-up until its next check, or finish it if its window
+ *  has closed. Returns true when the job was parked (caller should stop). */
+async function parkOrFinishRolling(job: BroadcastJob): Promise<boolean> {
+  const until = job.followUpRollingUntil;
+  if (!until || until.getTime() <= Date.now()) return false;
+  await prisma.broadcastJob.update({
+    where: { id: job.id },
+    data: {
+      status: "queued",
+      cursor: 0,
+      guestIds: [],
+      // Held in the future so dueNow() skips it, which also keeps it out of
+      // getActiveBroadcast() — a job that spends two weeks waiting must not
+      // read as "a broadcast is already running" and block every other send.
+      scheduledAt: new Date(Date.now() + ROLLING_RECHECK_MIN * 60 * 1000),
+    },
+  });
+  return true;
+}
+
 /**
- * Called every ~2s from instrumentation-node.ts. Sends at most one message
- * per tick, paced by the job's own delaySec (tracked via lastSentAt) so a
- * burst of ticks after a restart can't blow past the configured rate.
- * Guards against overlapping runs the same way pollInbound() does.
+ * Called every ~2s from instrumentation-node.ts. Advances EVERY runnable job
+ * by at most one message, each paced by its own delaySec (tracked via
+ * lastSentAt) so a burst of ticks after a restart can't blow past the
+ * configured rate. Guards against overlapping runs the same way pollInbound()
+ * does.
+ *
+ * Jobs progress side by side rather than strictly in turn: two campaigns
+ * started a minute apart both make progress instead of the second waiting out
+ * the first. Oldest first, so a job can't be starved by newer ones arriving.
  */
 export async function tickBroadcast(): Promise<void> {
   if (ticking) return;
   ticking = true;
   try {
-    const job = await prisma.broadcastJob.findFirst({
-      where: { status: { in: ACTIVE_STATUSES } },
+    const due = await prisma.broadcastJob.findMany({
+      where: dueNow(),
       orderBy: { createdAt: "asc" },
+      take: MAX_PARALLEL_JOBS,
     });
-    if (!job) return;
-
-    if (job.status === "queued") {
-      await prisma.broadcastJob.update({ where: { id: job.id }, data: { status: "running" } });
+    for (const j of due) {
+      // One job failing must not stop the others — its own errors are already
+      // recorded per recipient, but an unexpected throw here would otherwise
+      // end the tick and stall every job behind it.
+      await advanceJob(j).catch((err) =>
+        logger.error({ err, jobId: j.id }, "broadcast: job tick failed"),
+      );
     }
-
-    if (job.lastSentAt && Date.now() - job.lastSentAt.getTime() < job.delaySec * 1000) return;
-
-    if (job.cursor >= job.guestIds.length) {
-      await prisma.broadcastJob.update({
-        where: { id: job.id },
-        data: { status: "completed", completedAt: new Date() },
-      });
-      return;
-    }
-
-    const guestId = job.guestIds[job.cursor];
-    await sendOne(job, guestId).catch((err) =>
-      logger.error({ err, jobId: job.id, guestId }, "broadcast: send failed"),
-    );
   } finally {
     ticking = false;
   }
+}
+
+/**
+ * How many jobs the worker will advance in a single tick. Each contributes at
+ * most one message per tick, so this is also the ceiling on send rate:
+ * MAX_PARALLEL_JOBS messages per ~2s across everything running. Anything past
+ * it simply waits for the next tick, oldest first.
+ */
+const MAX_PARALLEL_JOBS = 8;
+
+async function advanceJob(initial: BroadcastJob): Promise<void> {
+  let job = initial;
+
+  if (job.status === "queued") {
+    // A follow-up's recipients are decided HERE, not when it was scheduled —
+    // everyone who replied or called during the wait drops out. Resolved
+    // before the status flips so a crash mid-resolve just retries.
+    if (job.followUpOfJobId) {
+      const hasRecipients = await materializeFollowUp(job.id, job.followUpOfJobId, {
+        trigger: job.followUpTrigger,
+        quietHours: job.followUpQuietHours ?? undefined,
+        rolling: Boolean(job.followUpRollingUntil),
+      });
+      if (!hasRecipients) {
+        // Nobody due YET is the normal state of a rolling job for most of
+        // its life — it must go back to waiting, not finish.
+        if (await parkOrFinishRolling(job)) return;
+        await prisma.broadcastJob.update({
+          where: { id: job.id },
+          data: { status: "completed", completedAt: new Date(), totalCount: 0 },
+        });
+        logger.info({ jobId: job.id }, "broadcast follow-up: everyone had responded, nothing to send");
+        return;
+      }
+    }
+    // Re-read via the update's own return value, NOT the row fetched above:
+    // materializeFollowUp has just rewritten guestIds/totalCount in the
+    // database, and the stale in-memory copy still holds the empty list a
+    // follow-up is created with. Without this the cursor check below sees
+    // `0 >= 0`, completes the job on the spot, and every recipient sits at
+    // "Pending" having never been messaged.
+    job = await prisma.broadcastJob.update({
+      where: { id: job.id },
+      data: { status: "running" },
+    });
+  }
+
+  if (job.lastSentAt && Date.now() - job.lastSentAt.getTime() < job.delaySec * 1000) return;
+
+  if (job.cursor >= job.guestIds.length) {
+    // This batch is done. A rolling job goes back to waiting for the next
+    // people to come due; a one-shot job is finished for good.
+    if (await parkOrFinishRolling(job)) return;
+    await prisma.broadcastJob.update({
+      where: { id: job.id },
+      data: { status: "completed", completedAt: new Date() },
+    });
+    return;
+  }
+
+  const guestId = job.guestIds[job.cursor];
+  await sendOne(job, guestId).catch((err) =>
+    logger.error({ err, jobId: job.id, guestId }, "broadcast: send failed"),
+  );
 }
 
 async function sendOne(job: BroadcastJob, guestId: string): Promise<void> {
@@ -205,6 +370,12 @@ async function sendOne(job: BroadcastJob, guestId: string): Promise<void> {
     ? job.templateName!
     : personalize(job.message, guest.fullName, guest.gender);
 
+  // What this guest will actually read, for the thread. Falls back to the
+  // template's name for jobs created before the body was captured.
+  const templateText = isCloudApiTemplate
+    ? renderTemplateForGuest(job, guest.fullName, guest.gender) ?? `[template: ${job.templateName}]`
+    : null;
+
   let attachment: { mimeType: string; fileName: string; base64: string } | null = null;
   if (job.imageDocumentId && !isCloudApiTemplate) {
     const doc = await prisma.document.findUnique({ where: { id: job.imageDocumentId } });
@@ -219,10 +390,14 @@ async function sendOne(job: BroadcastJob, guestId: string): Promise<void> {
     mailboxId: number.instanceName,
     channel: "whatsapp" as const,
     direction: "outbound" as const,
-    body: isCloudApiTemplate ? `[template: ${job.templateName}]` : text,
+    body: isCloudApiTemplate ? templateText! : text,
+    metaTemplateName: isCloudApiTemplate ? job.templateName : null,
     fromEmail: number.phoneNumber,
     toEmail: guest.phone,
     broadcastJobId: job.id,
+    // Stamped per message so a reply can be attributed without walking back
+    // to the job — see lib/reply-tag.ts.
+    replyTag: job.replyTag,
   };
 
   try {
@@ -265,6 +440,7 @@ async function sendOne(job: BroadcastJob, guestId: string): Promise<void> {
       res = await sendWhatsAppMessage(number, guest.phone, text);
     }
     await prisma.message.create({ data: { ...base, externalId: res.externalId, status: "sent" } });
+    await tagWhatsAppNumberUsed(guest.id, number.phoneNumber);
     await recordResult(job, guestId, true, null);
   } catch (err) {
     const errorDetail = err instanceof Error ? err.message : "send failed";
@@ -292,4 +468,13 @@ async function recordResult(
       errors,
     },
   });
+
+  // Flag the guest for the re-send worklist. This covers only the failures
+  // we can see synchronously — no phone on file, no connected number, the
+  // send call itself throwing. The far commoner case (WhatsApp accepted it,
+  // then delivery failed) has no error to catch here and is tagged later
+  // off the status webhook instead; see lib/broadcast-failed-tag.ts. Note
+  // the success branch deliberately does NOT clear the tag: "sent" only
+  // means it left us, and that is precisely the state that goes on to fail.
+  if (!success) await tagBroadcastFailure(guestId);
 }

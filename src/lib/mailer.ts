@@ -2,6 +2,7 @@ import nodemailer, { type Transporter } from "nodemailer";
 import crypto from "node:crypto";
 import type { MailboxConfig } from "./mailboxes";
 import { logger } from "./logger";
+import { applyEmailFooter } from "./email-footer";
 
 /**
  * Outbound email via the mailbox's own SMTP (nodemailer). One transport per
@@ -39,6 +40,14 @@ export interface SendArgs {
   inReplyTo?: string | null;
   references?: string[];
   attachments?: { filename: string; content: Buffer; contentType?: string; cid?: string }[];
+  /** Extra headers, e.g. Auto-Submitted on a machine-generated reply. */
+  headers?: Record<string, string>;
+  /**
+   * Skip the configured footer. Only for mail that is not correspondence
+   * with a guest — the marketing report to the CEO is an internal artefact
+   * and a marketing signature on it would be noise.
+   */
+  skipFooter?: boolean;
 }
 
 export interface SendResult {
@@ -52,17 +61,28 @@ export async function sendEmail(
   args: SendArgs,
 ): Promise<SendResult> {
   const messageId = makeMessageId(mailbox.address);
+
+  // Applied here, not at the call sites. Four places send mail today and the
+  // footer has to still be on the fifth — one that has to be remembered is
+  // one that will be missing somewhere.
+  const body = args.skipFooter
+    ? { text: args.text, html: args.html, attachments: [] as NonNullable<SendArgs["attachments"]> }
+    : await applyEmailFooter({ text: args.text, html: args.html });
+
   const info = await transportFor(mailbox).sendMail({
     from: mailbox.from,
     replyTo: mailbox.from,
     to: args.to,
     subject: args.subject,
-    text: args.text,
-    html: args.html,
+    text: body.text,
+    html: body.html,
     messageId,
     inReplyTo: args.inReplyTo ?? undefined,
     references: args.references?.length ? args.references.join(" ") : undefined,
-    attachments: args.attachments,
+    headers: args.headers,
+    // Footer images last so a caller's own attachment keeps its position in
+    // clients that show them in order.
+    attachments: [...(args.attachments ?? []), ...body.attachments],
   });
   logger.info(
     { mailbox: mailbox.id, to: args.to, messageId },

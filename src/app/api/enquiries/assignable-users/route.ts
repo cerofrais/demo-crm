@@ -1,10 +1,14 @@
 /**
- * GET /api/enquiries/assignable-users — staff a lead can be reassigned to.
- * Same audience as `leads.manage` (Admin, Manager) — reads live from
+ * GET /api/enquiries/assignable-users — staff a lead can be reassigned to,
+ * and the options for the "filter by person" dropdowns on the board and in
+ * Tasks. Readable by `leads.manage` (Admin, Manager) and `reports.allStaff`,
+ * which adds the read-only Viewer: listing names to filter by is a read, and
+ * reassigning is still gated separately by the routes that change owners.
+ * Reads live from
  * Keycloak via the app's own service account, not the lazily-populated
  * StaffProfile table, so a newly created user shows up immediately.
  */
-import { handle, ok, requirePermission, ApiError } from "@/lib/api";
+import { handle, ok, requireAnyPermission, ApiError } from "@/lib/api";
 import { listUsers } from "@/lib/keycloak-admin";
 import { rateLimit } from "@/lib/rate-limit";
 
@@ -13,7 +17,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   return handle(async () => {
-    const ctx = await requirePermission("leads.manage");
+    const ctx = await requireAnyPermission(["leads.manage", "reports.allStaff"]);
     // F23: per-user QPS ceiling so a single authenticated user can't spin this
     // endpoint (which drives listUsers' ~N+1 Keycloak role fetches) into a DoS.
     // Defence-in-depth alongside the 60s cache in listUsers(). failOpen (helper

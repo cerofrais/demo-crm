@@ -5,6 +5,7 @@ import { can } from "@/lib/rbac";
 import { prisma } from "@/lib/prisma";
 import { mailboxForRoles, canSendEmail } from "@/lib/mailboxes";
 import { sendEmail, makeMessageId } from "@/lib/mailer";
+import { normalizeReplyTag } from "@/lib/reply-tag";
 import { formatPackageForEmail } from "@/lib/packages";
 import { personalizeTemplate } from "@/lib/message-templates";
 import { sanitizeEmailHtml, extractCidImageIds, buildInlineImageAttachments } from "@/lib/mail-html";
@@ -41,6 +42,8 @@ const schema = z.object({
    * rather than the Prisma-generated default, so any non-empty string is valid here;
    * the findUnique lookup below is what actually validates it exists. */
   packageId: z.string().min(1).optional(),
+  /** Applied to a lead when that guest replies to this email. */
+  replyTag: z.string().max(64).optional(),
 });
 
 /**
@@ -70,7 +73,7 @@ export async function POST(req: NextRequest) {
     });
     if (!userLimit.allowed) return asNext(rateLimitResponse(userLimit));
 
-    const { guestIds, subject, body, html: rawHtml, attachmentDocumentId, packageId } =
+    const { guestIds, subject, body, html: rawHtml, attachmentDocumentId, packageId, replyTag: rawReplyTag } =
       schema.parse(await req.json());
     const html = rawHtml ? sanitizeEmailHtml(rawHtml) : undefined;
 
@@ -158,6 +161,7 @@ export async function POST(req: NextRequest) {
     let sent = 0;
     let failed = 0;
     const errors: string[] = [];
+    const replyTag = normalizeReplyTag(rawReplyTag);
 
     for (const guest of guests) {
       if (!guest.email) continue;
@@ -185,9 +189,13 @@ export async function POST(req: NextRequest) {
             body: personalBody,
             bodyHtml: personalHtml ?? null,
             attachmentDocumentId: attachmentDocumentId ?? null,
+            // Inline images are part of the body; only the attached file counts.
+            attachmentNames: sharedAttachment ? [sharedAttachment.filename] : [],
             fromEmail: mailbox.address,
             toEmail: guest.email,
             messageId: res.messageId,
+            // Bulk email has no BroadcastJob row, so the tag lives only here.
+            replyTag,
             status: "sent",
           },
         });

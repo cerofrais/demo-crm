@@ -9,7 +9,9 @@ import { runAiPipeline } from "@/lib/ai/pipeline";
 import { aiPipelineEnabled, aiPipelineIntervalSec } from "@/lib/ai/config";
 import { runDeletionSweep } from "@/lib/lead-deletion";
 import { tickBroadcast } from "@/lib/broadcast";
+import { tickHeldAssignments } from "@/lib/held-assignment";
 import { tickDailyMarketingReport } from "@/lib/marketing-report";
+import { tickWeeklyCresentReport } from "@/lib/cresent-report";
 import { logger } from "@/lib/logger";
 
 const g = globalThis as unknown as {
@@ -17,7 +19,9 @@ const g = globalThis as unknown as {
   __treAiPipelineStarted?: boolean;
   __treDeletionSweepStarted?: boolean;
   __treBroadcastStarted?: boolean;
+  __treHeldAssignmentStarted?: boolean;
   __treMarketingReportStarted?: boolean;
+  __treCresentReportStarted?: boolean;
 };
 
 if (process.env.EMAIL_INBOUND_ENABLED === "true" && !g.__treInboundStarted) {
@@ -72,4 +76,29 @@ if (!g.__treMarketingReportStarted) {
     void tickDailyMarketingReport();
     setInterval(() => void tickDailyMarketingReport(), intervalSec * 1000);
   }, 45_000);
+}
+
+if (!g.__treCresentReportStarted) {
+  g.__treCresentReportStarted = true;
+  // Every 15 minutes; the tick sends only from Monday 09:00 IST, once per
+  // week — the unique scheduled row is the guard, not this timer.
+  const intervalSec = 900;
+  logger.info({ intervalSec }, "weekly cresent report scheduler starting");
+  setTimeout(() => {
+    void tickWeeklyCresentReport();
+    setInterval(() => void tickWeeklyCresentReport(), intervalSec * 1000);
+  }, 50_000);
+}
+
+if (!g.__treHeldAssignmentStarted) {
+  g.__treHeldAssignmentStarted = true;
+  // A minute is plenty: this decides how long a lead that arrived off-hours
+  // waits past the moment somebody's shift actually starts, and the query is
+  // a single indexed read that usually returns nothing.
+  const intervalSec = 60;
+  logger.info({ intervalSec }, "held-lead assignment worker starting");
+  setTimeout(() => {
+    void tickHeldAssignments();
+    setInterval(() => void tickHeldAssignments(), intervalSec * 1000);
+  }, 25_000);
 }

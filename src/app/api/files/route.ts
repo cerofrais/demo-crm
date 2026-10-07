@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { handle, ok, requireSession } from "@/lib/api";
-import { readableDocCategories, can } from "@/lib/rbac";
+import { readableDocCategories, can, canReadAllGuestData } from "@/lib/rbac";
 import { prisma } from "@/lib/prisma";
 import { isInlineType } from "@/lib/storage";
 import type { DocumentCategory, Prisma } from "@prisma/client";
@@ -67,7 +67,7 @@ export async function GET(req: NextRequest) {
     // Broad access is kept for leads.manage (Admin/Manager) and health.view
     // (Doctor's cross-guest clinical need). Shared library files (no guest +
     // no enquiry) stay visible to everyone.
-    if (!can(ctx.roles, "leads.manage") && !can(ctx.roles, "health.view")) {
+    if (!canReadAllGuestData(ctx.roles)) {
       where.OR = [
         { guestId: null, enquiryId: null },
         { enquiry: { assignedToSub: ctx.sub } },

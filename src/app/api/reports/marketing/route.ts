@@ -61,6 +61,14 @@ export async function POST(req: NextRequest) {
 
     const body = await req.json().catch(() => ({}));
 
+    // Slugs as stored on Enquiry.tags. Capped so a hand-crafted request can't
+    // turn one report into an unbounded AND across hundreds of array columns.
+    const tags: string[] = Array.isArray(body?.tags)
+      ? body.tags.filter((t: unknown): t is string => typeof t === "string" && t.trim().length > 0)
+          .map((t: string) => t.trim())
+          .slice(0, 12)
+      : [];
+
     // Custom range: {from, to} as YYYY-MM-DD, both inclusive. Noon UTC is used
     // to name the day so neither end can slip into a neighbouring IST day.
     if (body?.from && body?.to) {
@@ -77,7 +85,7 @@ export async function POST(req: NextRequest) {
       if (to.getTime() - from.getTime() > 366 * 86_400_000) {
         throw new ApiError("VALIDATION_ERROR", "Pick a range of a year or less", 400);
       }
-      return ok(await generateRangeReport(from, to), undefined, 201);
+      return ok(await generateRangeReport(from, to, tags), undefined, 201);
     }
 
     // Otherwise the daily report — defaults to yesterday, matching the
@@ -87,7 +95,7 @@ export async function POST(req: NextRequest) {
       throw new ApiError("VALIDATION_ERROR", "Invalid date", 400);
     }
 
-    const result = await generateMarketingReport(day);
+    const result = await generateMarketingReport(day, tags);
     return ok(result, undefined, 201);
   });
 }

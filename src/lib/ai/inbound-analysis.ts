@@ -326,6 +326,8 @@ export async function analyseInbound(from: Date, to: Date): Promise<InboundAnaly
   });
 
   const templates = await prisma.messageTemplate.findMany({
+    // A retired template is not something to suggest staff send.
+    where: { archivedAt: null },
     select: { id: true, name: true, channel: true, body: true },
   });
 

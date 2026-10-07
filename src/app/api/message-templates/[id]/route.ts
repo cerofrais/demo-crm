@@ -1,5 +1,6 @@
 /**
- * PATCH  /api/message-templates/:id — edit a template. Admin/Manager only.
+ * PATCH  /api/message-templates/:id — edit, archive ({ archived: true }) or
+ *        restore ({ archived: false }) a template. Admin/Manager only.
  * DELETE /api/message-templates/:id — remove a template. Admin/Manager only.
  */
 import { NextRequest } from "next/server";
@@ -13,13 +14,15 @@ const patchSchema = z.object({
   name: z.string().min(1).max(120).optional(),
   subject: z.string().max(300).nullable().optional(),
   body: z.string().min(1).max(10_000).optional(),
+  folderId: z.string().uuid().nullish(),
+  archived: z.boolean().optional(),
 });
 
 export async function PATCH(req: NextRequest, { params }: { params: { id: string } }) {
   return handle(async () => {
-    await requirePermission("leads.manage");
+    const ctx = await requirePermission("leads.manage");
     const input = patchSchema.parse(await req.json());
-    return ok(await updateMessageTemplate(params.id, input));
+    return ok(await updateMessageTemplate(params.id, input, ctx.sub));
   });
 }
 

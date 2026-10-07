@@ -96,7 +96,7 @@ const STAGE_ORDER: EnquiryStage[] = [
 // tapering toward the close) rather than a flat spread across columns.
 const STAGE_WEIGHTS: Record<EnquiryStage, number> = {
   new_lead: 18, contacted: 15, rnr: 10, qualified: 12, pricing_shared: 10,
-  doctor_consultation: 7, payment_received: 5, booking_confirmed: 8, converted: 10, staff: 3, lost: 12,
+  doctor_consultation: 7, payment_received: 5, booking_confirmed: 8, converted: 10, staff: 3, lost: 12, non_leads: 0,
 };
 function weightedStage(r: () => number): EnquiryStage {
   const total = STAGE_ORDER.reduce((s, k) => s + STAGE_WEIGHTS[k], 0);
@@ -125,6 +125,7 @@ export const DEMO_USERS: DemoUser[] = [
   { sub: "demo-admin", name: "Ananya Krishnan", email: "ananya.krishnan@meridianwellness.demo", role: "ADMIN", phone: "+91 98450 11122", isOnline: true },
   { sub: "demo-manager", name: "Rohit Malhotra", email: "rohit.malhotra@meridianwellness.demo", role: "MANAGER", phone: "+91 98450 22233", isOnline: true },
   { sub: "demo-doctor", name: "Dr. Kavitha Iyer", email: "kavitha.iyer@meridianwellness.demo", role: "DOCTOR", phone: "+91 98450 33344", isOnline: true },
+  { sub: "demo-doctoradmin", name: "Dr. Meera Pillai", email: "meera.pillai@meridianwellness.demo", role: "DOCTORADMIN", phone: "+91 98450 99900", isOnline: true },
   { sub: "demo-reception", name: "Fatima Sheikh", email: "fatima.sheikh@meridianwellness.demo", role: "RECEPTION", phone: "+91 98450 44455", isOnline: true },
   { sub: "demo-sales-1", name: "Arjun Nair", email: "arjun.nair@meridianwellness.demo", role: "SALES", phone: "+91 98450 55566", isOnline: true },
   { sub: "demo-sales-2", name: "Sneha Reddy", email: "sneha.reddy@meridianwellness.demo", role: "SALES", phone: "+91 98450 66677", isOnline: false },

@@ -1,3 +1,6 @@
+// Age helpers live in ./age (dependency-free, see its header) and are
+// re-exported here so the many `from "@/lib/utils"` imports keep working.
+export { ageFromDob, ageGroup, ageToDateOfBirth } from "./age";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 
@@ -22,32 +25,6 @@ export function formatINR(amount?: number | null): string {
     currency: "INR",
     maximumFractionDigits: 0,
   }).format(amount);
-}
-
-export function ageFromDob(dob?: string | Date | null): number | null {
-  if (!dob) return null;
-  const d = new Date(dob);
-  if (Number.isNaN(d.getTime())) return null;
-  const diff = Date.now() - d.getTime();
-  return Math.floor(diff / (365.25 * 24 * 3600 * 1000));
-}
-
-export function ageGroup(age: number | null): string {
-  if (age == null) return "—";
-  if (age < 35) return "Under 35";
-  if (age < 50) return "35–49";
-  return "50+";
-}
-
-/**
- * Inverse of ageFromDob — a self-reported age (from a form's "Age" field,
- * not a real birth date) turned into an approximate dateOfBirth so the
- * existing ageGroup() bucketing works off it. Uses the same 365.25-day-year
- * math as ageFromDob so round-tripping this back through ageFromDob lands
- * on the same age.
- */
-export function ageToDateOfBirth(age: number): Date {
-  return new Date(Date.now() - age * 365.25 * 24 * 3600 * 1000);
 }
 
 /**

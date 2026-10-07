@@ -2,11 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Loader2, Check, X, Phone, AlarmClock, CalendarClock, CheckCircle2, ChevronDown, UserPlus, Search, MessageSquare } from "lucide-react";
+import { Loader2, Check, X, Phone, AlarmClock, CalendarClock, CheckCircle2, ChevronDown, UserPlus, Search, MessageSquare, Trash2 } from "lucide-react";
 import { Card, Badge, Select, Input } from "@/components/ui";
 import { api } from "@/lib/client";
 import { cn, formatIST } from "@/lib/utils";
 import { STAGES, stageLabel } from "@/lib/kanban";
+import { TagFilterBar } from "@/components/leads/tag-filter-bar";
+import type { TagMatch } from "@/lib/tag-match";
+import { formatTag, sortTags } from "@/lib/lead-tags";
 import type { EnquiryStage } from "@prisma/client";
 
 /** Mirrors the leads board's own source filter, minus its "" placeholder. */
@@ -39,6 +42,8 @@ interface TaskDTO {
   guestName: string;
   guestPhone: string;
   stage: EnquiryStage;
+  /** The lead's tags (merged system + custom), for the chips and the filter. */
+  tags: string[];
   /** False when this task belongs to someone else but sits on a lead you own. */
   mine: boolean;
   assignedToName: string | null;
@@ -48,7 +53,15 @@ interface TaskDTO {
   lastRemark: { body: string; authorName: string | null; createdAt: string } | null;
 }
 
-export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
+export function TasksList({
+  canSeeAll,
+  canRemoveDoctorTasks = false,
+}: {
+  canSeeAll: boolean;
+  /** Admin (leads.delete). Doctor reviews are normally resolved by the
+   *  doctor's decision on the lead; this only clears one raised in error. */
+  canRemoveDoctorTasks?: boolean;
+}) {
   const [tasks, setTasks] = useState<TaskDTO[]>([]);
   const [completed, setCompleted] = useState<TaskDTO[]>([]);
   const [scope, setScope] = useState<"me" | "all">("me");
@@ -61,18 +74,27 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
   const [stage, setStage] = useState("");
   const [source, setSource] = useState("");
   const [q, setQ] = useState("");
+  const [activeTags, setActiveTags] = useState<string[]>([]);
+  const [tagMatch, setTagMatch] = useState<TagMatch>("any");
+  const [availableTags, setAvailableTags] = useState<string[]>([]);
   // ?task=<id> from a "Task created" entry in a lead's activity timeline.
   const [focusId, setFocusId] = useState<string | null>(null);
   const [focusMissing, setFocusMissing] = useState(false);
+  // ?lead=<id> from the task chip on a lead card — this list, narrowed to
+  // that one lead.
+  const [leadId, setLeadId] = useState<string | null>(null);
   const router = useRouter();
   const debounce = useRef<ReturnType<typeof setTimeout>>();
 
   // Read off window.location rather than useSearchParams() so this page
   // doesn't need a Suspense boundary — same reasoning as GuestSearch's ?q=.
   useEffect(() => {
-    const id = new URLSearchParams(window.location.search).get("task");
-    if (!id) return;
-    setFocusId(id);
+    const sp = new URLSearchParams(window.location.search);
+    const id = sp.get("task");
+    const lead = sp.get("lead");
+    if (!id && !lead) return;
+    if (id) setFocusId(id);
+    if (lead) setLeadId(lead);
     // Tasks now belong to the LEAD OWNER, not whoever created them — so an
     // Admin/Manager clicking "Task created" in a lead's Activity tab is
     // almost always looking at someone else's task. Defaulting to "My
@@ -90,6 +112,13 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
     Completed: true,
   });
 
+  useEffect(() => {
+    api
+      .get<string[]>("/api/tasks/tags")
+      .then((t) => setAvailableTags(sortTags(t)))
+      .catch(() => {});
+  }, []);
+
   // Per-person filter options, for the same audience as reports.allStaff.
   useEffect(() => {
     if (!canSeeAll) return;
@@ -106,9 +135,14 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
       // open ones only — widen to "all" just for that case so the target can
       // actually be found, then split by status below.
       const params = new URLSearchParams({ scope, status: focusId ? "all" : "open" });
+      if (leadId) params.set("enquiryId", leadId);
       if (scope === "all" && person) params.set("assignee", person);
       if (stage) params.set("stage", stage);
       if (source) params.set("source", source);
+      if (activeTags.length) {
+        params.set("tags", activeTags.join(","));
+        params.set("tagMatch", tagMatch);
+      }
       if (q.trim().length >= 2) params.set("q", q.trim());
       const all = await api.get<TaskDTO[]>(`/api/tasks?${params}`);
       setTasks(all.filter((t) => t.status !== "done" && t.status !== "cancelled"));
@@ -117,7 +151,7 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
     } finally {
       setLoading(false);
     }
-  }, [scope, person, stage, source, q, focusId]);
+  }, [scope, person, stage, source, activeTags, tagMatch, q, focusId, leadId]);
 
   useEffect(() => {
     // Debounced only for the search box; the selects settle immediately.
@@ -142,6 +176,26 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
     await api.patch(`/api/tasks/${id}`, { status: "done" }).catch(load);
   }
 
+  async function removeDoctorTask(id: string) {
+    const task = tasks.find((t) => t.id === id);
+    if (
+      !window.confirm(
+        `Delete "${task?.title ?? "this doctor review"}"?\n\n` +
+          "This cannot be undone. The lead keeps its consultation stage and " +
+          "its history — only this task goes. Use it for a review raised in " +
+          "error, not to skip one.",
+      )
+    ) {
+      return;
+    }
+    setTasks((prev) => prev.filter((t) => t.id !== id));
+    // A real delete, not a cancel — a cancelled review sits in the completed
+    // list looking like a decision somebody made. The API still writes a
+    // task_deleted entry to the lead's timeline, so the removal is on record
+    // even though the task itself is gone.
+    await api.delete(`/api/tasks/${id}`).catch(load);
+  }
+
   async function decide(id: string, approved: boolean) {
     const task = tasks.find((t) => t.id === id);
     setTasks((prev) => prev.filter((t) => t.id !== id));
@@ -153,8 +207,18 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
     setOpenSections((prev) => ({ ...prev, [name]: !prev[name] }));
   }
 
-  const overdue = tasks.filter((t) => t.overdue);
-  const upcoming = tasks.filter((t) => !t.overdue);
+  // A Payment Pending chase sorts above everything else in its section and
+  // stays there until the lead leaves the stage — a lead waiting on money is
+  // the thing you want at eye level when you open this page.
+  const pinFirst = (list: TaskDTO[]) => [
+    ...list.filter((t) => t.kind === "payment_pending"),
+    ...list.filter((t) => t.kind !== "payment_pending"),
+  ];
+  // Named from the rows themselves — every task in a ?lead= list is on the
+  // same lead, so the first one carries the name.
+  const leadName = leadId ? (tasks[0]?.guestName ?? completed[0]?.guestName ?? null) : null;
+  const overdue = pinFirst(tasks.filter((t) => t.overdue));
+  const upcoming = pinFirst(tasks.filter((t) => !t.overdue));
   const hasAny = overdue.length > 0 || upcoming.length > 0 || completed.length > 0;
 
   return (
@@ -218,15 +282,40 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
             <option key={value} value={value}>{label}</option>
           ))}
         </Select>
-        {(stage || source || q) && (
+        {leadId && (
           <button
-            onClick={() => { setStage(""); setSource(""); setQ(""); }}
+            onClick={() => setLeadId(null)}
+            title="Show every lead's tasks again"
+            className="flex items-center gap-1 rounded-full bg-sky-100 px-2.5 py-1 text-xs font-medium text-sky-800"
+          >
+            {leadName ? `Tasks for ${leadName}` : "One lead only"}
+            <X className="h-3 w-3" />
+          </button>
+        )}
+        {(stage || source || q || activeTags.length > 0) && (
+          <button
+            onClick={() => { setStage(""); setSource(""); setQ(""); setActiveTags([]); }}
             className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
           >
             Clear filters
           </button>
         )}
       </div>
+
+      {availableTags.length > 0 && (
+        <div className="-mx-4 md:-mx-6">
+          <TagFilterBar
+            availableTags={availableTags}
+            activeTags={activeTags}
+            onToggle={(t) =>
+              setActiveTags((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]))
+            }
+            onClear={() => setActiveTags([])}
+            match={tagMatch}
+            onMatchChange={setTagMatch}
+          />
+        </div>
+      )}
 
       {focusMissing && (
         <Card className="border-amber-200 bg-amber-50/70 p-3 text-sm text-amber-900">
@@ -248,7 +337,9 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
         </div>
       ) : !hasAny ? (
         <Card className="py-12 text-center text-sm text-muted-foreground">
-          No open follow-ups. Nice — inbox zero. 🌿
+          {leadId
+            ? "No open follow-ups on this lead — they may have been completed, or belong to another staff member."
+            : "No open follow-ups. Nice — inbox zero. 🌿"}
         </Card>
       ) : (
         <div className="space-y-4">
@@ -262,6 +353,7 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
               onToggle={() => toggleSection("Overdue")}
               onComplete={complete}
               onDecide={decide}
+              onRemoveDoctorTask={canRemoveDoctorTasks ? removeDoctorTask : undefined}
               focusId={focusId}
             />
           )}
@@ -275,6 +367,7 @@ export function TasksList({ canSeeAll }: { canSeeAll: boolean }) {
               onToggle={() => toggleSection("Upcoming")}
               onComplete={complete}
               onDecide={decide}
+              onRemoveDoctorTask={canRemoveDoctorTasks ? removeDoctorTask : undefined}
               focusId={focusId}
             />
           )}
@@ -307,6 +400,7 @@ function Section({
   onToggle,
   onComplete,
   onDecide,
+  onRemoveDoctorTask,
   focusId = null,
   dimmed = false,
 }: {
@@ -318,6 +412,8 @@ function Section({
   onToggle: () => void;
   onComplete: (id: string) => void;
   onDecide: (id: string, approved: boolean) => void;
+  /** Admins only — undefined for everyone else, which hides the control. */
+  onRemoveDoctorTask?: (id: string) => void;
   /** Task deep-linked from a lead's activity timeline — ringed and scrolled to. */
   focusId?: string | null;
   dimmed?: boolean;
@@ -394,20 +490,64 @@ function Section({
                     </button>
                   </div>
                 )
-              ) : t.kind === "doctor_review" ? (
+              ) : t.kind === "payment_pending" ? (
                 dimmed ? (
                   <div
                     className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-emerald-400 bg-emerald-50 text-emerald-500"
-                    title="Resolved"
+                    title="Payment collected — lead moved on"
                   >
                     <Check className="h-4 w-4" />
                   </div>
                 ) : (
                   <div
-                    className="flex h-7 shrink-0 items-center rounded-md border border-indigo-300 bg-indigo-50 px-2 text-[11px] font-medium text-indigo-700"
-                    title="Resolved from the lead's consultation decision, not here"
+                    className="flex h-7 shrink-0 items-center rounded-md border border-amber-300 bg-amber-100 px-2 text-[11px] font-medium text-amber-800"
+                    title="Closes by itself when the lead leaves Payment Pending"
                   >
-                    Awaiting doctor
+                    Payment pending
+                  </div>
+                )
+              ) : t.kind === "doctor_review" ? (
+                dimmed ? (
+                  // A cancelled review is not a resolved one. Both used to
+                  // render the same green tick, which read as "the doctor
+                  // decided" for a task that was removed without a decision.
+                  t.status === "cancelled" ? (
+                    <div
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-muted-foreground"
+                      title="Removed without a doctor's decision"
+                    >
+                      <X className="h-4 w-4" />
+                    </div>
+                  ) : (
+                    <div
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-emerald-400 bg-emerald-50 text-emerald-500"
+                      title="Resolved"
+                    >
+                      <Check className="h-4 w-4" />
+                    </div>
+                  )
+                ) : (
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <div
+                      className="flex h-7 items-center rounded-md border border-indigo-300 bg-indigo-50 px-2 text-[11px] font-medium text-indigo-700"
+                      title="Resolved from the lead's consultation decision, not here"
+                    >
+                      Awaiting doctor
+                    </div>
+                    {/* Admin escape hatch for a review raised in error — a
+                        duplicate, or a lead that has since gone elsewhere.
+                        Absent for everyone else, since the normal way to
+                        clear one of these is the doctor's own decision. */}
+                    {onRemoveDoctorTask && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onRemoveDoctorTask(t.id); }}
+                        title="Delete this doctor review (admin only) — permanent; the lead is untouched"
+                        aria-label="Delete this doctor review"
+                        className="flex h-7 w-7 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:border-rose-300 hover:bg-rose-50 hover:text-rose-600"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
                   </div>
                 )
               ) : (
@@ -442,6 +582,12 @@ function Section({
                   <Badge className="bg-secondary text-secondary-foreground">
                     {stageLabel(t.stage)}
                   </Badge>
+                  {sortTags(t.tags ?? []).slice(0, 3).map((tag) => {
+                    const f = formatTag(tag);
+                    return (
+                      <Badge key={tag} className={f.className}>{f.label}</Badge>
+                    );
+                  })}
                   {/* Shown only for someone else's task — you now see tasks on
                       leads you own whoever created them, and without this
                       there's no way to tell those apart from your own. */}

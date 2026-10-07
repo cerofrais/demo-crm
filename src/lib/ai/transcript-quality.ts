@@ -34,14 +34,94 @@ const MIN_DISTINCT_WORDS = 5;
  * decode). Callers must treat `false` as "no transcript", never as "transcribe
  * it anyway with whatever this is".
  */
-export function isUsableTranscript(text: string | null | undefined): boolean {
+export interface TranscriptFloor {
+  minChars: number;
+  minDistinctWords: number;
+}
+
+/** Phone calls: minutes of speech, so anything short is a failed decode. */
+export const CALL_TRANSCRIPT_FLOOR: TranscriptFloor = {
+  minChars: MIN_TRANSCRIPT_CHARS,
+  minDistinctWords: MIN_DISTINCT_WORDS,
+};
+
+/**
+ * WhatsApp voice notes: a real one is often a single clause ("haan, bhej
+ * dijiye", "yes please send"), which the call floor would throw away as a
+ * failed decode. Low enough to keep those, high enough that a dead decode —
+ * empty, or one stray syllable — still doesn't reach the LLM.
+ */
+export const VOICE_NOTE_TRANSCRIPT_FLOOR: TranscriptFloor = {
+  minChars: 8,
+  minDistinctWords: 2,
+};
+
+export function isUsableTranscript(
+  text: string | null | undefined,
+  floor: TranscriptFloor = CALL_TRANSCRIPT_FLOOR,
+): boolean {
   if (!text) return false;
   const trimmed = text.trim();
-  if (trimmed.length < MIN_TRANSCRIPT_CHARS) return false;
+  if (trimmed.length < floor.minChars) return false;
+  if (isAsrFillerOnly(trimmed)) return false;
   const words = trimmed.split(/\s+/).filter(Boolean);
   const distinct = new Set(words.map((w) => w.toLowerCase()));
-  return distinct.size >= MIN_DISTINCT_WORDS;
+  return distinct.size >= floor.minDistinctWords;
 }
+
+/**
+ * Whisper's stock hallucinations on silence.
+ *
+ * Trained on captioned video, it fills near-silent audio with the phrases that
+ * end one — "Thanks for watching!", a subtitle credit, "Please subscribe".
+ * These are long enough to clear the length floors, so without this they are
+ * stored as if the guest said them: a 2-second silent voice note in the
+ * activity log reading "Thanks for watching!" is worse than no transcript.
+ *
+ * Only an ENTIRE transcript that is nothing but filler is rejected — a real
+ * note that happens to END with "thank you very much" keeps everything.
+ */
+const ASR_FILLER = [
+  "thanks for watching",
+  "thanks for watching everyone",
+  "thank you for watching",
+  "thank you",
+  "thank you very much",
+  "thanks",
+  "please subscribe",
+  "subscribe to my channel",
+  "like and subscribe",
+  "see you next time",
+  "see you in the next video",
+  "bye",
+  "bye bye",
+  "you",
+  "okay",
+  "hmm",
+  "subtitles by the amara.org community",
+  "transcription by castingwords",
+];
+
+export function isAsrFillerOnly(text: string): boolean {
+  const whole = bareWords(text);
+  if (!whole) return false;
+  if (FILLER_PHRASES.has(whole)) return true;
+  // A filler run ("Thank you. Thank you. Thank you.") is still only filler.
+  const sentences = text.split(/[.!?]+/).map(bareWords).filter(Boolean);
+  return sentences.length > 1 && sentences.every((s) => FILLER_PHRASES.has(s));
+}
+
+/** Letters, digits and single spaces — punctuation and case carry no signal
+ *  here, and "Amara.org" must not split a phrase into two sentences. */
+function bareWords(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const FILLER_PHRASES = new Set(ASR_FILLER.map(bareWords));
 
 /**
  * Whether a transcript is essentially already in Latin script — i.e. the ASR

@@ -1,5 +1,14 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // DEMO BRANCH: the AI switches are read on the server at render time, and
+  // there is no env file behind this build — so the pages that ask whether a
+  // model is configured (Ask the Database) would otherwise render as
+  // "switched off". The answers themselves are produced in the browser by
+  // src/lib/demo/ext-oct.ts; nothing here reaches a real model.
+  env: {
+    AI_ENABLED: "true",
+    AI_MODEL: "gemma3:latest",
+  },
   reactStrictMode: true,
   output: "standalone", // smaller Docker image
   poweredByHeader: false,

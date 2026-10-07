@@ -1,48 +1,50 @@
-import { describe, expect, it } from "vitest";
-import { backfillHealthRecord } from "./health-ingest";
-import { emptyHealthRecord } from "./health";
+import { describe, it, expect } from "vitest";
+import { subjectKey } from "./health-ingest";
 
-describe("backfillHealthRecord", () => {
-  it("fills every still-default field on an empty record", () => {
-    const { merged, changed } = backfillHealthRecord(emptyHealthRecord(), {
-      bloodGroup: "B+",
-      allergies: ["None"],
-      recentSurgeries: { flag: false, detail: "" },
-      seizures: { flag: true, detail: "one episode in 2020" },
-    });
-    expect(changed).toBe(true);
-    expect(merged.bloodGroup).toBe("B+");
-    expect(merged.allergies).toEqual(["None"]);
-    expect(merged.seizures).toEqual({ flag: true, detail: "one episode in 2020" });
+/**
+ * These cover the identity rule only — the part that decides whether two
+ * screening forms are about the same person. Getting it wrong in either
+ * direction is a real harm: too loose merges siblings' medical histories
+ * (the bug this replaced), too strict buries a genuine repeat submission.
+ */
+describe("subjectKey", () => {
+  it("treats the same name and phone as the same person", () => {
+    expect(subjectKey("Nikki Siddi", "+919848369909")).toBe(
+      subjectKey("Nikki Siddi", "+919848369909"),
+    );
   });
 
-  it("never overwrites a field a doctor already set, even with a non-empty incoming value", () => {
-    const existing = { ...emptyHealthRecord(), bloodGroup: "O+", doctorNotes: "Cleared for full program" };
-    const { merged, changed } = backfillHealthRecord(existing, {
-      bloodGroup: "B+", // conflicting — should be ignored
-      occupation: "Business", // still blank on existing — should apply
-    });
-    expect(merged.bloodGroup).toBe("O+"); // untouched
-    expect(merged.occupation).toBe("Business"); // backfilled
-    expect(changed).toBe(true);
+  it("ignores case and stray whitespace in the name", () => {
+    expect(subjectKey("  nikki   SIDDI ", "+919848369909")).toBe(
+      subjectKey("Nikki Siddi", "+919848369909"),
+    );
   });
 
-  it("treats a yesNoDetail field with a non-default flag as already touched, and doesn't overwrite it", () => {
-    const existing = { ...emptyHealthRecord(), heartDisease: { flag: true, detail: "angioplasty 2018" } };
-    const { merged } = backfillHealthRecord(existing, {
-      heartDisease: { flag: false, detail: "" },
-    });
-    expect(merged.heartDisease).toEqual({ flag: true, detail: "angioplasty 2018" });
+  it("separates different people who share a phone", () => {
+    // The actual reported case: three Siddis, one number. Keying on phone
+    // alone is exactly what blended their records together.
+    const phone = "+919848369909";
+    const keys = new Set([
+      subjectKey("Nikki Siddi", phone),
+      subjectKey("Akki Siddi", phone),
+      subjectKey("Sunitha Siddi", phone),
+    ]);
+    expect(keys.size).toBe(3);
   });
 
-  it("reports changed=false when the incoming submission adds nothing new", () => {
-    const existing = { ...emptyHealthRecord(), bloodGroup: "O+" };
-    const { changed } = backfillHealthRecord(existing, { bloodGroup: "B+" });
-    expect(changed).toBe(false);
+  it("separates the same name on different phones", () => {
+    expect(subjectKey("Nikki Siddi", "+919848369909")).not.toBe(
+      subjectKey("Nikki Siddi", "+918639946509"),
+    );
   });
 
-  it("reports changed=false for a guest re-submitting the same (still-empty) form twice", () => {
-    const { changed } = backfillHealthRecord(emptyHealthRecord(), {});
-    expect(changed).toBe(false);
+  it("does not collide a missing name with a missing phone", () => {
+    // Both are empty on one side but the separator keeps them distinct, so a
+    // nameless record can't be matched against a phoneless one.
+    expect(subjectKey(null, "+919848369909")).not.toBe(subjectKey("+919848369909", null));
+  });
+
+  it("is stable for null and undefined", () => {
+    expect(subjectKey(null, null)).toBe(subjectKey(undefined, undefined));
   });
 });

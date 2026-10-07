@@ -12,7 +12,7 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   return handle(async () => {
     const ctx = await requireSession();
-    if (!can(ctx.roles, "leads.delete")) {
+    if (!can(ctx.roles, "leads.delete") && !can(ctx.roles, "leads.viewDeleted")) {
       throw new ApiError("FORBIDDEN", "Admin only", 403);
     }
     return ok(await listDistinctDeletedLeadTags());

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { matchAutoReply } from "./whatsapp-autoreply";
+import { matchAutoReply, isWithinSchedule } from "./whatsapp-autoreply";
 
 interface Fixture {
   id: string;
@@ -49,5 +49,40 @@ describe("matchAutoReply", () => {
       { id: "second", triggerWord: "booking", enabled: true },
     ];
     expect(matchAutoReply(rules, "I'd like to make a booking")?.id).toBe("first");
+  });
+});
+
+describe("isWithinSchedule", () => {
+  // 09:00 IST = 03:30 UTC; IST = UTC+5:30 with no DST.
+  const at = (utcHour: number, utcMin: number) => new Date(Date.UTC(2026, 0, 15, utcHour, utcMin));
+
+  it("no window at all means always on", () => {
+    expect(isWithinSchedule(null, null, at(0, 0))).toBe(true);
+    expect(isWithinSchedule(null, null, at(12, 0))).toBe(true);
+  });
+
+  it("a half-set window is treated as always on, not guessed", () => {
+    expect(isWithinSchedule(540, null, at(0, 0))).toBe(true);
+    expect(isWithinSchedule(null, 1080, at(0, 0))).toBe(true);
+  });
+
+  it("daytime window (9:00–18:00 IST) is open inside, closed outside", () => {
+    // 03:30 UTC = 09:00 IST — inclusive start
+    expect(isWithinSchedule(540, 1080, at(3, 30))).toBe(true);
+    // 06:30 UTC = 12:00 IST — mid-window
+    expect(isWithinSchedule(540, 1080, at(6, 30))).toBe(true);
+    // 12:30 UTC = 18:00 IST — exclusive end
+    expect(isWithinSchedule(540, 1080, at(12, 30))).toBe(false);
+    // 01:00 UTC = 06:30 IST — before opening
+    expect(isWithinSchedule(540, 1080, at(1, 0))).toBe(false);
+  });
+
+  it("overnight window (22:00–06:00 IST) wraps midnight", () => {
+    // 17:30 UTC = 23:00 IST — late evening, inside
+    expect(isWithinSchedule(1320, 360, at(17, 30))).toBe(true);
+    // 22:30 UTC = 04:00 IST next day — small hours, inside
+    expect(isWithinSchedule(1320, 360, at(22, 30))).toBe(true);
+    // 06:30 UTC = 12:00 IST — daytime, outside
+    expect(isWithinSchedule(1320, 360, at(6, 30))).toBe(false);
   });
 });

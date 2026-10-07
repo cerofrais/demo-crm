@@ -4,6 +4,8 @@ import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, Search, Tag as TagIcon, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { formatTag } from "@/lib/lead-tags";
+import type { TagMatch } from "@/lib/tag-match";
+import { TagMatchToggle } from "./tag-match-toggle";
 
 /**
  * Tag filter bar — stays pinned to ONE row (horizontal scroll on the chip
@@ -30,11 +32,18 @@ export function TagFilterBar({
   activeTags,
   onToggle,
   onClear,
+  match,
+  onMatchChange,
 }: {
   availableTags: string[];
   activeTags: string[];
   onToggle: (tag: string) => void;
   onClear: () => void;
+  /** Any/All. Optional: a page that doesn't pass it (the report screens,
+   *  whose tag list defines what the report IS) keeps its fixed meaning and
+   *  shows no toggle. */
+  match?: TagMatch;
+  onMatchChange?: (match: TagMatch) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -153,6 +162,12 @@ export function TagFilterBar({
           );
         })}
       </div>
+
+      {/* Only meaningful from two tags up — with one, "any" and "all" are
+          the same filter, so the toggle would just be noise. */}
+      {match && onMatchChange && activeTags.length >= 2 && (
+        <TagMatchToggle value={match} onChange={onMatchChange} className="border-l border-border pl-2" />
+      )}
 
       {activeTags.length > 0 && (
         <button

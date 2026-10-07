@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { z } from "zod";
 import { handle, ok, requirePermission, ApiError } from "@/lib/api";
 import { prisma } from "@/lib/prisma";
-import { DOCTOR_REVIEW_TITLE_PREFIX, withRnrProgress, withLostRequestPending } from "@/lib/tasks";
+import { DOCTOR_REVIEW_TITLE_PREFIX, withRnrProgress, withLostRequestPending, withOpenTasks } from "@/lib/tasks";
 import { toEnquiryDTO, withCurrentAssigneeName } from "@/lib/enquiries";
 
 export const dynamic = "force-dynamic";
@@ -62,6 +62,6 @@ export async function PATCH(
       },
     });
 
-    return ok(await withLostRequestPending(await withRnrProgress(await withCurrentAssigneeName(toEnquiryDTO(updated)))));
+    return ok(await withOpenTasks(await withLostRequestPending(await withRnrProgress(await withCurrentAssigneeName(toEnquiryDTO(updated))))));
   });
 }

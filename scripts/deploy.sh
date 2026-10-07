@@ -41,6 +41,39 @@ done
 require_docker
 ensure_env
 
+# A box that is NOT the live one (STANDBY=true in its .env) must not grab the
+# things only one box may own. Two specific hazards, both learned the hard way:
+#
+#   ngrok  — a single free-tier endpoint. Starting it here yanks the public
+#            URL away from the live box, and every Meta/Plivo webhook with it.
+#   evolution-api — nextjs depends_on it, so a plain `up -d nextjs` starts it
+#            as a dependency. It would then reconnect the shared WhatsApp
+#            numbers and start answering guests in parallel with the live box.
+#
+# Deploying a standby is still useful (build, migrate, test the UI); it just
+# stays off the air.
+STANDBY="${STANDBY:-false}"
+if [ "$STANDBY" = "true" ]; then
+  warn "STANDBY=true — this box will not start ngrok or evolution-api."
+fi
+
+# `--no-deps` on a standby keeps evolution-api down; the live box keeps the
+# dependency so a normal deploy still brings its stack up.
+app_up_flags() {
+  [ "$STANDBY" = "true" ] && printf -- "--no-deps"
+}
+
+start_tunnel_if_wanted() {
+  if [ "$STANDBY" = "true" ]; then
+    log "Skipping ngrok — STANDBY box (the live box owns https://${NGROK_DOMAIN:-the tunnel})."
+    return
+  fi
+  if [ -n "${NGROK_AUTHTOKEN:-}" ] && [ -n "${NGROK_DOMAIN:-}" ]; then
+    log "Starting ngrok tunnel → https://${NGROK_DOMAIN}"
+    compose --profile dev up -d ngrok
+  fi
+}
+
 deploy_all() {
   hr "Deploy: ALL (infra + app)"
   $DO_BUILD && { prune_build_cache; log "Building app image…"; compose build "$APP_SERVICE"; }
@@ -50,12 +83,9 @@ deploy_all() {
   wait_healthy redis
   log "Starting app (migrations run on container start)…"
   prune_build_cache
-  compose --profile app up -d --build "$APP_SERVICE"
+  compose --profile app up -d --build $(app_up_flags) "$APP_SERVICE"
   wait_http_health || compose logs --tail 30 "$APP_SERVICE"
-  if [ -n "${NGROK_AUTHTOKEN:-}" ] && [ -n "${NGROK_DOMAIN:-}" ]; then
-    log "Starting ngrok tunnel → https://${NGROK_DOMAIN}"
-    compose --profile dev up -d ngrok
-  fi
+  start_tunnel_if_wanted
   $DO_SEED && "$ROOT_DIR/scripts/seed.sh"
   log "Stack is up → http://localhost:3000"
 }
@@ -75,12 +105,9 @@ deploy_app() {
   hr "Deploy: APP"
   $DO_BUILD && { prune_build_cache; log "Building app image…"; compose build "$APP_SERVICE"; }
   log "Starting app + its dependencies…"
-  compose --profile app up -d "$APP_SERVICE"
+  compose --profile app up -d $(app_up_flags) "$APP_SERVICE"
   wait_http_health || compose logs --tail 30 "$APP_SERVICE"
-  if [ -n "${NGROK_AUTHTOKEN:-}" ] && [ -n "${NGROK_DOMAIN:-}" ]; then
-    log "Starting ngrok tunnel → https://${NGROK_DOMAIN}"
-    compose --profile dev up -d ngrok
-  fi
+  start_tunnel_if_wanted
   log "App is up → http://localhost:3000"
 }
 

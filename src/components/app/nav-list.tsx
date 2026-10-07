@@ -20,9 +20,11 @@ import {
   MessageCircle,
   Shuffle,
   LayoutTemplate,
+  FileCheck,
   History,
   Trash2,
   Bot,
+  Database,
   LogOut,
   type LucideIcon,
 } from "lucide-react";
@@ -46,8 +48,10 @@ export const NAV_ICONS: Record<string, LucideIcon> = {
   MessageCircle,
   Shuffle,
   LayoutTemplate,
+  FileCheck,
   History,
   Bot,
+  Database,
 };
 
 export interface NavItem {

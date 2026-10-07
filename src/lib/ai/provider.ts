@@ -9,6 +9,37 @@ import { logger } from "@/lib/logger";
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
+  /**
+   * Images to send alongside the text. Serialised into the OpenAI
+   * `content: [{type:"text"},{type:"image_url"}]` shape, which Ollama's /v1
+   * endpoint understands as well — gemma4 on the box reads them, despite its
+   * tag listing no "vision" capability.
+   */
+  images?: ChatImage[];
+}
+
+export interface ChatImage {
+  mimeType: string;
+  /** Raw base64, no data: prefix. */
+  base64: string;
+}
+
+/** Hard ceiling per image. A phone photo is ~2-5MB; anything past this is
+ *  refused rather than sent, since the model's context is the real limit. */
+export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+function wireMessage(m: ChatMessage): { role: string; content: unknown } {
+  if (!m.images?.length) return { role: m.role, content: m.content };
+  return {
+    role: m.role,
+    content: [
+      { type: "text", text: m.content },
+      ...m.images.map((img) => ({
+        type: "image_url",
+        image_url: { url: `data:${img.mimeType};base64,${img.base64}` },
+      })),
+    ],
+  };
 }
 
 export class AiDisabledError extends Error {
@@ -35,7 +66,7 @@ export async function chat(
       },
       body: JSON.stringify({
         model: cfg.model,
-        messages,
+        messages: messages.map(wireMessage),
         temperature: opts?.temperature ?? cfg.temperature,
         max_tokens: opts?.maxTokens ?? cfg.maxTokens,
         // Ollama ≥0.5 and OpenAI both honour this; servers that don't simply
@@ -89,24 +120,27 @@ export function extractJson<T>(raw: string): T {
 export async function chatJSON<T>(
   system: string,
   user: string,
-  opts?: { temperature?: number; maxTokens?: number },
+  opts?: { temperature?: number; maxTokens?: number; images?: ChatImage[] },
 ): Promise<T> {
   const messages: ChatMessage[] = [
     { role: "system", content: `${system}\n\nRespond with a single valid JSON object and nothing else.` },
-    { role: "user", content: user },
+    { role: "user", content: user, ...(opts?.images?.length ? { images: opts.images } : {}) },
   ];
   const first = await chat(messages, { ...opts, json: true });
   try {
     return extractJson<T>(first);
   } catch (err) {
     logger.warn({ err }, "ai chatJSON parse failed — retrying once");
+    // With more room than the first attempt. The usual cause is a thinking
+    // model spending the whole budget reasoning and being cut off before the
+    // JSON — retrying at the same ceiling just reproduces that.
     const retry = await chat(
       [
         ...messages,
         { role: "assistant", content: first },
         { role: "user", content: "That was not valid JSON. Reply again with ONLY the JSON object." },
       ],
-      { ...opts, json: true },
+      { ...opts, json: true, maxTokens: Math.max(2000, (opts?.maxTokens ?? 1024) * 2) },
     );
     return extractJson<T>(retry);
   }

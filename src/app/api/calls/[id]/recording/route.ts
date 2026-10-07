@@ -31,7 +31,10 @@ export async function GET(_req: NextRequest, { params }: { params: { id: string 
   });
   if (!call?.recordingUrl) return new Response("No recording", { status: 404 });
 
-  const allowed = can(ctx.roles, "reports.allStaff") || call.repKeycloakId === ctx.sub;
+  // Listening is its own permission now: a role can have the Calls screen
+    // without the audio on it, and a rep can always play back a call they
+    // were on, whatever else they hold.
+    const allowed = can(ctx.roles, "calls.recording") || call.repKeycloakId === ctx.sub;
   if (!allowed) return new Response("Forbidden", { status: 403 });
 
   const upstream = await fetchRecording(call.recordingUrl);

@@ -253,8 +253,17 @@ function toIsoDate(year: number, month: number, day: number): string | null {
  * code is normalized to E.164. Returns null if it can't be made plausible.
  */
 function normalizeFormPhone(raw: string): string | null {
-  const digits = raw.replace(/[^\d+]/g, "");
-  if (!digits) return null;
+  const compact = raw.replace(/[^\d+]/g, "");
+  if (!compact) return null;
+  // Collapse repeated pluses and drop any that aren't leading. A guest typing
+  // "+1508…" into a field that already shows a "+" gives "++1508…", and that
+  // single stray character used to fail the pattern below and return null —
+  // which discards the ENTIRE submission, health answers included. One real
+  // screening form (Marc Boesch, 25 Aug) was lost exactly this way.
+  const hadPlus = compact.startsWith("+");
+  const bare = compact.replace(/\+/g, "");
+  if (!bare) return null;
+  const digits = hadPlus ? `+${bare}` : bare;
   if (digits.startsWith("+")) return /^\+[1-9]\d{6,14}$/.test(digits) ? digits : null;
   if (/^[6-9]\d{9}$/.test(digits)) return `+91${digits}`;
   const withPlus = `+${digits}`;

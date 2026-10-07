@@ -6,18 +6,35 @@
  */
 import { env } from "./env";
 import { logger } from "./logger";
+import { ApiError } from "./api";
 
 const BASE = env.EVOLUTION_API_URL;
 
 async function evoFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(`${BASE}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      apikey: env.EVOLUTION_API_KEY,
-      ...(init?.headers ?? {}),
-    },
-  });
+  try {
+    return await fetch(`${BASE}${path}`, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        apikey: env.EVOLUTION_API_KEY,
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch (err) {
+    // fetch() only THROWS (vs returning a non-ok response) when the request
+    // never reached the server at all — DNS failure, connection refused,
+    // timeout. The one place that legitimately happens here is a box where
+    // the evolution-api container isn't running (deliberate on the test
+    // server, so it can't fight production for the live WhatsApp sessions).
+    // Without this, every such call surfaced as an unhandled 500
+    // ("Something went wrong") instead of saying what's actually missing.
+    logger.error({ err, path }, "evolution: unreachable");
+    throw new ApiError(
+      "SERVICE_UNAVAILABLE",
+      "The WhatsApp service (Evolution API) is not reachable on this server. On the test box it is intentionally kept stopped so it can't take over production's live WhatsApp sessions — use production for WhatsApp number management.",
+      503,
+    );
+  }
 }
 
 async function evoFetchOk(path: string, init?: RequestInit): Promise<Response> {
@@ -45,49 +62,27 @@ export interface CreateInstanceResult {
   instanceToken: string;
 }
 
-/** Official Meta Cloud API mode instead of QR-paired Baileys — see docs/17. */
-export interface CloudApiConfig {
-  /** Permanent System User access token for the WABA that owns this number. */
-  token: string;
-  /** Meta's Phone Number id (not the E.164 number itself). */
-  phoneNumberId: string;
-  /** Meta's WhatsApp Business Account id. */
-  wabaId: string;
-}
-
 /**
- * Creates a new instance and returns its own token — does NOT wait for QR
- * pairing (Baileys mode only; a Cloud API instance is created already
- * "open", nothing to pair).
+ * Creates a new QR-paired instance and returns its own token — does NOT wait
+ * for the QR scan.
+ *
+ * Baileys only. Evolution can also front a Cloud API number
+ * (integration: WHATSAPP-BUSINESS), and it used to here, but that mode is
+ * just a proxy over graph.facebook.com — which this app now calls itself
+ * (lib/whatsapp-cloud-api.ts) — while swallowing Cloud API delivery
+ * statuses on the way back. Cloud API numbers no longer touch Evolution.
  */
-export async function createInstance(
-  instanceName: string,
-  cloudApi?: CloudApiConfig,
-): Promise<CreateInstanceResult> {
-  const body = cloudApi
-    ? {
-        instanceName,
-        integration: "WHATSAPP-BUSINESS",
-        token: cloudApi.token,
-        number: cloudApi.phoneNumberId,
-        businessId: cloudApi.wabaId,
-        qrcode: false,
-      }
-    : {
-        instanceName,
-        integration: "WHATSAPP-BAILEYS",
-        qrcode: true,
-      };
+export async function createInstance(instanceName: string): Promise<CreateInstanceResult> {
   const res = await evoFetchOk("/instance/create", {
     method: "POST",
-    body: JSON.stringify(body),
+    body: JSON.stringify({ instanceName, integration: "WHATSAPP-BAILEYS", qrcode: true }),
   });
   const data = await res.json();
   const instanceToken: string | undefined = data?.hash?.apikey ?? data?.hash;
   if (!instanceToken) {
     throw new Error("Evolution API did not return an instance token on create");
   }
-  logger.info({ instanceName, cloudApi: Boolean(cloudApi) }, "evolution: instance created");
+  logger.info({ instanceName }, "evolution: instance created");
   return { instanceName, instanceToken };
 }
 
@@ -97,8 +92,66 @@ export interface QrCodeResult {
   state: "open" | "close" | "connecting" | "unknown";
 }
 
+/**
+ * Onboarding back-off. Every call to /instance/connect makes WhatsApp issue a
+ * NEW pairing code, and the admin page polls for one every 3 seconds — so a
+ * QR dialog left open asks for roughly 1,200 codes an hour. Repeated pairing
+ * attempts are one of the things WhatsApp scores as automated behaviour, and
+ * on 2026-08-22 a number that was already restricted sat in exactly that loop.
+ *
+ * After MAX_QR_ATTEMPTS codes without a successful pairing, the instance is
+ * put on ice for QR_COOLDOWN_MS. Enforced here rather than in the dialog
+ * because a client-side limit is undone by a page refresh, and the point is to
+ * stop the requests reaching WhatsApp at all.
+ *
+ * In-memory on purpose: this is a rate limiter, not a record. A deploy clears
+ * it, which is acceptable — restarts are manual and infrequent, and the cost
+ * of a reset is at most three extra codes.
+ */
+export const MAX_QR_ATTEMPTS = 3;
+export const QR_COOLDOWN_MS = 5 * 60 * 1000;
+
+const qrAttempts = new Map<string, { count: number; blockedUntil: number }>();
+
+/** Milliseconds still to wait before this instance may ask for another code. */
+export function qrCooldownRemaining(instanceName: string): number {
+  const entry = qrAttempts.get(instanceName);
+  if (!entry) return 0;
+  return Math.max(0, entry.blockedUntil - Date.now());
+}
+
+/** Pairing succeeded (or the operator gave up and closed the dialog) — the
+ *  next onboarding attempt starts from a clean slate. */
+export function resetQrAttempts(instanceName: string): void {
+  qrAttempts.delete(instanceName);
+}
+
+export class QrCooldownError extends Error {
+  constructor(public readonly retryAfterMs: number) {
+    super(
+      `Too many pairing attempts. WhatsApp treats repeated QR requests as automated behaviour, ` +
+        `so this number is paused for ${Math.ceil(retryAfterMs / 1000)}s before it can try again.`,
+    );
+    this.name = "QrCooldownError";
+  }
+}
+
 /** Fetches (or re-generates) the pairing QR code for an instance not yet connected. */
 export async function getQrCode(instanceName: string): Promise<QrCodeResult> {
+  const remaining = qrCooldownRemaining(instanceName);
+  if (remaining > 0) throw new QrCooldownError(remaining);
+
+  const entry = qrAttempts.get(instanceName) ?? { count: 0, blockedUntil: 0 };
+  entry.count += 1;
+  if (entry.count >= MAX_QR_ATTEMPTS) {
+    // Counted BEFORE the request goes out, so the third code is handed over
+    // and the block starts immediately after — rather than issuing a fourth
+    // to discover the limit.
+    entry.count = 0;
+    entry.blockedUntil = Date.now() + QR_COOLDOWN_MS;
+  }
+  qrAttempts.set(instanceName, entry);
+
   const res = await evoFetchOk(`/instance/connect/${encodeURIComponent(instanceName)}`);
   const data = await res.json();
   const raw: string | undefined = data?.base64 ?? data?.qrcode?.base64;

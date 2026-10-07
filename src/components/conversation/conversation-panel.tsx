@@ -9,7 +9,7 @@ import { cn, formatIST } from "@/lib/utils";
 import type { MessageDTO } from "@/lib/types";
 import { TemplatePicker } from "@/components/messaging/template-picker";
 import { AttachmentPicker, type AttachmentSelection } from "@/components/messaging/attachment-picker";
-import { personalizeTemplate } from "@/lib/message-templates";
+import { personalizeTemplate, templateBodyToHtml } from "@/lib/message-templates";
 
 interface ConversationResponse {
   items: MessageDTO[]; // newest-first
@@ -236,6 +236,13 @@ export function ConversationPanel({
             )}
             {items.map((m) => {
               const outbound = m.direction === "outbound";
+              // Names cover received attachments too, whose files aren't
+              // stored; an older message may only have the linked document.
+              const attachmentNames = m.attachmentNames?.length
+                ? m.attachmentNames
+                : m.attachment
+                  ? [m.attachment.filename]
+                  : [];
               return (
                 <div key={m.id} className={cn("flex", outbound ? "justify-end" : "justify-start")}>
                   <div
@@ -255,6 +262,18 @@ export function ConversationPanel({
                           day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
                         })}
                       </span>
+                      {/* In the header as well as below the body, so a message
+                          with an attachment stands out while scrolling. */}
+                      {attachmentNames.length > 0 && (
+                        <span
+                          className="inline-flex items-center gap-0.5"
+                          title={attachmentNames.join(", ")}
+                          aria-label={`${attachmentNames.length} attachment${attachmentNames.length === 1 ? "" : "s"}`}
+                        >
+                          <Paperclip className="h-3 w-3" />
+                          {attachmentNames.length > 1 && attachmentNames.length}
+                        </span>
+                      )}
                       {m.status === "failed" && (
                         <Badge className="bg-destructive/10 text-destructive">Failed</Badge>
                       )}
@@ -266,10 +285,30 @@ export function ConversationPanel({
                     </div>
                     {m.subject && <div className="text-xs font-semibold text-foreground">{m.subject}</div>}
                     <MessageBody body={m.body} />
-                    {m.attachment && (
-                      <div className="mt-1 flex items-center gap-1 text-[11px] text-muted-foreground">
-                        <Paperclip className="h-3 w-3 shrink-0" />
-                        <span className="truncate">{m.attachment.filename}</span>
+                    {attachmentNames.length > 0 && (
+                      <div className="mt-1 flex items-start gap-1 text-[11px] text-muted-foreground">
+                        <Paperclip className="mt-0.5 h-3 w-3 shrink-0" />
+                        <span className="min-w-0 break-words">
+                          {attachmentNames.map((name, i) => (
+                            <span key={`${name}-${i}`}>
+                              {i > 0 && ", "}
+                              {/* Only a file the CRM holds can be opened from here;
+                                  a received attachment is named, not stored. */}
+                              {m.attachment && name === m.attachment.filename ? (
+                                <a
+                                  href={`/api/files/${m.attachment.id}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="underline hover:text-foreground"
+                                >
+                                  {name}
+                                </a>
+                              ) : (
+                                name
+                              )}
+                            </span>
+                          ))}
+                        </span>
                       </div>
                     )}
                   </div>
@@ -333,7 +372,7 @@ export function ConversationPanel({
               align="left"
               onSelect={(t) => {
                 if (t.subject) setSubject(personalizeTemplate(t.subject, { name: guestName, gender: guestGender }));
-                setBodyHtml(personalizeTemplate(t.body, { name: guestName, gender: guestGender }).replace(/\n/g, "<br>"));
+                setBodyHtml(templateBodyToHtml(personalizeTemplate(t.body, { name: guestName, gender: guestGender })));
               }}
             />
             <Button

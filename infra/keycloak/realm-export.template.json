@@ -15,6 +15,7 @@
     "realm": [
       { "name": "crm-admin", "description": "Full access; Keycloak admin; DPDP compliance" },
       { "name": "crm-doctor", "description": "Health profiles, therapy plans; no pipeline" },
+      { "name": "crm-doctoradmin", "description": "Doctor, plus visibility of Payment Received / Booking Confirmed / Converted" },
       { "name": "crm-manager", "description": "Full pipeline, staff performance, packages, referrals; no health data" },
       { "name": "crm-reception", "description": "Own leads, messaging, tasks" },
       { "name": "crm-sales", "description": "Own leads up to Booking Confirmed, then handed off to Reception" },

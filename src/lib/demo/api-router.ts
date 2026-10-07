@@ -12,6 +12,9 @@
 import { getDb, mutateDb, newId, nowIso } from "./store";
 import { DEMO_MAILBOXES, DEMO_USERS } from "./seed";
 import { readClientSessionCookie } from "./session";
+import { demoLastActiveAt, registerExtRoutes } from "./ext-routes";
+import { registerOctRoutes } from "./ext-oct";
+import { ensureExt } from "./ext-seed";
 import { PERMISSION_CATALOG, PERMISSION_GROUP_ORDER } from "../permissions-catalog";
 import { ALL_ROLES, permissionsFor, type AppRole } from "../rbac";
 import { CRM_ROLE_TO_APP_ROLE, type CrmRole } from "../keycloak-roles";
@@ -75,7 +78,39 @@ function toEnquiryDTO(db: DemoData, e: DemoEnquiry) {
     proposedDates: e.proposedDates,
     lostReason: e.lostReason,
     preferredCheckIn: e.preferredCheckIn,
+    occupancy: e.occupancy ?? null,
+    companionName: e.companionName ?? null,
+    stayDays: e.stayDays ?? null,
+    roomCount: e.roomCount ?? null,
+    pricePerDayINR: e.pricePerDayINR ?? null,
+    roomCategory: e.roomCategory ?? null,
+    unconfirmedMessages: 0,
+    openTasks: openTasksOf(db, e.id),
+    whatsappWindow: whatsappWindowOf(db, e.guestId),
   };
+}
+
+function openTasksOf(db: DemoData, enquiryId: string) {
+  const open = db.tasks
+    .filter((t) => t.enquiryId === enquiryId && t.status === "open")
+    .sort((a, b) => (a.dueAt ?? "9") < (b.dueAt ?? "9") ? -1 : 1);
+  return {
+    count: open.length,
+    items: open.slice(0, 3).map((t) => ({ id: t.id, title: t.title, dueAt: t.dueAt, kind: t.kind })),
+  };
+}
+
+/** Meta's 24h window: the guest wrote in on a cloud_api line within the day. */
+function whatsappWindowOf(db: DemoData, guestId: string) {
+  const cloud = new Set(db.whatsappNumbers.filter((n) => n.integration === "cloud_api").map((n) => n.id));
+  const last = db.messages
+    .filter((m) => m.guestId === guestId && m.channel === "whatsapp" && m.direction === "inbound" && cloud.has(m.mailboxId))
+    .reduce<string | null>((acc, m) => (!acc || m.createdAt > acc ? m.createdAt : acc), null);
+  if (!last) return null;
+  const expires = Date.parse(last) + 24 * 3_600_000;
+  if (expires <= Date.now()) return null;
+  const n = db.whatsappNumbers.find((x) => cloud.has(x.id));
+  return { expiresAt: new Date(expires).toISOString(), ourNumber: n?.phoneNumber ?? null };
 }
 
 /** Live (non-archived) leads. Every board/list/report query goes through this
@@ -128,6 +163,7 @@ function toMessageDTO(m: DemoMessage, all?: DemoMessage[]) {
     needsReview: m.needsReview,
     createdAt: m.createdAt,
     attachment: m.attachment ?? null,
+    attachmentNames: m.attachmentNames ?? (m.attachment ? [m.attachment.filename] : []),
     fromLabel: m.fromLabel,
     editedAt: m.editedAt,
     deletedAt: m.deletedAt,
@@ -384,6 +420,10 @@ on("PATCH", "/api/enquiries/:id", ({ params, body }) => {
       if (typeof input.phone === "string") g.phone = input.phone;
       if (typeof input.email === "string") g.email = input.email;
       if (typeof input.city === "string") g.city = input.city;
+      if ("gender" in input) g.gender = (input.gender as typeof g.gender) ?? null;
+    }
+    for (const k of ["occupancy", "companionName", "stayDays", "roomCount", "pricePerDayINR", "roomCategory"] as const) {
+      if (k in input) (e as unknown as Record<string, unknown>)[k] = input[k] ?? null;
     }
     if ("assignedToSub" in input) {
       e.assignedToSub = (input.assignedToSub as string) ?? null;
@@ -476,7 +516,11 @@ on("PATCH", "/api/enquiries/:id/tags", updateEnquiryTags);
 
 on("GET", "/api/enquiries/:id/tasks", ({ params }) => {
   const db = getDb();
-  return ok(db.tasks.filter((t) => t.enquiryId === params.id));
+  const items = db.tasks
+    .filter((t) => t.enquiryId === params.id && t.status === "open")
+    .sort((a, b) => ((a.dueAt ?? "9") < (b.dueAt ?? "9") ? -1 : 1))
+    .map((t) => ({ id: t.id, title: t.title, dueAt: t.dueAt, kind: t.kind, assignedToName: DEMO_USERS.find((u) => u.sub === t.assignedToSub)?.name ?? null }));
+  return ok({ items });
 });
 
 on("POST", "/api/enquiries/:id/tasks", ({ params, body }) => {
@@ -857,15 +901,53 @@ on("DELETE", "/api/messages/:id", ({ params }) => {
 
 on("GET", "/api/tasks", ({ query }) => {
   const db = getDb();
-  let list = db.tasks.slice();
-  const status = query.get("status");
-  const mine = query.get("assignee");
-  if (status) list = list.filter((t) => t.status === status);
-  if (mine === "me") {
-    const me = currentUser();
-    list = list.filter((t) => t.assignedToSub === me.sub);
-  }
-  return ok(list.sort((a, b) => ((a.dueAt ?? "") < (b.dueAt ?? "") ? -1 : 1)));
+  const me = currentUser();
+  const status = query.get("status") ?? "open";
+  const scope = query.get("scope") ?? "me";
+  const assignee = query.get("assignee");
+  const enquiryId = query.get("enquiryId");
+  const stage = query.get("stage");
+  const source = query.get("source");
+  const tags = (query.get("tags") ?? "").split(",").filter(Boolean);
+  const q = (query.get("q") ?? "").trim().toLowerCase();
+  const now = Date.now();
+  const rows = db.tasks.flatMap((t) => {
+    if (status !== "all" && t.status !== status) return [];
+    const e = db.enquiries.find((x) => x.id === t.enquiryId);
+    if (!e || e.deletedAt) return [];
+    const g = db.guests.find((x) => x.id === e.guestId);
+    if (enquiryId && t.enquiryId !== enquiryId) return [];
+    if (!enquiryId) {
+      if (scope === "me" || assignee === "me") {
+        if (t.assignedToSub !== me.sub && e.assignedToSub !== me.sub) return [];
+      } else if (assignee && t.assignedToSub !== assignee) return [];
+    }
+    if (stage && e.stage !== stage) return [];
+    if (source && e.source !== source) return [];
+    // OR, like the lead filter: any one selected tag is enough.
+    if (tags.length && !tags.some((x) => e.tags.includes(x))) return [];
+    if (q && !`${g?.fullName ?? ""} ${g?.phone ?? ""} ${t.title}`.toLowerCase().includes(q)) return [];
+    const last = db.notes.filter((n) => n.enquiryId === e.id).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+    return [{
+      id: t.id,
+      title: t.title,
+      status: t.status,
+      kind: t.kind,
+      approved: t.approved,
+      dueAt: t.dueAt,
+      overdue: t.status === "open" && !!t.dueAt && Date.parse(t.dueAt) < now,
+      enquiryId: t.enquiryId,
+      guestName: g?.fullName ?? t.guestName,
+      guestPhone: g?.phone ?? "",
+      stage: e.stage,
+      tags: e.tags,
+      mine: t.assignedToSub === me.sub,
+      assignedToName: DEMO_USERS.find((u) => u.sub === t.assignedToSub)?.name ?? null,
+      createdByName: t.createdBy && t.createdBy !== t.assignedToSub ? DEMO_USERS.find((u) => u.sub === t.createdBy)?.name ?? null : null,
+      lastRemark: last ? { body: last.body.slice(0, 200), authorName: last.authorName, createdAt: last.createdAt } : null,
+    }];
+  });
+  return ok(rows.sort((a, b) => ((a.dueAt ?? "9") < (b.dueAt ?? "9") ? -1 : 1)));
 });
 
 on("PATCH", "/api/tasks/:id", ({ params, body }) => {
@@ -1164,7 +1246,7 @@ on("POST", "/api/ai/pipeline", () => ok({ started: true, message: "Background AI
 // ---- Staff / users --------------------------------------------------------
 
 const CRM_ROLE_OF: Record<string, string> = {
-  ADMIN: "crm-admin", DOCTOR: "crm-doctor", MANAGER: "crm-manager",
+  ADMIN: "crm-admin", DOCTOR: "crm-doctor", DOCTORADMIN: "crm-doctoradmin", MANAGER: "crm-manager",
   RECEPTION: "crm-reception", SALES: "crm-sales", STAFF: "crm-staff", VIEWER: "crm-viewer",
 };
 
@@ -1192,6 +1274,8 @@ on("GET", "/api/admin/users", () =>
       role: CRM_ROLE_OF[u.role] ?? null,
       appRole: u.role,
       createdAt: "2026-01-01T00:00:00.000Z",
+      allowedWhatsAppNumbers: ensureExt(getDb(), DEMO_USERS).userLines[u.sub] ?? [],
+      lastActiveAt: u.role === "VIEWER" ? null : demoLastActiveAt(u.sub),
     })),
   ),
 );
@@ -1199,7 +1283,7 @@ on("GET", "/api/admin/call-routing", () => ok({ scope: "reception_sales" }));
 on("GET", "/api/admin/lead-deletion", () => ok({ autoDeleteDays: 30 }));
 on("GET", "/api/admin/lead-assignment", () =>
   ok(
-    (["whatsapp", "email", "call", "google_sheets"] as const).map((category) => ({
+    (["whatsapp", "email", "call", "google_sheets", "website_form", "instagram", "facebook"] as const).map((category) => ({
       category,
       strategy: "round_robin" as const,
       eligibleSubs: [] as string[],
@@ -1241,7 +1325,10 @@ on("DELETE", "/api/whatsapp/autoreplies/:id", ({ params }) => {
   return ok({ success: true });
 });
 
-on("GET", "/api/message-templates", () => ok(getDb().messageTemplates));
+on("GET", "/api/message-templates", ({ query }) => {
+  const all = getDb().messageTemplates.map((t) => ({ ...t, archivedAt: t.archivedAt ?? null }));
+  return ok(query.get("includeArchived") ? all : all.filter((t) => !t.archivedAt));
+});
 on("POST", "/api/message-templates", ({ body }) => {
   const input = body as Record<string, unknown>;
   const db = mutateDb((d) => {
@@ -1694,11 +1781,22 @@ const APP_ROLE_TO_CRM_ROLE = Object.fromEntries(
  * that guard rather than silently allowing it.
  */
 on("PATCH", "/api/admin/users/:id", ({ params, body }) => {
-  const crmRole = String((body as Record<string, unknown>)?.role ?? "") as CrmRole;
+  const b = (body ?? {}) as Record<string, unknown>;
+  if (Array.isArray(b.allowedWhatsAppNumbers)) {
+    const lines = b.allowedWhatsAppNumbers as string[];
+    mutateDb((d) => {
+      const x = ensureExt(d, DEMO_USERS);
+      if (lines.length) x.userLines[params.id] = lines;
+      else delete x.userLines[params.id];
+    });
+  }
+  if (!("role" in b)) return ok({ id: params.id });
+  const crmRole = String(b.role ?? "") as CrmRole;
   const appRole = CRM_ROLE_TO_APP_ROLE[crmRole];
   if (!appRole) throw new Error("Unknown role");
   const me = currentUser();
-  if (me.sub === params.id) {
+  const current = getDb().users.find((x) => x.sub === params.id)?.role;
+  if (me.sub === params.id && current !== appRole) {
     throw new Error("You can't change your own role — ask another administrator.");
   }
   mutateDb((d) => {
@@ -1976,8 +2074,31 @@ on("PATCH", "/api/guests/:id/block", ({ params, body }) => {
   return ok({ id: params.id, isBlocked: blocked });
 });
 
-on("GET", "/api/guests/:id/health", () => ok(null));
-on("DELETE", "/api/guests/:id/health", ({ params }) => ok({ id: params.id, cleared: true }));
+on("GET", "/api/guests/:id/health", ({ params }) => {
+  const records = ensureExt(getDb(), DEMO_USERS)
+    .healthRecords.filter((r) => r.guestId === params.id)
+    .map(({ id, subjectName, hasDuplicate, updatedAt, record }) => ({ id, subjectName, hasDuplicate, updatedAt, record, schemaMismatch: false }));
+  return ok({ records });
+});
+on("PUT", "/api/guests/:id/health", ({ params, query, body }) => {
+  const recordId = query.get("recordId") ?? newId("hr");
+  const updatedAt = nowIso();
+  mutateDb((d) => {
+    const x = ensureExt(d, DEMO_USERS);
+    const r = x.healthRecords.find((h) => h.id === recordId);
+    if (r) Object.assign(r, { record: body, updatedAt });
+    else x.healthRecords.push({ id: recordId, guestId: params.id, subjectName: null, hasDuplicate: false, updatedAt, record: body as never });
+  });
+  return ok({ saved: true, recordId, updatedAt });
+});
+on("DELETE", "/api/guests/:id/health", ({ params, query }) => {
+  const recordId = query.get("recordId");
+  mutateDb((d) => {
+    const x = ensureExt(d, DEMO_USERS);
+    x.healthRecords = x.healthRecords.filter((h) => h.guestId !== params.id || (recordId !== null && h.id !== recordId));
+  });
+  return ok({ id: params.id, cleared: true });
+});
 
 // ---- Bulk guest operations -------------------------------------------------
 
@@ -2207,6 +2328,7 @@ on("PATCH", "/api/message-templates/:id", ({ params, body }) => {
     if (typeof b.name === "string") t.name = b.name;
     if (typeof b.body === "string") t.body = b.body;
     if (typeof b.subject === "string" || b.subject === null) t.subject = b.subject as string | null;
+    if (typeof b.archived === "boolean") t.archivedAt = b.archived ? nowIso() : null;
     t.updatedAt = nowIso();
   });
   return ok(db.messageTemplates.find((x) => x.id === params.id) ?? null);
@@ -2245,6 +2367,12 @@ async function parseBody(init?: RequestInit): Promise<unknown> {
   }
   return undefined;
 }
+
+// Features merged from main after the first demo release (ext-routes.ts).
+registerExtRoutes({ on, ok, currentUser });
+
+// Features merged from main in October 2026 (ext-oct.ts).
+registerOctRoutes({ on, ok, currentUser });
 
 /**
  * Most-specific-first: a route is tried ahead of any route with more path

@@ -1,3 +1,5 @@
+import { TRANSCRIBE_MAX_AGE_DAYS } from "@/lib/voice-note";
+
 /**
  * AI provider configuration — everything comes from env so the stack can be
  * pointed at any OpenAI-compatible chat endpoint without a code change:
@@ -77,13 +79,23 @@ export function asrLanguages(): (string | undefined)[] {
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-export type AiFeature = "callAnalysis" | "leadScoring" | "guestInsights" | "assist";
+export type AiFeature =
+  | "callAnalysis"
+  | "voiceNotes"
+  | "leadScoring"
+  | "guestInsights"
+  | "assist"
+  | "askDb"
+  | "remarkDraft";
 
 const FEATURE_ENV: Record<AiFeature, string> = {
   callAnalysis: "AI_FEATURE_CALL_ANALYSIS",
+  voiceNotes: "AI_FEATURE_VOICE_NOTES",
   leadScoring: "AI_FEATURE_LEAD_SCORING",
   guestInsights: "AI_FEATURE_GUEST_INSIGHTS",
   assist: "AI_FEATURE_ASSIST",
+  askDb: "AI_FEATURE_ASK_DB",
+  remarkDraft: "AI_FEATURE_REMARK_DRAFT",
 };
 
 /**
@@ -92,6 +104,29 @@ const FEATURE_ENV: Record<AiFeature, string> = {
  */
 export function aiFeatureEnabled(feature: AiFeature): boolean {
   return aiEnabled() && process.env[FEATURE_ENV[feature]] !== "false";
+}
+
+/**
+ * Whether WhatsApp voice notes get transcribed on this deployment: the
+ * feature switch plus an actual ASR endpoint to send them to.
+ *
+ * Lives here, with the other env reads, rather than in
+ * voice-note-transcribe.ts — the activity log imports it, and that module is
+ * pulled into the client bundle, which must not reach storage/redis.
+ */
+/**
+ * How far back the voice-note sweep looks. The default keeps it a catch-up
+ * pass after an ASR outage rather than a backfill of the whole archive;
+ * raise it temporarily (VOICE_NOTE_MAX_AGE_DAYS) to transcribe older notes
+ * once, then put it back.
+ */
+export function voiceNoteMaxAgeDays(): number {
+  const raw = Number(process.env.VOICE_NOTE_MAX_AGE_DAYS);
+  return Number.isFinite(raw) && raw > 0 ? raw : TRANSCRIBE_MAX_AGE_DAYS;
+}
+
+export function voiceNoteTranscriptionEnabled(): boolean {
+  return aiFeatureEnabled("voiceNotes") && transcribeConfig() !== null;
 }
 
 export function aiPipelineEnabled(): boolean {

@@ -5,7 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { toEnquiryDTO, withCurrentAssigneeName } from "@/lib/enquiries";
 import { addCustomTag, removeCustomTag } from "@/lib/tags-service";
 import { tagMutationSchema } from "@/lib/validation";
-import { withRnrProgress, withLostRequestPending } from "@/lib/tasks";
+import { withRnrProgress, withLostRequestPending, withOpenTasks } from "@/lib/tasks";
 
 export const dynamic = "force-dynamic";
 
@@ -43,6 +43,6 @@ export async function PATCH(
       include: { guest: true },
     });
     if (!updated) throw new ApiError("NOT_FOUND", "Enquiry not found", 404);
-    return ok(await withLostRequestPending(await withRnrProgress(await withCurrentAssigneeName(toEnquiryDTO(updated)))));
+    return ok(await withOpenTasks(await withLostRequestPending(await withRnrProgress(await withCurrentAssigneeName(toEnquiryDTO(updated))))));
   });
 }

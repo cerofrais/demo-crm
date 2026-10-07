@@ -93,6 +93,13 @@ export const STAGES: StageDef[] = [
     badge: "bg-slate-100 text-slate-700",
   },
   {
+    id: "non_leads",
+    label: "Non-Leads",
+    description: "Never a lead — spam, vendors, wrong number, internal",
+    accent: "bg-zinc-400",
+    badge: "bg-zinc-100 text-zinc-700",
+  },
+  {
     id: "lost",
     label: "Lost / Dead",
     description: "No response after 6-2-1 or not interested",

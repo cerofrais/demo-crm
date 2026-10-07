@@ -111,7 +111,7 @@ export async function scoreEnquiry(enquiryId: string): Promise<void> {
 /** Batch step: score never-scored or stale (activity since last score) open leads. */
 export async function runLeadScoring(limit = 8): Promise<number> {
   const open = await prisma.enquiry.findMany({
-    where: { stage: { notIn: ["converted", "lost"] } },
+    where: { stage: { notIn: ["converted", "lost", "non_leads"] } },
     select: { id: true, aiScoredAt: true, lastActivityAt: true },
     take: 500,
   });

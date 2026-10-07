@@ -10,13 +10,14 @@ import { NextRequest } from "next/server";
 import { handle, ok, requireSession, ApiError } from "@/lib/api";
 import { can } from "@/lib/rbac";
 import { listDeletedLeads } from "@/lib/deleted-leads";
+import { parseTagMatch } from "@/lib/tag-match";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   return handle(async () => {
     const ctx = await requireSession();
-    if (!can(ctx.roles, "leads.delete")) {
+    if (!can(ctx.roles, "leads.delete") && !can(ctx.roles, "leads.viewDeleted")) {
       throw new ApiError("FORBIDDEN", "Admin only", 403);
     }
 
@@ -28,6 +29,7 @@ export async function GET(req: NextRequest) {
         to: sp.get("to") ?? undefined,
         source: sp.get("source") ?? undefined,
         tags: sp.get("tags")?.split(",").map((t) => t.trim()).filter(Boolean),
+        tagMatch: parseTagMatch(sp.get("tagMatch"), "any"),
       },
       25,
       sp.get("cursor") ?? undefined,

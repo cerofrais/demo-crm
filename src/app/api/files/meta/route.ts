@@ -1,13 +1,7 @@
 import { handle, ok, requireSession } from "@/lib/api";
-import {
-  readableDocCategories,
-  canUploadDocCategory,
-  type DocCategory,
-} from "@/lib/rbac";
+import { DOC_CATEGORIES, readableDocCategories, canUploadDocCategory } from "@/lib/rbac";
 
 export const dynamic = "force-dynamic";
-
-const ALL: DocCategory[] = ["medical", "consent", "operational", "marketing"];
 
 // GET /api/files/meta — which document categories the current user can read/upload
 export async function GET() {
@@ -15,7 +9,11 @@ export async function GET() {
     const ctx = await requireSession();
     return ok({
       readable: readableDocCategories(ctx.roles),
-      uploadable: ALL.filter((c) => canUploadDocCategory(ctx.roles, c)),
+      // DOC_CATEGORIES, not a local copy — this endpoint feeds the Resources
+      // upload picker, and its own hardcoded list silently omitted `private`
+      // while the filter beside it (readableDocCategories) offered it. The
+      // category could be filtered for but never chosen at upload.
+      uploadable: DOC_CATEGORIES.filter((c) => canUploadDocCategory(ctx.roles, c)),
     });
   });
 }

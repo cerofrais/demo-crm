@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { handle, ok, requireSession, ApiError } from "@/lib/api";
-import { can } from "@/lib/rbac";
+import { can, canReadAllGuestData } from "@/lib/rbac";
 import { prisma } from "@/lib/prisma";
 import { toMessageDTO } from "@/lib/messages";
 import {
@@ -42,7 +42,7 @@ export async function GET(
     // their own clinical thread (health.view); everyone else (view-only STAFF,
     // own-only RECEPTION) must own an enquiry for this guest or they could read
     // arbitrary guests' correspondence (IDOR).
-    if (!can(ctx.roles, "leads.manage") && !can(ctx.roles, "health.view")) {
+    if (!canReadAllGuestData(ctx.roles)) {
       const owns = await prisma.enquiry.findFirst({
         where: { guestId: guest.id, assignedToSub: ctx.sub },
         select: { id: true },

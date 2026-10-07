@@ -124,13 +124,13 @@ export function NewLeadDialog({
             <div className="flex items-start gap-3 rounded-lg border border-brand-200 bg-brand-50 p-4">
               <RefreshCw className="mt-0.5 h-5 w-5 text-brand-600" />
               <div className="text-sm text-brand-800">
-                <p className="font-semibold">Returning guest recognised</p>
+                <p className="font-semibold">Existing guest found</p>
                 <p className="mt-1">
                   This phone/email already exists ({returning.priorEnquiries} prior
                   enquiry/enquiries
                   {returning.lastStage ? `, last stage: ${returning.lastStage}` : ""}) — their
                   contact details were reused. A new lead ticket was still created for
-                  this enquiry, same as always for a returning guest.
+                  this enquiry, same as always for an existing guest.
                 </p>
               </div>
             </div>

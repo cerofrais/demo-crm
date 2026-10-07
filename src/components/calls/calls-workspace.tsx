@@ -1,11 +1,15 @@
 "use client";
 
 import { Fragment, useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import { Phone, PhoneIncoming, PhoneOutgoing, PhoneMissed, Filter, RefreshCw, FileText, ChevronDown, UserPlus } from "lucide-react";
 import { PageHeader } from "@/components/app/page-header";
 import { Card, Badge, Button, Input, Select, ScoreBadge } from "@/components/ui";
 import { RecordingPlayer } from "@/components/calls/recording-player";
 import { NewLeadDialog } from "@/components/leads/new-lead-dialog";
+import { TagFilterBar } from "@/components/leads/tag-filter-bar";
+import { sortTags } from "@/lib/lead-tags";
+import type { TagMatch } from "@/lib/tag-match";
 import { api } from "@/lib/client";
 import { cn, formatIST } from "@/lib/utils";
 import type { CallDTO } from "@/lib/calls";
@@ -27,11 +31,43 @@ function fmt(sec: number): string {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
+/** The table cell is narrow — the full sentence is the title attribute. */
+function shortTranscriptStatus(status: string): string {
+  if (status.startsWith("Not transcribed")) return "Not answered";
+  if (status.startsWith("No recording")) return "No recording";
+  if (status.startsWith("Transcribing")) return "Transcribing…";
+  return "No transcript";
+}
+
 const LANGUAGE_LABEL: Record<string, string> = {
   te: "Telugu",
   hi: "Hindi",
   mixed: "Mixed",
 };
+
+/**
+ * The guest's name on a call row, linking to the lead the call belongs to.
+ *
+ * Every call that matters leads to the same question — what is happening with
+ * this person — and the answer was two screens away: read the name here, go to
+ * Leads, search for it. The call already carries the enquiryId, so the name is
+ * simply the link. A call with no lead behind it (an unknown number) stays
+ * plain text, which is also the signal that it needs a lead created.
+ */
+function GuestLink({ call, className }: { call: CallDTO; className?: string }) {
+  const name = call.guestName ?? "—";
+  if (!call.enquiryId) return <p className={cn(className, "truncate")}>{name}</p>;
+  return (
+    <Link
+      href={`/leads?lead=${call.enquiryId}`}
+      onClick={(e) => e.stopPropagation()}
+      title="Open this lead"
+      className={cn(className, "block truncate text-brand-700 underline-offset-2 hover:underline")}
+    >
+      {name}
+    </Link>
+  );
+}
 
 export function CallsWorkspace({ canCreateLead }: { canCreateLead: boolean }) {
   const [tab, setTab] = useState<"all" | "unattended">("all");
@@ -44,6 +80,17 @@ export function CallsWorkspace({ canCreateLead }: { canCreateLead: boolean }) {
   const [dateTo, setDateTo] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [newLeadCall, setNewLeadCall] = useState<CallDTO | null>(null);
+  // Lead tags — a call carries the tags of the lead it was on.
+  const [availableTags, setAvailableTags] = useState<string[]>([]);
+  const [activeTags, setActiveTags] = useState<string[]>([]);
+  const [tagMatch, setTagMatch] = useState<TagMatch>("any");
+
+  useEffect(() => {
+    api
+      .get<string[]>("/api/calls/tags")
+      .then((t) => setAvailableTags(sortTags(t)))
+      .catch(() => {});
+  }, []);
 
   const load = useCallback(async (cursor?: string) => {
     setLoading(true);
@@ -53,6 +100,10 @@ export function CallsWorkspace({ canCreateLead }: { canCreateLead: boolean }) {
     } else {
       if (direction) params.set("direction", direction);
       if (status) params.set("status", status);
+      if (activeTags.length) {
+        params.set("tags", activeTags.join(","));
+        params.set("tagMatch", tagMatch);
+      }
     }
     if (dateFrom) params.set("from", dateFrom);
     if (dateTo) params.set("to", dateTo);
@@ -66,7 +117,7 @@ export function CallsWorkspace({ canCreateLead }: { canCreateLead: boolean }) {
     }
     setNextCursor(data.nextCursor);
     setLoading(false);
-  }, [tab, direction, status, dateFrom, dateTo]);
+  }, [tab, direction, status, dateFrom, dateTo, activeTags, tagMatch]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -154,6 +205,22 @@ export function CallsWorkspace({ canCreateLead }: { canCreateLead: boolean }) {
         </Button>
       </div>
 
+      {/* Missed calls from new callers have no lead yet, so no tags to filter by. */}
+      {tab === "all" && availableTags.length > 0 && (
+        <div className="mt-3">
+          <TagFilterBar
+            availableTags={availableTags}
+            activeTags={activeTags}
+            onToggle={(t) =>
+              setActiveTags((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]))
+            }
+            onClear={() => setActiveTags([])}
+            match={tagMatch}
+            onMatchChange={setTagMatch}
+          />
+        </div>
+      )}
+
       {/* Phone: card list */}
       <div className="space-y-2 p-4 md:hidden">
         {loading && !calls.length ? (
@@ -174,7 +241,7 @@ export function CallsWorkspace({ canCreateLead }: { canCreateLead: boolean }) {
                     ? <PhoneIncoming className="mt-0.5 h-4 w-4 shrink-0 text-brand-500" />
                     : <PhoneOutgoing className="mt-0.5 h-4 w-4 shrink-0 text-earth-400" />}
                   <div className="min-w-0">
-                    <p className="truncate font-medium">{c.guestName ?? "—"}</p>
+                    <GuestLink call={c} className="truncate font-medium" />
                     <p className="truncate text-xs text-muted-foreground">{c.customerPhone}</p>
                   </div>
                 </div>
@@ -205,8 +272,11 @@ export function CallsWorkspace({ canCreateLead }: { canCreateLead: boolean }) {
               )}
               {c.hasRecording && (
                 <div className="mt-2">
-                  <RecordingPlayer callId={c.id} durationSec={c.recordingDurSec} />
+                  <RecordingPlayer callId={c.id} durationSec={c.recordingDurSec} label={c.guestName ?? c.customerPhone} />
                 </div>
+              )}
+              {!c.transcript && !c.transcriptEnglish && c.transcriptStatus && (
+                <p className="text-xs italic text-muted-foreground">{c.transcriptStatus}</p>
               )}
               {(c.transcript || c.transcriptEnglish) && (
                 <div className="mt-2">
@@ -281,7 +351,7 @@ export function CallsWorkspace({ canCreateLead }: { canCreateLead: boolean }) {
                             : <PhoneOutgoing className="h-4 w-4 text-earth-400" />}
                         </td>
                         <td className="px-3 py-2.5">
-                          <p className="font-medium">{c.guestName ?? "—"}</p>
+                          <GuestLink call={c} className="font-medium" />
                           <p className="text-xs text-muted-foreground">{c.customerPhone}</p>
                         </td>
                         <td className="px-3 py-2.5 text-xs text-muted-foreground">{c.repName ?? "—"}</td>
@@ -295,12 +365,19 @@ export function CallsWorkspace({ canCreateLead }: { canCreateLead: boolean }) {
                           {c.aiScore !== null ? (
                             <ScoreBadge score={c.aiScore} />
                           ) : (
-                            <span className="text-xs text-muted-foreground">—</span>
+                            // Not a blank cell: say why there is no transcript
+                            // (most often the call was never answered).
+                            <span
+                              className="text-xs text-muted-foreground"
+                              title={c.transcriptStatus ?? undefined}
+                            >
+                              {c.transcriptStatus ? shortTranscriptStatus(c.transcriptStatus) : "—"}
+                            </span>
                           )}
                         </td>
                         <td className="px-3 py-2.5">
                           {c.hasRecording
-                            ? <RecordingPlayer callId={c.id} durationSec={c.recordingDurSec} />
+                            ? <RecordingPlayer callId={c.id} durationSec={c.recordingDurSec} label={c.guestName ?? c.customerPhone} />
                             : <span className="text-xs text-muted-foreground">—</span>}
                         </td>
                         <td className="px-3 py-2.5">

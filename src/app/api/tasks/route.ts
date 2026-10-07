@@ -1,11 +1,19 @@
 import { NextRequest } from "next/server";
 import { handle, ok, requireSession } from "@/lib/api";
 import { can } from "@/lib/rbac";
+import { parseTagMatch, tagListFilter } from "@/lib/tag-match";
 import { prisma } from "@/lib/prisma";
 import { getStaffNamesBatch } from "@/lib/enquiries";
+import { mergeLeadTags } from "@/lib/lead-tags";
+import { logger } from "@/lib/logger";
 import type { Prisma, TaskStatus } from "@prisma/client";
 
 export const dynamic = "force-dynamic";
+
+// Was an undocumented take: 200 while production already had 584 open tasks —
+// an "All staff" view silently dropped the rest, and any filter applied to it
+// searched a truncated set. Same reasoning (and warning) as the board's cap.
+const TASK_CAP = 2000;
 
 // GET /api/tasks?scope=me|all&status=open|all — follow-ups / reminders
 export async function GET(req: NextRequest) {
@@ -60,9 +68,19 @@ export async function GET(req: NextRequest) {
     const stage = sp.get("stage");
     const source = sp.get("source");
     const q = sp.get("q")?.trim();
+    // Any (default, matching the leads board) or All — see lib/tag-match.ts.
+    const tags = sp.get("tags")?.split(",").map((t) => t.trim()).filter(Boolean);
+    const tagMatch = parseTagMatch(sp.get("tagMatch"), "any");
+    // One lead's tasks — the task chip on a lead card links straight here.
+    // Still AND-ed with the visibility clause, so it can only ever narrow
+    // what this person was already allowed to see.
+    const enquiryId = sp.get("enquiryId");
     const leadWhere: Prisma.EnquiryWhereInput = {};
+    if (enquiryId) leadWhere.id = enquiryId;
     if (stage) leadWhere.stage = stage as Prisma.EnquiryWhereInput["stage"];
     if (source) leadWhere.source = source as Prisma.EnquiryWhereInput["source"];
+    const tagFilter = tagListFilter(tags ?? [], tagMatch);
+    if (tagFilter) leadWhere.tags = tagFilter;
     if (q && q.length >= 2) {
       // Same shape and 2-char floor as the leads board's search — an
       // unindexed ILIKE '%a%' over every guest is not worth serving.
@@ -78,11 +96,21 @@ export async function GET(req: NextRequest) {
     const tasks = await prisma.task.findMany({
       where,
       orderBy: [{ status: "asc" }, { dueAt: "asc" }],
-      take: 200,
+      take: TASK_CAP,
       include: {
         enquiry: {
           include: {
-            guest: { select: { fullName: true, phone: true } },
+            // dateOfBirth/isReturning are here for mergeLeadTags, which
+            // derives the age and revisit tags from the guest.
+            guest: {
+              select: {
+                fullName: true,
+                phone: true,
+                dateOfBirth: true,
+                isReturning: true,
+                tags: true,
+              },
+            },
             // The most recent remark on the lead — what a rep needs to know
             // before making the call, without opening the lead to find it.
             // take:1 per row, so this stays cheap on a 200-row page.
@@ -105,6 +133,10 @@ export async function GET(req: NextRequest) {
       ...tasks.map((t) => t.createdBy),
     ]);
 
+    if (tasks.length === TASK_CAP) {
+      logger.warn({ cap: TASK_CAP, sub: ctx.sub }, "tasks list hit its row cap — some tasks were not returned");
+    }
+
     const now = Date.now();
     return ok(
       tasks.map((t) => ({
@@ -119,6 +151,9 @@ export async function GET(req: NextRequest) {
         guestName: t.enquiry.guest.fullName,
         guestPhone: t.enquiry.guest.phone,
         stage: t.enquiry.stage,
+        // Merged, not the raw column — same as every other surface that shows
+        // a lead's tags, so a card can't display a tag the filter wouldn't match.
+        tags: mergeLeadTags(t.enquiry.tags, t.enquiry.guest, t.enquiry),
         mine: t.assignedToSub === ctx.sub,
         assignedToName: t.assignedToSub ? (names.get(t.assignedToSub) ?? null) : null,
         // Only surfaced when someone else asked for it — a task you created

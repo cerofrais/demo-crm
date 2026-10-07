@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { canSendEmail } from "./mailboxes";
 import {
   ALL_ROLES,
+  canReadAllGuestData,
+  canUseWhatsAppIntegration,
+  DOC_CATEGORIES,
   NAV,
   ROUTE_GUARDS,
   can,
@@ -10,11 +13,13 @@ import {
   canMutateLeads,
   canReadDocCategory,
   canUploadDocCategory,
+  readableDocCategories,
   canWorkLeadStage,
   isAdmin,
   mapRoles,
   navFor,
   primaryRole,
+  canViewLeadStage,
 } from "./rbac";
 
 describe("mapRoles", () => {
@@ -76,6 +81,98 @@ describe("document category access (F24/DPDP-sensitive)", () => {
 
   it("plain STAFF cannot upload operational documents (read-only)", () => {
     expect(canUploadDocCategory(["STAFF"], "operational")).toBe(false);
+  });
+
+  it("only Admin, Manager and Doctor may send from the Cloud API number", () => {
+    // It is the one number that has never been banned, it carries the WABA's
+    // quality rating, and every outbound-first message depends on it. The
+    // Baileys numbers have been removed three times; this one must not be
+    // reachable by everyone who can type a message.
+    for (const r of ["ADMIN", "MANAGER", "DOCTOR"] as const) {
+      expect(canUseWhatsAppIntegration([r], "cloud_api")).toBe(true);
+    }
+    for (const r of ["RECEPTION", "SALES", "STAFF", "VIEWER"] as const) {
+      expect(canUseWhatsAppIntegration([r], "cloud_api")).toBe(false);
+    }
+  });
+
+  it("leaves Baileys numbers open to anyone who can message", () => {
+    // Deliberately unrestricted: losing a Baileys number is recoverable by
+    // re-pairing, losing the Cloud API number is not.
+    for (const r of ["RECEPTION", "SALES"] as const) {
+      expect(canUseWhatsAppIntegration([r], "baileys")).toBe(true);
+      expect(canUseWhatsAppIntegration([r], null)).toBe(true);
+    }
+  });
+
+  it("every category an admin can upload is also one they can filter by", () => {
+    // The Resources toolbar builds its FILTER from readableDocCategories and
+    // its UPLOAD picker from canUploadDocCategory over the same list. When
+    // those came from two hardcoded arrays they drifted: `private` was
+    // filterable but not uploadable, so the category could be searched for
+    // and never chosen — the file went in as whatever was selected instead.
+    for (const c of DOC_CATEGORIES) {
+      if (canUploadDocCategory(["ADMIN"], c)) {
+        expect(readableDocCategories(["ADMIN"])).toContain(c);
+      }
+    }
+  });
+
+  it("an admin can upload into every category, private included", () => {
+    for (const c of DOC_CATEGORIES) {
+      expect(canUploadDocCategory(["ADMIN"], c)).toBe(true);
+    }
+  });
+
+  it("private resources need documents.private — operational access is not enough", () => {
+    // The whole point of the category: Reception and Sales work Resources
+    // every day and must not see the restricted shelf inside it.
+    expect(canReadDocCategory(["RECEPTION"], "private")).toBe(false);
+    expect(canReadDocCategory(["SALES"], "private")).toBe(false);
+    expect(canReadDocCategory(["STAFF"], "private")).toBe(false);
+    expect(canReadDocCategory(["ADMIN"], "private")).toBe(true);
+    expect(canReadDocCategory(["DOCTOR"], "private")).toBe(true);
+    expect(canReadDocCategory(["MANAGER"], "private")).toBe(true);
+  });
+
+  it("private and medical are separate grants, not one", () => {
+    // Manager is the case that proves it: they hold documents.private and
+    // must still be refused medical documents. Internal rate cards and
+    // guests' health records are different sensitivities, and neither grant
+    // may ever imply the other.
+    expect(can(["MANAGER"], "documents.private")).toBe(true);
+    expect(can(["MANAGER"], "documents.medical")).toBe(false);
+    expect(canReadDocCategory(["MANAGER"], "medical")).toBe(false);
+    expect(canReadDocCategory(["MANAGER"], "consent")).toBe(false);
+    // And the reverse: holding medical does not by itself grant private.
+    expect(can(["DOCTOR"], "documents.private")).toBe(true);
+  });
+
+  it("only holders of documents.private may upload into it", () => {
+    expect(canUploadDocCategory(["ADMIN"], "private")).toBe(true);
+    expect(canUploadDocCategory(["DOCTOR"], "private")).toBe(true);
+    expect(canUploadDocCategory(["MANAGER"], "private")).toBe(true);
+    expect(canUploadDocCategory(["SALES"], "private")).toBe(false);
+    expect(canUploadDocCategory(["RECEPTION"], "private")).toBe(false);
+  });
+
+  it("private never appears in a non-holder's readable categories", () => {
+    // readableDocCategories drives BOTH the Resources list and
+    // findAttachableDocument, so this one assertion covers listing and
+    // attach-by-id together.
+    expect(readableDocCategories(["SALES"])).not.toContain("private");
+    expect(readableDocCategories(["RECEPTION"])).not.toContain("private");
+    expect(readableDocCategories(["STAFF"])).not.toContain("private");
+    // VIEWER is the exception: "read-only across the whole app" now includes
+    // the internal shelf. Reading it is the entire grant — uploading into it
+    // is refused for every read-only role, checked just below.
+    expect(readableDocCategories(["VIEWER"])).toContain("private");
+    expect(canUploadDocCategory(["VIEWER"], "private")).toBe(false);
+    expect(readableDocCategories(["ADMIN"])).toContain("private");
+    expect(readableDocCategories(["DOCTOR"])).toContain("private");
+    expect(readableDocCategories(["MANAGER"])).toContain("private");
+    // Manager gains the private shelf without gaining the medical one.
+    expect(readableDocCategories(["MANAGER"])).not.toContain("medical");
   });
 
   it("marketing uploads are restricted to ADMIN/MANAGER regardless of documents.medical", () => {
@@ -180,11 +277,34 @@ describe("VIEWER role (crm-viewer) — read-only across the app", () => {
     for (const p of writePerms) expect(can(["VIEWER"], p)).toBe(false);
   });
 
-  it("cannot see Health Records or medical documents", () => {
-    expect(can(["VIEWER"], "health.view")).toBe(false);
-    expect(can(["VIEWER"], "documents.medical")).toBe(false);
-    expect(canReadDocCategory(["VIEWER"], "medical")).toBe(false);
-    expect(canReadDocCategory(["VIEWER"], "consent")).toBe(false);
+  // Reversed deliberately: Viewer is now "read-only across the WHOLE app",
+  // health records included. Safe only because reading and writing a record
+  // are separate permissions — the pairing below is the guarantee, so if
+  // health.edit ever leaks into this role these assertions fail.
+  it("reads health records and medical documents but can never change them", () => {
+    expect(can(["VIEWER"], "health.view")).toBe(true);
+    expect(can(["VIEWER"], "documents.medical")).toBe(true);
+    expect(canReadDocCategory(["VIEWER"], "medical")).toBe(true);
+    expect(canReadDocCategory(["VIEWER"], "consent")).toBe(true);
+
+    expect(can(["VIEWER"], "health.edit")).toBe(false);
+    expect(canUploadDocCategory(["VIEWER"], "medical")).toBe(false);
+    expect(canUploadDocCategory(["VIEWER"], "consent")).toBe(false);
+    expect(canUploadDocCategory(["VIEWER"], "private")).toBe(false);
+  });
+
+  // The bug this role was reported for: it could open the board and the
+  // Activity Log but every mailbox thread answered "you can only view
+  // conversations for your own guests" — a read-only role owns no leads, and
+  // the org-wide grant was spelled as the WRITE permission leads.manage.
+  it("may read any guest's conversation, not just its own", () => {
+    expect(canReadAllGuestData(["VIEWER"])).toBe(true);
+    expect(canReadAllGuestData(["ADMIN"])).toBe(true);
+    expect(canReadAllGuestData(["DOCTOR"])).toBe(true);
+    // Own-only roles stay scoped to the guests they are assigned.
+    expect(canReadAllGuestData(["SALES"])).toBe(false);
+    expect(canReadAllGuestData(["RECEPTION"])).toBe(false);
+    expect(canReadAllGuestData(["STAFF"])).toBe(false);
   });
 
   it("can read operational documents but not upload them, same as STAFF", () => {
@@ -216,24 +336,26 @@ describe("canMutateLeads", () => {
   });
 });
 
-describe("Deleted Leads archive is admin-only", () => {
+describe("Deleted Leads archive — Admin purges, Viewer only reads", () => {
   // The archive exposes a deleted lead's full message, call-recording and
-  // document history, so it is deliberately narrower than the Activity Log
-  // (reports.allStaff, which MANAGER also holds).
-  const ROLES = ["MANAGER", "RECEPTION", "SALES", "DOCTOR", "VIEWER"] as const;
+  // document history, so it stays narrower than the Activity Log: only ADMIN
+  // (purge) and the read-only VIEWER (read) reach it.
+  const BLOCKED = ["MANAGER", "RECEPTION", "SALES", "DOCTOR"] as const;
 
-  it("grants the underlying permission to ADMIN only", () => {
+  it("keeps the destructive permission on ADMIN alone", () => {
     expect(can(["ADMIN"], "leads.delete")).toBe(true);
-    for (const role of ROLES) {
+    expect(can(["VIEWER"], "leads.delete")).toBe(false);
+    for (const role of BLOCKED) {
       expect(can([role], "leads.delete")).toBe(false);
     }
   });
 
-  it("shows the sidebar item to ADMIN only", () => {
+  it("shows the sidebar item to ADMIN and VIEWER only", () => {
     const item = NAV.find((n) => n.href === "/deleted");
     expect(item).toBeDefined();
     expect(navFor(["ADMIN"]).some((n) => n.href === "/deleted")).toBe(true);
-    for (const role of ROLES) {
+    expect(navFor(["VIEWER"]).some((n) => n.href === "/deleted")).toBe(true);
+    for (const role of BLOCKED) {
       expect(navFor([role]).some((n) => n.href === "/deleted")).toBe(false);
     }
   });
@@ -242,7 +364,7 @@ describe("Deleted Leads archive is admin-only", () => {
     // Hiding the nav link alone would leave /deleted reachable by typing it.
     const guard = ROUTE_GUARDS.find((g) => g.prefix === "/deleted");
     expect(guard).toBeDefined();
-    expect(guard!.perm).toBe("leads.delete");
+    expect(guard!.perm).toEqual(["leads.delete", "leads.viewDeleted"]);
   });
 });
 
@@ -316,6 +438,133 @@ describe("messaging.broadcast is separate from messaging.send", () => {
   it("broadcast always implies send — no role can mass-mail without 1:1", () => {
     for (const role of ALL_ROLES) {
       if (can([role], "messaging.broadcast")) expect(can([role], "messaging.send")).toBe(true);
+    }
+  });
+});
+
+describe("DOCTORADMIN", () => {
+  it("maps from its own Keycloak realm role", () => {
+    expect(mapRoles(["crm-doctoradmin"])).toEqual(["DOCTORADMIN"]);
+  });
+
+  it("keeps every capability a Doctor has", () => {
+    // The role is "Doctor, who can see the rest of the board" — losing a
+    // doctor power here would be a silent downgrade for whoever holds it.
+    for (const perm of [
+      "health.view",
+      "documents.medical",
+      "documents.private",
+      "leads.view",
+      "guests.view",
+      "leads.doctorDecision",
+      "messaging.send",
+      "messaging.broadcast",
+      "messaging.cloudApi",
+    ] as const) {
+      expect(can(["DOCTORADMIN"], perm)).toBe(true);
+    }
+  });
+
+  it("can SEE every column on the board", () => {
+    for (const stage of [
+      "new_lead", "contacted", "rnr", "qualified", "pricing_shared",
+      "doctor_consultation", "payment_received", "booking_confirmed",
+      "converted", "lost",
+    ]) {
+      expect(canViewLeadStage(["DOCTORADMIN"], stage)).toBe(true);
+    }
+  });
+
+  it("can only WORK its own column", () => {
+    // The whole point of the role: reading a Converted lead must not imply
+    // being able to change one.
+    expect(canWorkLeadStage(["DOCTORADMIN"], "doctor_consultation")).toBe(true);
+    for (const stage of [
+      "new_lead", "contacted", "rnr", "qualified", "pricing_shared",
+      "payment_received", "booking_confirmed", "converted", "lost",
+    ]) {
+      expect(canWorkLeadStage(["DOCTORADMIN"], stage)).toBe(false);
+    }
+  });
+
+  it("never sees the admin-only Staff lane", () => {
+    expect(canViewLeadStage(["DOCTORADMIN"], "staff")).toBe(false);
+    expect(canWorkLeadStage(["DOCTORADMIN"], "staff")).toBe(false);
+  });
+
+  it("does not gain pipeline or admin powers", () => {
+    expect(can(["DOCTORADMIN"], "leads.manage")).toBe(false);
+    expect(can(["DOCTORADMIN"], "leads.delete")).toBe(false);
+    expect(can(["DOCTORADMIN"], "users.manage")).toBe(false);
+  });
+
+  it("still counts as a role that works leads", () => {
+    // canMutateLeads gates the edit affordances; without this the doctor
+    // decision buttons would render read-only in its own column.
+    expect(canMutateLeads(["DOCTORADMIN"])).toBe(true);
+  });
+
+  it("leaves the plain Doctor role unchanged — still one column, view and work", () => {
+    expect(canViewLeadStage(["DOCTOR"], "payment_received")).toBe(false);
+    expect(canViewLeadStage(["DOCTOR"], "doctor_consultation")).toBe(true);
+    expect(canWorkLeadStage(["DOCTOR"], "payment_received")).toBe(false);
+  });
+
+  it("does not widen view access for anyone else", () => {
+    // viewAllStages is the only thing lifting the restriction, and only
+    // DOCTORADMIN holds it.
+    expect(canViewLeadStage(["SALES"], "booking_confirmed")).toBe(false);
+    expect(canViewLeadStage(["DOCTOR"], "new_lead")).toBe(false);
+    expect(canViewLeadStage(["MANAGER"], "staff")).toBe(false);
+  });
+});
+
+describe("Broadcast Status is Admin/Manager only (plus read-only Viewer)", () => {
+  // Front Office is the role this was reported for: it holds messaging.send
+  // AND messaging.broadcast, so it cleared the sidebar, the middleware guard,
+  // the page body and the API all four. Sales and the Doctor roles came in
+  // the same way.
+  const ALLOWED = ["ADMIN", "MANAGER", "VIEWER"] as const;
+  const BLOCKED = ["RECEPTION", "SALES", "DOCTOR", "DOCTORADMIN", "STAFF"] as const;
+
+  it("grants the permission to Admin, Manager and Viewer only", () => {
+    for (const role of ALLOWED) expect(can([role], "messaging.viewStatus")).toBe(true);
+    for (const role of BLOCKED) expect(can([role], "messaging.viewStatus")).toBe(false);
+  });
+
+  it("hides the sidebar item from Front Office and every other sending role", () => {
+    const item = NAV.find((n) => n.href === "/broadcast-status");
+    expect(item).toBeDefined();
+    expect(item!.perm).toBe("messaging.viewStatus");
+    for (const role of ALLOWED) {
+      expect(navFor([role]).some((n) => n.href === "/broadcast-status")).toBe(true);
+    }
+    for (const role of BLOCKED) {
+      expect(navFor([role]).some((n) => n.href === "/broadcast-status")).toBe(false);
+    }
+  });
+
+  it("guards the route in middleware, not just the sidebar", () => {
+    // Hiding the nav link alone would leave /broadcast-status reachable by
+    // typing the URL.
+    const guard = ROUTE_GUARDS.find((g) => g.prefix === "/broadcast-status");
+    expect(guard).toBeDefined();
+    expect(guard!.perm).toBe("messaging.viewStatus");
+  });
+
+  it("does not ride on messaging.send or messaging.broadcast", () => {
+    // The two gates that used to let Front Office through. Both must stay
+    // decoupled from seeing the page, or this regresses silently.
+    expect(can(["RECEPTION"], "messaging.send")).toBe(true);
+    expect(can(["RECEPTION"], "messaging.broadcast")).toBe(true);
+    expect(can(["RECEPTION"], "messaging.viewStatus")).toBe(false);
+  });
+
+  it("leaves Front Office able to SEND a broadcast — only the status page moved", () => {
+    // Scope check: the report was about visibility of the status tab, not
+    // about taking mass-send away from the front desk.
+    for (const role of ["RECEPTION", "SALES", "DOCTOR", "DOCTORADMIN"] as const) {
+      expect(can([role], "messaging.broadcast")).toBe(true);
     }
   });
 });

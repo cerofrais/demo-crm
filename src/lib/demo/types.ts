@@ -5,7 +5,7 @@
  * underneath — everything lives in one JSON blob in localStorage.
  */
 
-export type AppRole = "ADMIN" | "DOCTOR" | "MANAGER" | "RECEPTION" | "SALES" | "STAFF" | "VIEWER";
+export type AppRole = "ADMIN" | "DOCTOR" | "DOCTORADMIN" | "MANAGER" | "RECEPTION" | "SALES" | "STAFF" | "VIEWER";
 
 export type EnquiryStage =
   | "new_lead"
@@ -18,6 +18,7 @@ export type EnquiryStage =
   | "booking_confirmed"
   | "converted"
   | "staff"
+  | "non_leads"
   | "lost";
 
 export interface DemoUser {
@@ -83,6 +84,14 @@ export interface DemoEnquiry {
   /** Free-text check-in preference captured on the lead form (EnquiryDTO
    *  .preferredCheckIn) — e.g. "Second week of November". */
   preferredCheckIn: string | null;
+  /** Booking details a rep fills in on the drawer (EnquiryDTO) — optional,
+   *  most leads have none. */
+  occupancy?: "single" | "double" | null;
+  companionName?: string | null;
+  stayDays?: number | null;
+  roomCount?: number | null;
+  pricePerDayINR?: number | null;
+  roomCategory?: "premium" | "executive" | null;
   /** Soft delete. A non-null value moves the lead into the Deleted archive
    *  and out of every live board/list query. */
   deletedAt: string | null;
@@ -136,6 +145,8 @@ export interface DemoMessage {
   attachment?: { id: string; filename: string; mimeType: string } | null;
   /** The message this one replies to, quoted in the thread (MessageDTO.replyTo). */
   replyToId?: string | null;
+  /** Every attachment an email carried, by filename (MessageDTO.attachmentNames). */
+  attachmentNames?: string[];
 }
 
 export interface DemoTask {
@@ -145,7 +156,7 @@ export interface DemoTask {
   title: string;
   dueAt: string | null;
   status: "open" | "done" | "cancelled";
-  kind: "follow_up" | "doctor_review" | "deletion_approval";
+  kind: "follow_up" | "doctor_review" | "deletion_approval" | "payment_pending";
   approved: boolean | null;
   assignedToSub: string | null;
   createdBy: string;
@@ -259,8 +270,12 @@ export interface DemoMessageTemplate {
   subject: string | null;
   body: string;
   createdBy: string | null;
+  /** Archived templates stay in the list behind "Show archived". */
+  archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
+  /** The folder this template is filed in (template-folders.ts). */
+  folderId?: string | null;
 }
 
 export interface DemoBroadcastJob {
@@ -335,4 +350,9 @@ export interface DemoData {
   documents: DemoDocument[];
   campaignRules: DemoCampaignRule[];
   marketingReports: DemoMarketingReport[];
+  /** State for the features merged in September 2026 (email auto-replies and
+   *  auto-tags, routing rules, staff shifts, health records per form, the
+   *  weekly client report, lead-sheet checks). Created by ext-seed.ts; an
+   *  older payload without it is upgraded lazily by ensureExt(). */
+  ext?: import("./ext-seed").DemoExt;
 }

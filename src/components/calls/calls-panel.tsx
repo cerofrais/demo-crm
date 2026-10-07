@@ -171,6 +171,9 @@ export function AiCallInsights({ call, onUpdated }: { call: CallDTO; onUpdated: 
               )}
             </div>
           )}
+          {!call.transcript && !call.transcriptEnglish && call.transcriptStatus && (
+            <p className="text-[11px] italic text-muted-foreground">{call.transcriptStatus}</p>
+          )}
           {call.transcriptEnglish && (
             <div>
               <button
@@ -268,7 +271,7 @@ export function CallsPanel({ guestId, enquiryId }: Props) {
           </div>
 
           {c.hasRecording && (
-            <RecordingPlayer callId={c.id} durationSec={c.recordingDurSec} />
+            <RecordingPlayer callId={c.id} durationSec={c.recordingDurSec} label={c.guestName ?? c.customerPhone} />
           )}
 
           <AiCallInsights

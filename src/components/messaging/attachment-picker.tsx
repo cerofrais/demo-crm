@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Paperclip, Loader2, Upload, Search, FileText, Users } from "lucide-react";
 import { Button, Input } from "@/components/ui";
 import { api } from "@/lib/client";
@@ -32,6 +33,14 @@ function humanSize(bytes: number): string {
 
 /** Five rows plus a sliver of the sixth, so it reads as scrollable. */
 const LIST_MAX_HEIGHT = "15.5rem";
+/** Wide enough for a long library filename beside its size column. */
+const WIDTH_PX = 340;
+/** Never let the panel touch a screen edge. */
+const GUTTER = 8;
+/** Below this there isn't room for the search box plus a usable list. */
+const MIN_SPACE = 220;
+/** Whole panel: search box, list, and the upload row beneath it. */
+const PANEL_MAX_PX = 420;
 
 /**
  * Paperclip button + popover for picking a message attachment.
@@ -71,15 +80,74 @@ export function AttachmentPicker({
   const [q, setQ] = useState("");
   const [checking, setChecking] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const [pos, setPos] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
+
+  /**
+   * The popover is rendered in a PORTAL, positioned against the trigger's
+   * viewport rect.
+   *
+   * It used to be an absolutely-positioned child, which meant any ancestor
+   * with `overflow` clipped it — and every place this is used sits inside
+   * one: a dialog's scroll box, a chat pane, a table cell. The symptom was
+   * a popover with its left edge (and the start of every filename) shaved
+   * off, or its list cut in half at the dialog's bottom border. No amount of
+   * widening the dialog or flipping the anchor side fixes that; escaping the
+   * clipping context does.
+   */
+  useEffect(() => {
+    if (!open) return;
+    function place() {
+      const trigger = rootRef.current?.getBoundingClientRect();
+      if (!trigger) return;
+      const width = Math.min(WIDTH_PX, window.innerWidth - GUTTER * 2);
+      const wantLeft = align === "right" ? trigger.right - width : trigger.left;
+      // Clamped so it can never hang off either edge of the screen — which is
+      // what a phone-width viewport would otherwise do.
+      const left = Math.min(Math.max(GUTTER, wantLeft), window.innerWidth - width - GUTTER);
+
+      const below = window.innerHeight - trigger.bottom - GUTTER;
+      const above = trigger.top - GUTTER;
+      // Flip up only when below genuinely can't hold it AND above is roomier,
+      // so the list isn't squeezed into a sliver for no reason.
+      const flipUp = openUpward || (below < MIN_SPACE && above > below);
+      const maxHeight = Math.max(MIN_SPACE, flipUp ? above : below);
+      setPos({
+        top: flipUp ? Math.max(GUTTER, trigger.top - Math.min(maxHeight, PANEL_MAX_PX) - 6) : trigger.bottom + 6,
+        left,
+        maxHeight: Math.min(maxHeight, PANEL_MAX_PX),
+      });
+    }
+    place();
+    // `true` captures scrolls inside any container, not just the window —
+    // the trigger usually lives in one.
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [open, align, openUpward]);
 
   useEffect(() => {
     if (!open) return;
     function onClickOutside(e: MouseEvent) {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      // The popover is no longer a DOM child of the trigger, so it has to be
+      // checked separately or clicking inside it would close it.
+      if (rootRef.current?.contains(t) || popoverRef.current?.contains(t)) return;
+      setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
     }
     document.addEventListener("mousedown", onClickOutside);
-    return () => document.removeEventListener("mousedown", onClickOutside);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onClickOutside);
+      document.removeEventListener("keydown", onKey);
+    };
   }, [open]);
 
   const load = useCallback(() => {
@@ -163,13 +231,17 @@ export function AttachmentPicker({
         {checking ? <Loader2 className="h-4 w-4 animate-spin" /> : <Paperclip className="h-4 w-4" />}
       </Button>
 
-      {open && (
+      {open && pos && createPortal(
         <div
-          className={cn(
-            "absolute z-20 w-72 rounded-md border border-border bg-popover shadow-lg",
-            align === "left" ? "left-0" : "right-0",
-            openUpward ? "bottom-full mb-1" : "top-full mt-1",
-          )}
+          ref={popoverRef}
+          style={{
+            top: pos.top,
+            left: pos.left,
+            width: Math.min(WIDTH_PX, typeof window === "undefined" ? WIDTH_PX : window.innerWidth - GUTTER * 2),
+            maxHeight: pos.maxHeight,
+          }}
+          // z-index clears the dialog overlay this often opens on top of.
+          className="fixed z-[100] flex flex-col overflow-hidden rounded-md border border-border bg-popover shadow-lg"
         >
           <div className="border-b border-border p-2">
             <div className="relative">
@@ -183,7 +255,7 @@ export function AttachmentPicker({
             </div>
           </div>
 
-          <div className="overflow-y-auto" style={{ maxHeight: LIST_MAX_HEIGHT }}>
+          <div className="min-h-0 flex-1 overflow-y-auto" style={{ maxHeight: LIST_MAX_HEIGHT }}>
             {loading && (
               <div className="flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" /> Loading…
@@ -217,7 +289,12 @@ export function AttachmentPicker({
                   ) : (
                     <FileText className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                   )}
-                  <span className="min-w-0 flex-1 truncate text-sm text-foreground">{d.filename}</span>
+                  {/* Long library names ("Rakshabandhan Voucher …") clip in a
+                      popover this narrow — the tooltip is what makes two
+                      similarly-named files tellable apart. */}
+                  <span className="min-w-0 flex-1 truncate text-sm text-foreground" title={d.filename}>
+                    {d.filename}
+                  </span>
                   <span className="shrink-0 text-[11px] text-muted-foreground">
                     {humanSize(d.sizeBytes)}
                   </span>
@@ -240,7 +317,8 @@ export function AttachmentPicker({
               {checking ? "Checking…" : "Upload new file…"}
             </button>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

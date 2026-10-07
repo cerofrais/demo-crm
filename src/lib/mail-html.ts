@@ -23,7 +23,10 @@ export function sanitizeEmailHtml(html: string): string {
     // cid: is how an inline image references its own attachment (see
     // extractCidImageIds below) — http(s) covers a pasted external image URL.
     allowedSchemesByTag: { img: ["http", "https", "cid"] },
-    allowedSchemes: ["http", "https", "mailto"],
+    // tel: so a phone number in a signature can be tapped to call. Without it
+    // the sanitizer silently dropped the href and left a link-styled number
+    // that did nothing — which is what the saved footer's phones had become.
+    allowedSchemes: ["http", "https", "mailto", "tel"],
     transformTags: {
       a: sanitizeHtml.simpleTransform("a", { rel: "noopener noreferrer", target: "_blank" }),
     },

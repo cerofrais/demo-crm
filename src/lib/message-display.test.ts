@@ -65,30 +65,38 @@ describe("cleanMessageBody — bracket-wrapped URLs (real email shape)", () => {
     );
   });
 
-  it("shortens — not deletes — a bracket-wrapped real link", () => {
+  it("leaves a bracket-wrapped real link exactly as sent", () => {
     const out = cleanMessageBody("[https://trewellness.in/packages]See our packages");
-    expect(out.clean).toBe("[trewellness.in]See our packages");
+    expect(out.clean).toBe("[https://trewellness.in/packages]See our packages");
   });
 });
 
 describe("cleanMessageBody — ordinary links", () => {
-  it("shortens a real link to its domain instead of deleting it", () => {
-    // A guest sharing a page is telling us something; dropping it would hide
-    // content from whoever reads the thread.
-    const out = cleanMessageBody("See https://www.trewellness.in/packages?utm_source=x for details");
-    expect(out.clean).toBe("See [trewellness.in] for details");
-    expect(out.linksShortened).toBe(1);
+  it("keeps the WHOLE url, path and query included", () => {
+    // Which page was shared is usually the substance of the message — a rep
+    // cannot act on a bare domain, and "[trewellness.in]" cannot distinguish
+    // the disease-management page from the pricing page.
+    const body = "See https://www.trewellness.in/packages?utm_source=x for details";
+    const out = cleanMessageBody(body);
+    expect(out.clean).toBe(body);
     expect(out.trackersRemoved).toBe(0);
+    expect(out.changed).toBe(false);
   });
 
-  it("strips www. but keeps the rest of the host", () => {
-    expect(cleanMessageBody("https://www.example.co.uk/a").clean).toBe("[example.co.uk]");
+  it("keeps a deep path intact", () => {
+    const body = "https://trewellness.in/disease-management/";
+    expect(cleanMessageBody(body).clean).toBe(body);
   });
 
-  it("handles several links in one message", () => {
-    const out = cleanMessageBody("a https://one.com/x b https://two.com/y c");
-    expect(out.clean).toBe("a [one.com] b [two.com] c");
-    expect(out.linksShortened).toBe(2);
+  it("keeps several links in one message", () => {
+    const body = "a https://one.com/x b https://two.com/y c";
+    expect(cleanMessageBody(body).clean).toBe(body);
+  });
+
+  it("still strips a tracker while leaving a real link beside it whole", () => {
+    const out = cleanMessageBody("Read https://trewellness.in/blog/post-1 https://x.sendibt2.com/tr/op/abc");
+    expect(out.clean).toBe("Read https://trewellness.in/blog/post-1");
+    expect(out.trackersRemoved).toBe(1);
   });
 });
 
@@ -98,7 +106,7 @@ describe("cleanMessageBody — leaves ordinary text alone", () => {
     const out = cleanMessageBody(body);
     expect(out.clean).toBe(body);
     expect(out.changed).toBe(false);
-    expect(out.trackersRemoved + out.linksShortened).toBe(0);
+    expect(out.trackersRemoved).toBe(0);
   });
 
   it("keeps paragraph breaks", () => {

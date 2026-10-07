@@ -3,14 +3,21 @@ import type { Enquiry, Guest, Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { logger } from "./logger";
 import { ageFromDob, ageGroup } from "./utils";
-import { mergeLeadTags, slugifyTag, sortTags } from "./lead-tags";
-import { getRnrProgressBatch, getLostRequestPendingBatch, hasOpenDeletionApprovalTask } from "./tasks";
+import { mergeLeadTags, slugifyTag, sortTags, isWhatsAppTag } from "./lead-tags";
+import { getRnrProgressBatch, getLostRequestPendingBatch, getOpenTasksBatch, hasOpenDeletionApprovalTask } from "./tasks";
 import { PHONE_RE } from "./validation";
 import { STAGES } from "./kanban";
-import { can, canWorkLeadStage, type AppRole } from "./rbac";
+import { can, canViewLeadStage, type AppRole } from "./rbac";
 import type { EnquiryDTO, AssistResultDTO } from "./types";
+import { STATUS_STALE_MINUTES } from "./message-display";
+import { isStayGuestTag } from "./guest-visits";
 
-type EnquiryWithGuest = Enquiry & { guest: Guest };
+/** Guest include that also counts health records, for the lead drawer's banner. */
+export const GUEST_WITH_HEALTH_COUNT = {
+  include: { _count: { select: { healthProfiles: true } } },
+} satisfies Prisma.GuestDefaultArgs;
+
+type EnquiryWithGuest = Enquiry & { guest: Guest & { _count?: { healthProfiles: number } } };
 
 export function toEnquiryDTO(e: EnquiryWithGuest): EnquiryDTO {
   return {
@@ -26,21 +33,38 @@ export function toEnquiryDTO(e: EnquiryWithGuest): EnquiryDTO {
     // Date-only in meaning (see parseFormDate) — the client renders just the
     // calendar date, never a time.
     preferredCheckIn: e.preferredCheckIn?.toISOString() ?? null,
+    occupancy: e.occupancy,
+    companionName: e.companionName,
+    stayDays: e.stayDays,
+    roomCount: e.roomCount,
+    pricePerDayINR: e.pricePerDayINR,
+    roomCategory: e.roomCategory,
     boardPosition: e.boardPosition,
     needsAttention: e.needsAttention,
     aiScore: e.aiScore,
     aiScoreReason: e.aiScoreReason,
     aiAssist: (e.aiAssist as AssistResultDTO | null) ?? null,
     aiAssistAt: e.aiAssistAt?.toISOString() ?? null,
-    // merged on read so even un-synced leads show current system tags
-    tags: mergeLeadTags(e.tags, e.guest, e),
+    // Merged on read so even un-synced leads show current system tags, plus
+    // the guest's WhatsApp-number tags: those live on the Guest (a WhatsApp
+    // thread is keyed by phone, not by lead) but belong on the card, and the
+    // board's tag filter is applied CLIENT-side against this very array — so
+    // a tag missing here is a tag the board silently matches nothing for.
+    // Deliberately only the wa: ones, not every guest tag: the rest are bulk
+    // -import and housekeeping labels that would bury the card.
+    tags: sortTags([
+      ...new Set([...mergeLeadTags(e.tags, e.guest, e), ...e.guest.tags.filter(isWhatsAppTag)]),
+    ]),
     lastActivityAt: e.lastActivityAt.toISOString(),
     createdAt: e.createdAt.toISOString(),
     rnrProgress: null,
+    unconfirmedMessages: 0,
+    whatsappWindow: null,
     doctorDecision: e.doctorDecision,
     doctorDecisionAt: e.doctorDecisionAt?.toISOString() ?? null,
     doctorDecisionNote: e.doctorDecisionNote,
     lostRequestPending: false,
+    openTasks: { count: 0, items: [] },
     guest: {
       id: e.guest.id,
       fullName: e.guest.fullName,
@@ -50,6 +74,8 @@ export function toEnquiryDTO(e: EnquiryWithGuest): EnquiryDTO {
       gender: e.guest.gender,
       ageGroup: ageGroup(ageFromDob(e.guest.dateOfBirth)),
       isReturning: e.guest.isReturning,
+      // Only known when the query counted them (GUEST_WITH_HEALTH_COUNT).
+      hasHealthRecord: e.guest._count ? e.guest._count.healthProfiles > 0 : null,
       tags: e.guest.tags,
     },
   };
@@ -139,7 +165,7 @@ export function buildWhere(f: EnquiryFilters): Prisma.EnquiryWhereInput {
  * polled on a timer by every signed-in user.
  */
 function attentionWhere(roles: AppRole[], sub: string): Prisma.EnquiryWhereInput | null {
-  const stages = STAGES.filter((s) => canWorkLeadStage(roles, s.id)).map((s) => s.id);
+  const stages = STAGES.filter((s) => canViewLeadStage(roles, s.id)).map((s) => s.id);
   if (!stages.length) return null;
 
   const where: Prisma.EnquiryWhereInput = {
@@ -312,7 +338,7 @@ export async function listEnquiries(f: EnquiryFilters): Promise<EnquiryDTO[]> {
     // narrowing here (rather than after) keeps the 500-row cap from being
     // spent on leads the filter would discard anyway.
     where: buildWhere(f.rnrDone ? { ...f, stage: "rnr" } : f),
-    include: { guest: true },
+    include: { guest: GUEST_WITH_HEALTH_COUNT },
     orderBy: [{ stage: "asc" }, { boardPosition: "asc" }, { lastActivityAt: "desc" }],
     take: BOARD_LEAD_CAP,
   });
@@ -336,6 +362,28 @@ export async function listEnquiries(f: EnquiryFilters): Promise<EnquiryDTO[]> {
   const pendingIds = await getLostRequestPendingBatch(rows.map((r) => r.id));
   for (const dto of dtos) {
     if (pendingIds.has(dto.id)) dto.lostRequestPending = true;
+  }
+
+  // Open tasks for every card in one query, same as the batches around it.
+  const openTasksById = await getOpenTasksBatch(rows.map((r) => r.id));
+  for (const dto of dtos) {
+    const summary = openTasksById.get(dto.id);
+    if (summary) dto.openTasks = summary;
+  }
+
+  // One grouped query for the whole board, not one per lead. Counted per
+  // GUEST rather than per enquiry: a WhatsApp thread is guest-level, so a
+  // message with no enquiryId still belongs on that guest's lead.
+  const unconfirmedByGuest = await getUnconfirmedMessageCounts(rows.map((r) => r.guest.id));
+  for (const dto of dtos) {
+    dto.unconfirmedMessages = unconfirmedByGuest.get(dto.guest.id) ?? 0;
+  }
+
+  // Same shape as above: one grouped query for the board, keyed by guest
+  // because a WhatsApp thread is guest-level.
+  const windowByGuest = await getOpenWhatsAppWindows(rows.map((r) => r.guest.id));
+  for (const dto of dtos) {
+    dto.whatsappWindow = windowByGuest.get(dto.guest.id) ?? null;
   }
 
   const assignedSubs = rows.flatMap((r) => (r.assignedToSub ? [r.assignedToSub] : []));
@@ -371,12 +419,16 @@ export async function listDistinctActiveLeadTags(): Promise<string[]> {
       source: true,
       campaignLabel: true,
       isReturningFlag: true,
-      guest: { select: { dateOfBirth: true, isReturning: true, phone: true } },
+      guest: { select: { dateOfBirth: true, isReturning: true, phone: true, tags: true } },
     },
   });
   const all = new Set<string>();
   for (const r of rows) {
     for (const t of mergeLeadTags(r.tags, r.guest, r)) all.add(t);
+    // The guest's WhatsApp-number tags, matching what toEnquiryDTO puts on a
+    // card — offering a filter the board can't apply would be worse than not
+    // offering it. Other guest tags stay out for the same reason.
+    for (const t of r.guest.tags) if (isWhatsAppTag(t)) all.add(t);
   }
   return sortTags([...all]);
 }
@@ -613,12 +665,22 @@ export async function bulkImportGuests(rows: BulkImportRow[], tag?: string): Pro
             tags: batchTag
               ? Array.from(new Set([...existing.tags, batchTag]))
               : existing.tags,
+            // A past-stay list marks everyone on it as having visited.
+            ...(isStayGuestTag(batchTag) ? { isReturning: true } : {}),
           },
         });
         result.updated++;
       } else {
         await prisma.guest.create({
-          data: { fullName, phone, email, city, gender, tags: batchTag ? [batchTag] : [] },
+          data: {
+            fullName,
+            phone,
+            email,
+            city,
+            gender,
+            tags: batchTag ? [batchTag] : [],
+            isReturning: isStayGuestTag(batchTag),
+          },
         });
         result.created++;
       }
@@ -659,4 +721,117 @@ export async function findReturningGuest(
       _count: { select: { enquiries: true } },
     },
   });
+}
+
+/**
+ * How many outbound WhatsApp messages each guest is still waiting on a
+ * delivery confirmation for — "sent" and older than STATUS_STALE_MINUTES.
+ *
+ * Batched deliberately: the leads board renders hundreds of cards, and a
+ * per-card query would be hundreds of round trips for a badge.
+ */
+export async function getUnconfirmedMessageCounts(
+  guestIds: string[],
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (!guestIds.length) return out;
+  const cutoff = new Date(Date.now() - STATUS_STALE_MINUTES * 60 * 1000);
+
+  // Cloud API only — the same scoping isStatusStale applies per message, for
+  // the same reason: Baileys leaves ~33% of its outbound with no status ever,
+  // so counting it would badge hundreds of leads for normal behaviour. Read
+  // from the numbers table rather than hardcoding an instance name, so a
+  // re-paired or added Cloud API number is picked up automatically.
+  const cloudApi = await prisma.whatsAppNumber.findMany({
+    where: { integration: "cloud_api" },
+    select: { instanceName: true },
+  });
+  if (!cloudApi.length) return out;
+
+  const rows = await prisma.message.groupBy({
+    by: ["guestId"],
+    where: {
+      guestId: { in: guestIds },
+      channel: "whatsapp",
+      direction: "outbound",
+      status: "sent",
+      mailboxId: { in: cloudApi.map((n) => n.instanceName) },
+      createdAt: { lt: cutoff },
+      deletedAt: null,
+    },
+    _count: { _all: true },
+  });
+  for (const r of rows) {
+    if (r.guestId) out.set(r.guestId, r._count._all);
+  }
+  return out;
+}
+
+
+/**
+ * The open 24-hour customer-service window per guest, if any.
+ *
+ * ONLY FOR CLOUD API LINES. The 24-hour rule is Meta's, and it binds only the
+ * official WhatsApp Business Platform: a Baileys (QR-paired) number talks over
+ * the WhatsApp Web protocol and has no such window, so a countdown on one of
+ * those conversations invents a deadline that does not exist and pressures
+ * staff into sending early for no reason. This query used to consider every
+ * inbound message regardless of the line it arrived on, which meant every
+ * chip on the board was wrong whenever the guest had written to a Baileys
+ * number — the common case here, where two of the three lines are Baileys.
+ *
+ * Meta also counts the window PER NUMBER — a reply from a line the guest
+ * never wrote to is refused with error 131047 however recent the conversation
+ * looks. 331 of this deployment's 373 such failures were exactly that, so the
+ * window is reported together with the line it is open on rather than as a
+ * bare countdown.
+ *
+ * The join runs BEFORE the DISTINCT ON, so a guest whose newest message came
+ * in on Baileys still shows a genuinely open Cloud API window from an earlier
+ * one — what matters is whether a CLOUD API window is open, not which line
+ * happened to be used last. An inbound row with no recorded receiving line
+ * drops out: without it we cannot say which window it opened, and claiming
+ * one would be the same mistake in a quieter form. All 504 such rows predate
+ * the field and none falls inside any live 24-hour window.
+ *
+ * DISTINCT ON takes each guest's most recent qualifying inbound message;
+ * ordering by "createdAt" DESC means the window returned is the latest one to
+ * have been opened, and `toEmail` on an inbound row is the number of ours
+ * that received it. Guests with no such message in the last 24h are simply
+ * absent from the map — a closed window is the common case and needs no row.
+ *
+ * `now() AT TIME ZONE 'UTC'` is deliberate: Message.createdAt is `timestamp
+ * without time zone` holding UTC, and comparing it against a bare now()
+ * (which is timestamptz) would silently convert using the session's timezone
+ * and shift the cutoff by the UTC offset — 5h30m here.
+ */
+export async function getOpenWhatsAppWindows(
+  guestIds: string[],
+): Promise<Map<string, { expiresAt: string; ourNumber: string | null }>> {
+  const out = new Map<string, { expiresAt: string; ourNumber: string | null }>();
+  if (!guestIds.length) return out;
+
+  const rows = await prisma.$queryRaw<
+    { guestId: string; expiresAt: Date; ourNumber: string | null }[]
+  >`
+    SELECT DISTINCT ON (m."guestId")
+           m."guestId",
+           m."createdAt" + interval '24 hours' AS "expiresAt",
+           m."toEmail" AS "ourNumber"
+    FROM "Message" m
+    JOIN "WhatsAppNumber" n
+      ON n."phoneNumber" = m."toEmail"
+     AND n.integration = 'cloud_api'
+    WHERE m.channel = 'whatsapp'
+      AND m.direction = 'inbound'
+      AND m."guestId" = ANY(${guestIds}::text[])
+      AND m."deletedAt" IS NULL
+      AND m."createdAt" > (now() AT TIME ZONE 'UTC') - interval '24 hours'
+    ORDER BY m."guestId", m."createdAt" DESC
+  `;
+
+  for (const r of rows) {
+    out.set(r.guestId, { expiresAt: r.expiresAt.toISOString(), ourNumber: r.ourNumber });
+  }
+  return out;
 }

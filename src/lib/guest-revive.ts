@@ -34,7 +34,9 @@ export async function reviveGuestIfDeleted(
 
   await prisma.guest.update({
     where: { id: guestId },
-    data: { deletedAt: null, isReturning: true },
+    // Only un-hides the record. Coming back in touch is not a stay, so the
+    // returning flag is left as it is (see guest-visits.ts).
+    data: { deletedAt: null },
   });
   await prisma.activity.create({
     data: {

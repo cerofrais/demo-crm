@@ -23,16 +23,31 @@ send-from dropdown (no per-role split, e.g. Manager gets a different number
 than Reception) — that was an explicit choice to keep the first cut simple;
 if it's needed later it's a `WhatsAppNumber`-to-role mapping, not a redesign.
 
+Two channels feed the same tables. Baileys numbers go through Evolution API;
+Cloud API numbers talk to Meta directly, with Evolution nowhere in the path.
+
 ```
-Evolution API (Baileys) ──webhook──▶ POST /api/webhooks/whatsapp ──▶ Message row
-        ▲                                                                │
-        │                                                     needsAttention on lead
-   QR pairing                                                            │
-        │                                                                ▼
-/whatsapp-numbers (admin)                                    WhatsApp tab in lead drawer
-        │                                                     GET /api/guests/:id/whatsapp
-POST /api/admin/whatsapp/numbers                              POST /api/messages/whatsapp
+Evolution API (Baileys) ──webhook──▶ POST /api/webhooks/whatsapp ──┐
+        ▲                                                          │
+        │                                                          ├─▶ ingestWhatsAppMessage()
+   QR pairing                                                      │        │
+        │                          Meta Cloud API ──webhook──▶     │        ▼
+/whatsapp-numbers (admin)          POST /api/webhooks/whatsapp-cloud┘   Message row
+        │                                                                   │
+POST /api/admin/whatsapp/numbers                              needsAttention on lead
+                                                                            │
+                                                                            ▼
+                                                          WhatsApp tab in lead drawer
+                                                          GET /api/guests/:id/whatsapp
+                                                          POST /api/messages/whatsapp
 ```
+
+`ingestWhatsAppMessage()` (`src/lib/whatsapp-ingest.ts`) is where the two
+channels converge: each webhook normalizes its own wire format — Baileys'
+`messages.upsert` vs Meta's `entry[].changes[].value` — and everything after
+that (dedup, internal-number and blocked-guest filtering, lead resolution,
+media persistence, activity, reply tags, auto-tags, auto-reply) is one
+implementation, so the channels can't drift in how a conversation behaves.
 
 - **`WhatsAppNumber`** (Prisma) — one row per instance: label, phone number
   (filled in once paired), `instanceName` (also used as `Message.mailboxId`,
@@ -42,8 +57,8 @@ POST /api/admin/whatsapp/numbers                              POST /api/messages
 - **`Message.channel = "whatsapp"`** and the `whatsapp` source enum value on
   `Enquiry` both already existed in the schema before this feature — reused
   as-is, no migration needed for either.
-- **Inbound** is push-based (Evolution posts to us), not polled like email's
-  IMAP — Evolution has no "check every N seconds" step to configure.
+- **Inbound** is push-based (Evolution or Meta posts to us), not polled like
+  email's IMAP — there is no "check every N seconds" step to configure.
 - **Auto lead creation**: an inbound message from an unknown phone number
   creates a new enquiry (`source: "whatsapp"`), exactly like an unmatched
   inbound email — same `needsAttention` flag so it lights up on the Kanban
@@ -111,7 +126,8 @@ cleanly** the first time this branch actually deploys, before relying on it.
 | `EVOLUTION_API_URL` | Internal URL the app uses to call Evolution's REST API (`http://evolution-api:8080` in compose) |
 | `EVOLUTION_API_KEY` | Global admin key — same value in both the app's env and `evolution-api`'s `AUTHENTICATION_API_KEY` |
 | `WHATSAPP_WEBHOOK_SECRET` | Query-param shared secret Evolution appends to its webhook calls to `/api/webhooks/whatsapp` |
-| `WA_BUSINESS_TOKEN_WEBHOOK` | Official Cloud API mode only (see below) — verify token Evolution checks against Meta's webhook handshake |
+| `WA_BUSINESS_TOKEN_WEBHOOK` | Official Cloud API mode only (see below) — verify token echoed back on Meta's webhook handshake. Name is historical: it used to be consumed by the evolution-api container |
+| `META_APP_SECRET` | Official Cloud API mode only — Meta app secret, verifies the `X-Hub-Signature-256` on every Cloud API webhook POST |
 
 ## Permissions
 
@@ -132,7 +148,9 @@ else) rather than just pointing at another tab.
 
 - **Inbound**: WhatsApp media is end-to-end encrypted — the webhook payload
   only carries metadata (mimetype, caption, and a document's filename), not
-  bytes. On seeing `imageMessage` / `videoMessage` / `audioMessage` /
+  bytes. (Cloud API numbers take the equivalent two-hop Graph route instead —
+  see `fetchCloudApiMedia()` in the Cloud API section below.) On seeing
+  `imageMessage` / `videoMessage` / `audioMessage` /
   `documentMessage` / `stickerMessage` in `messages.upsert`, the webhook
   calls Evolution's `POST /chat/getBase64FromMediaMessage/{instance}` to
   fetch (and have Baileys decrypt) the actual bytes, then stores them the
@@ -147,8 +165,14 @@ else) rather than just pointing at another tab.
   email attachments, then the send route fetches those bytes server-side and
   routes to Evolution's `sendMedia` (image/video/document) or
   `sendWhatsAppAudio` (native voice-note UI on the recipient's end,
-  triggered by an `audio/*` mimetype) endpoint. The textarea becomes the
+  triggered by an `audio/*` mimetype) endpoint — or, on a Cloud API number,
+  to Meta's own upload-then-send pair, which makes the same distinction from
+  the same mimetype. The textarea becomes the
   caption; a photo/voice-note with no caption is a valid, empty-body send.
+- **Voice notes are transcribed** — both directions, both integrations — by
+  the same speech-to-text endpoint the call recordings use. The transcript
+  shows under the player here, and on the lead's Activity tab and the
+  Activity Log with a mic icon. See docs/14-ai-features.md §2.
 
 ## Auto-reply
 
@@ -191,15 +215,27 @@ everything else.
 Baileys (above) is fine for low-volume, rep-driven conversations, but it's an
 unofficial protocol — WhatsApp can and does ban numbers it catches doing
 bulk/automated sending through it, no appeal. A number used for real
-bulk/marketing sends should instead go through Evolution's `WHATSAPP-BUSINESS`
-integration type, which talks to the official Meta Cloud API. `/whatsapp-numbers`
-→ **Add number** → **Official Cloud API** does this end to end: it validates
-the token/Phone Number ID against Meta before creating anything, creates the
-Evolution instance, and persists a `WhatsAppNumber` row with
-`integration: "cloud_api"` plus the WABA id / Phone Number id / permanent
-access token (`whatsapp-admin.ts`'s `createInstance()` takes an optional
-`CloudApiConfig` for this — Baileys numbers are unaffected, same call with no
-second argument).
+bulk/marketing sends should instead go through the official Meta Cloud API.
+`/whatsapp-numbers` → **Add number** → **Official Cloud API** does this end to
+end: it validates the token/Phone Number ID against Meta before creating
+anything, then persists a `WhatsAppNumber` row with `integration: "cloud_api"`
+plus the WABA id / Phone Number id / permanent access token.
+
+**Evolution API is not in this path at all.** It used to be — Cloud API
+numbers were created as Evolution `WHATSAPP-BUSINESS` instances and their
+traffic relayed through it — but that mode is a thin proxy over the same
+`graph.facebook.com` endpoints this app can call itself, and it lost data on
+the way back: Evolution v2.3.7 crashes internally right after logging a Cloud
+API status webhook (`TypeError: Cannot read properties of undefined (reading
+'name')` in `ChannelStartupService`), so delivery statuses never reached us
+and Cloud API messages sat on "sent" forever. Cloud API numbers now talk to
+Meta directly in both directions; Evolution serves only the QR-paired Baileys
+numbers, which genuinely need its Web-protocol implementation.
+
+A Cloud API row still carries an `instanceName` — it is that number's
+`Message.mailboxId` — but no Evolution instance exists behind it, and
+`instanceToken` holds the marker `"cloud-api"` rather than a real token.
+There is no QR code to scan for one; the QR endpoint refuses with a 400.
 
 **Prerequisites you still do by hand in Meta's console** (nothing here
 automates these): create a Meta App with the WhatsApp product, connect it to
@@ -208,22 +244,49 @@ and create a System User with `whatsapp_business_management` +
 `whatsapp_business_messaging` permissions to generate the permanent access
 token the admin UI asks for.
 
-**Webhook**: Meta's Cloud API needs to reach Evolution API's own webhook
-receiver (`{EVOLUTION_API_URL}/webhook/meta`) directly over the public
-internet — Evolution implements Meta's verify handshake and event ingestion
-itself there, gated by `WA_BUSINESS_TOKEN_WEBHOOK`. This deployment's only
-public entry point is the app (via ngrok in this setup — see the comment on
-the `ngrok` service in `docker-compose.yml`), so `/api/webhooks/whatsapp-cloud-relay`
-exists purely to forward Meta's calls through to Evolution's real receiver —
-it has no webhook logic of its own. In Meta's app dashboard (WhatsApp →
-Configuration), set:
-- **Callback URL**: `https://<public-app-domain>/api/webhooks/whatsapp-cloud-relay`
+**Webhook**: Meta calls this app directly at
+`/api/webhooks/whatsapp-cloud` (handlers in
+`src/lib/whatsapp-cloud-webhook.ts`, payload parsing in
+`src/lib/whatsapp-cloud-inbound.ts`). It handles the `hub.challenge` verify
+handshake itself, gated by `WA_BUSINESS_TOKEN_WEBHOOK`, then ingests both
+halves of the payload: `statuses[]` through `applyWhatsAppStatusUpdate()`, and
+`messages[]` through the same `ingestWhatsAppMessage()` the Baileys webhook
+uses, so lead creation, blocked-guest filtering, reply tags, auto-tags and
+auto-replies behave identically on both channels.
+
+`/api/webhooks/whatsapp-cloud-relay` is the same handlers under the route's
+former name, kept because that is the URL currently registered with Meta —
+changing it costs a re-verification handshake. Repoint Meta at
+`/api/webhooks/whatsapp-cloud` when convenient and delete that file.
+
+In Meta's app dashboard (WhatsApp → Configuration), set:
+- **Callback URL**: `https://<public-app-domain>/api/webhooks/whatsapp-cloud`
 - **Verify token**: the same value as `WA_BUSINESS_TOKEN_WEBHOOK`
+- Subscribe to the **messages** field (covers inbound messages and statuses)
+
+Set `META_APP_SECRET` (Meta app → App settings → Basic → App Secret) too. The
+route verifies the `X-Hub-Signature-256` Meta signs every POST with; without
+the secret it accepts unsigned payloads and logs a warning per request — and
+this endpoint creates leads and rewrites delivery statuses, so an unsigned one
+is a write endpoint for anyone who learns the URL.
+
+**Inbound media** is two Graph hops, not one: the webhook carries only a media
+id, `GET /{media-id}` returns a short-lived lookaside URL, and that URL still
+needs the bearer token to fetch. `fetchCloudApiMedia()` does both and hands
+back bytes, mirroring `getMediaBase64()`'s shape on the Baileys side. The
+download is deferred until after the dedup/internal/blocked checks, so a
+duplicate webhook delivery costs nothing.
 
 Once connected, a Cloud API number behaves like any other `WhatsAppNumber`
 for 1:1 conversation (same `Message` rows, same WhatsApp tab, same
 `/api/messages/whatsapp` send route — that path still sends free text, which
-is fine inside an open 24h customer-service window).
+is fine inside an open 24h customer-service window). `sendWhatsAppMessage()` /
+`sendWhatsAppMedia()` branch on `integration`: Cloud API goes to
+`POST /{phone-number-id}/messages` directly, Baileys to Evolution's
+`sendText`/`sendMedia`. Media on the Cloud API side is uploaded to Meta first
+and referenced by id — Meta never takes inline bytes — and audio goes out as
+`type: "audio"` so it renders as a voice note, the equivalent of Evolution's
+separate `sendWhatsAppAudio` endpoint.
 
 **Bulk broadcast is different**, because a template is mandatory outside that
 window: `src/lib/whatsapp-cloud-api.ts` calls Meta's Graph API directly

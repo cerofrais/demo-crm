@@ -38,20 +38,27 @@ export const PERMISSION_CATALOG: PermissionMeta[] = [
   { key: "leads.ownOnly", group: "Leads", label: "Own leads only", description: "Restricted to leads assigned to them, plus the unassigned queue." },
   { key: "leads.preBookingOnly", group: "Leads", label: "Pre-booking only", description: "Loses access to a lead once it reaches Booking Confirmed." },
   { key: "leads.consultationOnly", group: "Leads", label: "Consultation stage only", description: "Sees only leads currently in Doctor Consultation, org-wide." },
+  { key: "leads.viewAllStages", group: "Leads", label: "View every stage", description: "Sees every column on the board (except the admin-only Staff lane) without gaining the right to change leads outside its own stage." },
   { key: "leads.doctorDecision", group: "Leads", label: "Record doctor decision", description: "Accept / Reject / Needs-phone-consult on a consultation-stage lead." },
-  { key: "leads.delete", group: "Leads", label: "Delete leads", description: "Delete a lead, and open the Deleted Leads archive to read or permanently purge one.", sensitive: true },
+  { key: "leads.delete", group: "Leads", label: "Delete leads", description: "Delete a lead, and permanently purge one from the Deleted Leads archive.", sensitive: true },
+  { key: "leads.viewDeleted", group: "Leads", label: "Read the deleted-lead archive", description: "Open Deleted Leads and read a deleted ticket, including its message and call history, without being able to purge it.", sensitive: true },
+  { key: "leads.viewStaffLane", group: "Leads", label: "See the Staff column", description: "See the Staff parking lane on the board. Moving leads into or out of it stays Admin-only.", sensitive: false },
 
   // ── Guests & health ────────────────────────────────────────────────────
   { key: "guests.view", group: "Guests & health", label: "View guests", description: "Search and open the Guests directory." },
   { key: "guests.delete", group: "Guests & health", label: "Delete guests", description: "Soft- or hard-delete a guest record and their history.", sensitive: true },
-  { key: "health.view", group: "Guests & health", label: "View health records", description: "Open guest medical history and health profiles.", sensitive: true },
+  { key: "health.view", group: "Guests & health", label: "View health records", description: "Open guest medical history and health profiles. Read-only on its own — saving or deleting a record needs 'Edit health records'.", sensitive: true },
+  { key: "health.edit", group: "Guests & health", label: "Edit health records", description: "Create, replace or delete a health record. Separate from viewing so a read-only role can be shown records without being able to change them.", sensitive: true },
 
   // ── Messaging ──────────────────────────────────────────────────────────
   { key: "messaging.send", group: "Messaging", label: "Send messages", description: "Message one guest at a time — email, WhatsApp, click-to-call, edit/delete a sent message." },
-  { key: "messaging.broadcast", group: "Messaging", label: "Send broadcasts", description: "Mass-send to many guests at once: WhatsApp broadcasts and bulk email, plus Broadcast Status.", sensitive: true },
+  { key: "messaging.broadcast", group: "Messaging", label: "Send broadcasts", description: "Mass-send to many guests at once: WhatsApp broadcasts and bulk email. Does NOT include the Broadcast Status page — that is 'Watch broadcast status'.", sensitive: true },
+  { key: "messaging.viewStatus", group: "Messaging", label: "Watch broadcast status", description: "Open Broadcast Status and follow a send's progress, without being able to start or cancel one.", sensitive: false },
+  { key: "messaging.cloudApi", group: "Messaging", label: "Use the official WhatsApp number", description: "Send from the Cloud API number. It is the only number that has never been banned and everything outbound-first depends on it, so it is kept to senior staff.", sensitive: true },
 
   // ── Documents ──────────────────────────────────────────────────────────
   { key: "documents.medical", group: "Documents", label: "Medical documents", description: "Upload and read documents in the medical category.", sensitive: true },
+  { key: "documents.private", group: "Documents", label: "Private resources", description: "See and attach restricted Resources files (internal rate cards, contracts). Hidden entirely from everyone else — they are not listed, not searchable, and cannot be attached even with a direct link.", sensitive: true },
   { key: "documents.operational", group: "Documents", label: "Operational documents", description: "Upload and read everyday operational documents and Resources." },
 
   // ── Catalogue ──────────────────────────────────────────────────────────
@@ -64,12 +71,14 @@ export const PERMISSION_CATALOG: PermissionMeta[] = [
   // ── Reporting ──────────────────────────────────────────────────────────
   { key: "dashboard.view", group: "Reporting", label: "View dashboard", description: "Org-wide analytics on the Dashboard." },
   { key: "reports.allStaff", group: "Reporting", label: "All-staff reports", description: "Reports across every staff member, plus Calls and the Activity Log." },
+  { key: "calls.recording", group: "Reporting", label: "Play call recordings", description: "Listen to and download any call recording, not only their own calls. A rep can always play back a call they were on.", sensitive: true },
   { key: "reports.own", group: "Reporting", label: "Own reports", description: "Their own performance numbers only." },
 
   // ── Administration ─────────────────────────────────────────────────────
   { key: "users.manage", group: "Administration", label: "Manage users", description: "Create staff accounts, change roles, reset passwords, and open this page.", sensitive: true },
   { key: "users.view", group: "Administration", label: "View users", description: "See the staff list without changing anything." },
   { key: "ai.audit", group: "Administration", label: "AI audit log", description: "Read every AI prompt and output in the AI Audit trail.", sensitive: true },
+  { key: "db.query", group: "Administration", label: "Ask the database", description: "Ask questions in plain English and read the answer straight from the database. Read-only, and health records, documents and WhatsApp credentials stay out of reach.", sensitive: true },
   { key: "whatsapp.manage", group: "Administration", label: "Manage WhatsApp numbers", description: "Onboard, reconnect and remove WhatsApp numbers, and manage auto-replies.", sensitive: true },
   { key: "whatsapp.view", group: "Administration", label: "View WhatsApp numbers", description: "See connected numbers without onboarding or removing them." },
   { key: "lead-assignment.view", group: "Administration", label: "View lead assignment", description: "See routing configuration without changing it." },

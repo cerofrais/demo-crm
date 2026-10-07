@@ -31,6 +31,7 @@ enum EnquiryStage {
   booking_confirmed    // Booked
   converted            // Checked in / completed
   staff                // Parked with general staff — not being actively worked, not dead yet
+  non_leads            // Not a lead at all — spam, vendors, wrong number, internal
   lost                 // Dead / not interested
 }
 
@@ -52,6 +53,12 @@ enum DocumentCategory {
   consent
   operational
   marketing
+  /// Restricted Resources-library files — internal rate cards, contracts,
+  /// anything not everyone with Resources access should see. Gated by its
+  /// own `documents.private` permission rather than folded into `medical`,
+  /// so granting someone access to internal files never also hands them
+  /// guests' medical records.
+  private
 }
 
 enum MessageChannel {
@@ -92,12 +99,27 @@ enum TaskKind {
   follow_up
   doctor_review
   deletion_approval
+  /// Standing chase on a lead sitting in Payment Pending. Opened when the
+  /// lead enters that stage, closed when it leaves — see lib/tasks.ts.
+  payment_pending
 }
 
 enum DoctorDecision {
   accepted
   rejected
   needs_phone_consult
+}
+
+/// How the room is sold. Only ever set by a rep on the lead drawer; leads
+/// that never reach a booking conversation keep it null.
+enum Occupancy {
+  single
+  double
+}
+
+enum RoomCategory {
+  premium
+  executive
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +135,12 @@ model Guest {
   dateOfBirth      DateTime?
   gender           String?
   city             String?
+  /// Where the guest works and what they do there. Captured from the lead
+  /// forms when they carry it (see website-form-parser's business/role
+  /// labels); otherwise filled in by a rep. Free text on purpose — this is
+  /// context for a sales conversation, not something to report on.
+  businessName     String?
+  businessRole     String?
   /// arbitrary, admin-defined searchable attributes (segments, custom fields)
   customFields     Json           @default("{}")
   tags             String[]       @default([])
@@ -139,7 +167,7 @@ model Guest {
   createdAt        DateTime       @default(now())
   updatedAt        DateTime       @updatedAt
 
-  healthProfile HealthProfile?
+  healthProfiles HealthProfile[]
   enquiries     Enquiry[]
   memberships   Membership[]
   documents     Document[]
@@ -154,15 +182,40 @@ model Guest {
 
 /// Encrypted at the application layer (AES-256-GCM) before write. The blob holds
 /// the medical screening form: conditions, allergies, medications, diet, etc.
+/// One screening form = one record. NOT one per guest.
+///
+/// A family shares a phone number, and Guest.phone is unique, so three
+/// siblings submitting three forms all resolve to the same Guest. Merging
+/// them into a single record — which is what this model used to force —
+/// silently blended three people's medical history into one. The record now
+/// carries its own subject, and the Guest it hangs off is the phone's owner
+/// rather than necessarily the person the record is about.
 model HealthProfile {
   id            String   @id @default(uuid())
-  guestId       String   @unique
+  guestId       String
   guest         Guest    @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  /// Who this record is ABOUT, as the form gave it. Null on records written
+  /// before per-submission records existed, and on ones a doctor created by
+  /// hand from the guest page — both mean "the guest themselves".
+  subjectName   String?
+  subjectPhone  String?
+  /// Another record shares this subject's name + phone. Never resolved
+  /// automatically: a second form for the same person may be a correction or
+  /// a genuine second visit, and only a human can tell which. Set on every
+  /// record in the group, so finding one finds them all.
+  hasDuplicate  Boolean  @default(false)
+  /// RFC Message-ID of the form email this came from — the idempotency key.
+  /// Without it a replay or a re-poll would create the record twice, which
+  /// is exactly the failure mode this model is meant to end.
+  sourceMessageId String? @unique
   encryptedData Bytes // AES-256-GCM ciphertext (see lib/crypto.ts)
   iv            Bytes // per-record initialization vector
   authTag       Bytes // GCM auth tag
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+
+  @@index([guestId])
+  @@index([subjectPhone, subjectName])
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +243,23 @@ model Enquiry {
   /// confirmed booking, and deliberately separate from `proposedDates` (free
   /// text, currently unused anywhere in the app).
   preferredCheckIn DateTime?
+  /// Booking detail a rep fills in once a stay is being firmed up. Every
+  /// field is optional and independent — a lead can have a room category and
+  /// no price, and most leads have none of them at all.
+  ///
+  /// `companionName` belongs to `double` alone. The drawer hides it under
+  /// single occupancy AND clears it on the switch, so the pair can never
+  /// disagree; anything reading these must still tolerate a companion name
+  /// on a single booking, since older rows were never validated.
+  occupancy        Occupancy?
+  companionName    String?
+  /// Length of stay in days, as sold.
+  stayDays         Int?
+  /// Rooms booked. Independent of occupancy: a family can take two double
+  /// rooms, so this is not derivable from `occupancy`.
+  roomCount        Int?
+  pricePerDayINR   Int?
+  roomCategory     RoomCategory?
   lostReason      String?
   campaignLabel   String?
   /// Permanent idempotency key for inbound webhook leads (e.g. a Meta lead-gen
@@ -259,8 +329,19 @@ model Tag {
   @@index([category])
 }
 
+/// A remark is the lead's working record — it is what the Cresent report
+/// shows the client. A comment is internal chatter about the lead that the
+/// client has no business reading, so it is kept out of that report.
+enum NoteKind {
+  remark
+  comment
+}
+
 model Note {
   id        String   @id @default(uuid())
+  /// Every note written before comments existed is a remark, which is what
+  /// they were.
+  kind      NoteKind @default(remark)
   enquiryId String
   enquiry   Enquiry  @relation(fields: [enquiryId], references: [id], onDelete: Cascade)
   authorSub String
@@ -353,6 +434,8 @@ model Document {
   createdAt  DateTime         @default(now())
   messages   Message[]
   notes      Note[]
+  autoReplies AutoReply[]
+  welcomeEmails WelcomeEmailSetting[]
 
   @@index([guestId])
   @@index([enquiryId])
@@ -400,14 +483,49 @@ model Message {
   inReplyTo   String?
   references  String[]         @default([])
   templateId  String?
+  /// Meta's approved template, by name, when the message was sent as one.
+  /// Distinct from templateId above, which is a CRM MessageTemplate. Kept
+  /// beside the rendered body rather than inside it: the thread shows both,
+  /// and a report can group by campaign without parsing message text.
+  metaTemplateName String?
   status      String           @default("sent") // sent | delivered | read | failed
   errorDetail String?
   externalId  String? // provider message id
+  /// Copied from the broadcast that sent this message (WhatsApp) or from the
+  /// bulk-email request (which has no job row). Read back when the guest
+  /// replies, to tag their lead — see lib/reply-tag.ts.
+  replyTag    String?
+  /// Set when this outbound message was produced by an EmailAutoReply rule.
+  /// Doubles as the cooldown key: "have we auto-replied to this address
+  /// recently" is answered without a second table.
+  autoReplyRuleId    String?
   needsReview Boolean          @default(false) // unmatched inbound flagged for staff
   // Inline media (WhatsApp images/audio/documents; not used by email today,
   // which surfaces attachments via the Documents tab instead — see docs/17).
   attachmentDocumentId String?
+  /// Every attachment the email carried, by filename — received ones included,
+  /// whose files are NOT stored (only the fact of them and their names). Lets
+  /// the conversation show a paperclip on a message without the CRM starting
+  /// to hold whatever a guest happens to attach, which can be a medical report.
+  attachmentNames      String[] @default([])
   attachmentDocument   Document? @relation(fields: [attachmentDocumentId], references: [id])
+  /// Speech-to-text for an attached WhatsApp voice note, same pipeline as call
+  /// recordings: `transcript` is the native script as spoken, `transcriptEnglish`
+  /// the translation staff actually read. Both null until the background pass
+  /// has run — see lib/ai/voice-note-transcribe.ts.
+  transcript          String?
+  transcriptEnglish   String?
+  transcriptLanguage  String?
+  transcribedAt       DateTime?
+  /// Why the last attempt produced nothing (ASR down, no speech in the clip).
+  /// Kept so the UI can say so instead of showing a permanent "Transcribing…".
+  transcriptError     String?
+  /// Attempts so far. Caps retries on a clip that will never decode, and is
+  /// what the background sweep orders and filters on.
+  transcriptAttempts  Int       @default(0)
+  /// When the last attempt started. Spaces retries out, so an ASR outage
+  /// can't burn all three attempts inside two pipeline ticks.
+  transcriptAttemptAt DateTime?
   /// Set only for a bulk-broadcast send — which trigger it belongs to, for
   /// the Broadcast Status page's per-recipient view. Never set for a 1:1
   /// send or an inbound message. Deleting a trigger there (see
@@ -426,6 +544,15 @@ model Message {
   @@index([enquiryId, createdAt])
   @@index([guestId, mailboxId, createdAt])
   @@index([broadcastJobId])
+  /// Backs the reply-tag lookup in lib/reply-tag.ts. Created by the
+  /// broadcast_reply_tag migration's raw SQL but never declared here, so
+  /// every later `migrate dev` planned to DROP it as drift. Declared now so
+  /// the schema matches the database that has been running all along.
+  @@index([guestId, replyTag, createdAt])
+  @@index([autoReplyRuleId, toEmail])
+  /// Backs the voice-note transcription sweep: "audio messages not yet
+  /// transcribed", newest first.
+  @@index([channel, transcribedAt, createdAt])
 }
 
 /// Per-mailbox IMAP cursor so the poller only fetches new mail and never marks
@@ -487,6 +614,8 @@ model WhatsAppNumber {
   updatedAt     DateTime @updatedAt
 
   autoReplies AutoReply[]
+  autoTags    AutoTag[]
+  scheduledTags ScheduledTag[]
 }
 
 /// An automated text reply sent on a WhatsApp number's inbound messages.
@@ -494,20 +623,198 @@ model WhatsAppNumber {
 /// when that word appears in the inbound message; at most one with a blank
 /// triggerWord acts as a catch-all for everything else. See
 /// lib/whatsapp-autoreply.ts for the matching/sending logic.
+/// trigger — matched against the inbound message body (the original mode).
+/// welcome — fires ONLY on the first message from a brand-new number (one
+/// whose guest record didn't exist before this message); never matched
+/// against body text, and takes precedence over trigger replies for that
+/// first message so a new customer isn't double-messaged.
+enum AutoReplyKind {
+  trigger
+  welcome
+}
+
 model AutoReply {
   id       String         @id @default(uuid())
   numberId String
   number   WhatsAppNumber @relation(fields: [numberId], references: [id], onDelete: Cascade)
+  kind     AutoReplyKind  @default(trigger)
   /// Case-insensitive substring match against the inbound message body.
   /// Null/empty = matches every inbound message on this number.
+  /// Always null for kind=welcome (welcome is event-driven, not text-driven).
   triggerWord String?
   replyText   String
+  /// Optional file sent with the reply. Library-only (no guest/enquiry
+  /// scope) — one asset goes to every guest that triggers this rule, same
+  /// rule as a broadcast attachment. See lib/attachment-access.ts.
+  attachmentDocumentId String?
+  attachmentDocument   Document? @relation(fields: [attachmentDocumentId], references: [id])
   enabled     Boolean  @default(true)
+  /// Optional daily active window, minutes-since-midnight IST (0–1439).
+  /// Both null = active around the clock. from > to = overnight window
+  /// (e.g. 1320→360 is 10pm–6am). Checked on top of `enabled`.
+  activeFromMin Int?
+  activeToMin   Int?
   createdBy   String
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   @@index([numberId, enabled])
+}
+
+/// The signature block appended to every outgoing email.
+///
+/// A single row: there is one CRM identity, not one per user or per mailbox.
+/// Images are carried as cid: attachments rather than remote URLs — a hosted
+/// image needs a permanently public URL this deployment does not have, and a
+/// presigned one would expire and leave a broken image in mail already
+/// delivered. See lib/email-footer.ts.
+model EmailFooter {
+  id        String   @id @default("default")
+  enabled   Boolean  @default(true)
+  html      String   @default("")
+  /// Plain-text equivalent for the text/plain part. Kept separate rather than
+  /// stripped from the HTML so it can be worded for a reader who sees no
+  /// images at all.
+  text      String   @default("")
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+}
+
+/// Trigger-word auto-reply for INBOUND email — the sibling of AutoReply
+/// (WhatsApp), sharing its matching rules via matchAutoReply().
+///
+/// The transports differ in one way that matters: two email auto-responders
+/// pointed at each other will send forever, and ours would be one of them.
+/// Every guard in lib/email-autoreply.ts exists for that, and the most
+/// important is that 1,240 of this CRM's 1,398 inbound emails are FROM our
+/// own address (the website form mailer posts as hello@) — replying to those
+/// would be an instant self-sustaining loop.
+model EmailAutoReply {
+  id          String   @id @default(uuid())
+  /// "sales" | "doctor" — which mailbox's inbound this rule watches.
+  mailboxId   String   @default("sales")
+  /// Case-insensitive substrings matched against the SUBJECT. Substrings
+  /// rather than words so a URL or a phrase works without special handling.
+  subjectTerms String[] @default([])
+  /// The same, matched against the body.
+  bodyTerms    String[] @default([])
+  /// How several terms in one list combine: "any" (a synonym list) or "all"
+  /// (every term must appear). Applies within each list; the two lists
+  /// themselves always AND together, so a rule can require a subject word
+  /// AND a link in the body. A rule with both lists empty is the catch-all.
+  termMatch    String   @default("any")
+  /// Null re-uses the incoming subject with a "Re: " prefix.
+  subject     String?
+  replyText   String
+  /// Library documents sent with the reply. Several, unlike WhatsApp's single
+  /// attachment: an email can reasonably carry a brochure and a rate card at
+  /// once. Library-scoped only — one asset goes to every sender that triggers
+  /// the rule, same rule as a broadcast attachment.
+  attachmentDocumentIds String[] @default([])
+  /// Tag put on the lead when this rule matches, e.g. "Sample Itinerary EP".
+  /// Applied on the match, not on a successful send, so the request is still
+  /// recorded when the reply can't go out — a form with no email on it.
+  tagOnMatch  String?
+  enabled     Boolean  @default(true)
+  /// Daily IST window, minutes since midnight. Same semantics as AutoReply.
+  activeFromMin Int?
+  activeToMin   Int?
+  createdBy   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([mailboxId, enabled])
+}
+
+/// Rule that tags a LEAD when an inbound WhatsApp message matches. Sibling of
+/// AutoReply, deliberately separate: tagging is bookkeeping about a
+/// conversation, not a message to the guest, and the two are wanted
+/// independently — "price" should tag price-asked whether or not it also
+/// triggers a reply.
+model AutoTag {
+  id       String         @id @default(uuid())
+  numberId String
+  number   WhatsAppNumber @relation(fields: [numberId], references: [id], onDelete: Cascade)
+  /// Word or whole sentence. Matched case-insensitively anywhere in the
+  /// message body, exactly like AutoReply.triggerWord — a sentence is just a
+  /// longer needle, so no separate mode is needed.
+  trigger   String
+  /// Slugified, so it joins the same vocabulary the board and filters use.
+  tag       String
+  enabled   Boolean  @default(true)
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([numberId, enabled])
+}
+
+/// Rule that tags a LEAD when an inbound EMAIL matches — the email sibling of
+/// AutoTag. Matched like EmailAutoReply (subject and body terms, any/all
+/// within a list, the two lists AND together), but every matching rule
+/// applies, and a rule with no terms never matches. See lib/email-auto-tag.ts.
+/// Tag everyone who writes to one of our numbers during a window.
+///
+/// The keyword rules above tag by what a guest SAYS; this one tags by WHEN
+/// they said anything at all. That is what a campaign needs: put the number on
+/// a Diwali post, open a window around it, and every person who messages that
+/// number while it runs is tagged as having come from it — no keyword, because
+/// people answer an ad with "hi".
+model ScheduledTag {
+  id       String         @id @default(uuid())
+  numberId String
+  number   WhatsAppNumber @relation(fields: [numberId], references: [id], onDelete: Cascade)
+  /// Slugified, joining the same vocabulary as every other lead tag.
+  tag      String
+  /// What the window is for, shown in the list ("Diwali post").
+  label    String?
+  /// The window, inclusive of both ends. Stored UTC like every timestamp.
+  startsAt DateTime
+  endsAt   DateTime
+  enabled  Boolean  @default(true)
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([numberId, enabled])
+}
+
+model EmailAutoTag {
+  id           String   @id @default(uuid())
+  /// "sales" | "doctor" — which mailbox's inbound this rule watches.
+  mailboxId    String   @default("sales")
+  subjectTerms String[] @default([])
+  bodyTerms    String[] @default([])
+  termMatch    String   @default("any")
+  /// Slugified, so it joins the same vocabulary the board and filters use.
+  tag          String
+  enabled      Boolean  @default(true)
+  createdBy    String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([mailboxId, enabled])
+}
+
+/// Singleton config for the automatic onboarding email sent to a NEW guest
+/// the moment their email address first enters the CRM via inbound mail
+/// (unknown sender / website form / medical form) — sent from the sales
+/// mailbox (hello@trewellness.in). Body/subject support the same {name}/
+/// {salutation} tokens as broadcasts. Managed from the Auto-Reply page.
+model WelcomeEmailSetting {
+  id        String   @id @default("singleton")
+  enabled   Boolean  @default(false)
+  subject   String
+  body      String
+  /// Optional file attached to every welcome email — library-only, same
+  /// reasoning as AutoReply.attachmentDocumentId.
+  attachmentDocumentId String?
+  attachmentDocument   Document? @relation(fields: [attachmentDocumentId], references: [id])
+  /// Same daily IST window semantics as AutoReply.activeFromMin/ToMin.
+  activeFromMin Int?
+  activeToMin   Int?
+  updatedBy String
+  updatedAt DateTime @updatedAt
 }
 
 // ---------------------------------------------------------------------------
@@ -550,12 +857,90 @@ model UserPreference {
 // Staff profiles — phone numbers for click-to-call (identity stays in Keycloak)
 // ---------------------------------------------------------------------------
 
+/// A dated absence for one staff member — the one-off counterpart of
+/// StaffProfile.weeklyOffDays. Stored as calendar DATES, not timestamps:
+/// "off on the 14th" is a day in IST, not an instant, and a timestamp would
+/// start and end the leave at 05:30 local.
+/// One person's working hours on one weekday. Absent = they work that whole
+/// day (which is what everybody had before shifts existed), so adding this
+/// changed nobody's routing until an admin sets hours.
+///
+/// Times are MINUTES FROM MIDNIGHT IST, not timestamps: a shift is a
+/// wall-clock window that repeats, and storing it as an instant would drift.
+model StaffShift {
+  id          String @id @default(uuid())
+  /// StaffProfile.keycloakId.
+  sub         String
+  /// 0=Sunday … 6=Saturday, read in IST.
+  weekday     Int
+  startMinute Int
+  /// When endMinute <= startMinute the shift crosses midnight — 22:00→06:00
+  /// is start 1320, end 360. See isWithinShift().
+  endMinute   Int
+
+  @@unique([sub, weekday])
+  @@index([sub])
+}
+
+/// A lead that could not be auto-assigned because nobody eligible was on
+/// shift. The row IS the queue: it exists while the lead is waiting and is
+/// deleted the moment it finds an owner.
+///
+/// Kept off Enquiry as its own table so the wait leaves no permanent columns
+/// on the main record, and so the routing inputs can be replayed exactly as
+/// they were at creation — the WhatsApp number in particular is not stored
+/// anywhere on Enquiry.
+model HeldAssignment {
+  enquiryId         String   @id
+  /// Enquiry.source at the time, replayed by the worker.
+  source            String
+  campaignLabel     String?
+  /// The tags the lead was created with. Copied for the same reason as the
+  /// fields around it: replaying the decision later must use the same inputs.
+  tags              String[] @default([])
+  /// Our receiving number, for the WhatsApp-number rule.
+  ourWhatsAppNumber String?
+  heldAt            DateTime @default(now())
+  /// Bumped on every failed retry — surfaced in logs so a lead nobody can
+  /// ever take is visible rather than silently looping.
+  attempts          Int      @default(0)
+
+  @@index([heldAt])
+}
+
+model StaffLeave {
+  id        String   @id @default(uuid())
+  /// StaffProfile.keycloakId. No FK: a profile can be recreated when someone
+  /// is re-invited, and the leave record should outlive that.
+  sub       String
+  /// Inclusive on both ends, so a single day has startDate == endDate.
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  note      String?
+  createdBy String
+  createdAt DateTime @default(now())
+
+  @@index([sub, startDate, endDate])
+}
+
 model StaffProfile {
   keycloakId  String   @id        // Keycloak `sub`
   displayName String
   /// E.164 phone, e.g. +919876543210 — required for click-to-call
   phone       String?
   isOnline    Boolean  @default(true)
+  /// Recurring days off, 0=Sunday … 6=Saturday, read in IST. Empty = works
+  /// every day. Someone off today is skipped by lead assignment and by
+  /// inbound call routing — see lib/staff-availability.ts.
+  weeklyOffDays Int[]  @default([])
+  /// WhatsApp lines this person may SEND from, as E.164 numbers. Empty means
+  /// every line they would otherwise be offered — the behaviour before this
+  /// existed. Keyed on the phone number, not WhatsAppNumber.id: re-pairing a
+  /// Baileys line mints a new row (60 alone has had five), so an id-keyed
+  /// restriction would silently lapse, or lock the person out entirely, on
+  /// the next re-pair. Set by admins on the Users page; enforced server-side
+  /// on every send, not just hidden from the picker.
+  allowedWhatsAppNumbers String[] @default([])
   /// Denormalized AppRole ("ADMIN"/"MANAGER"/"DOCTOR"/"RECEPTION"/"STAFF"),
   /// synced from Keycloak by keycloak-admin.ts. Lets the inbound-call webhook
   /// filter reps by role without an unauthenticated Keycloak Admin API call
@@ -596,6 +981,113 @@ model LeadDeletionSettings {
 /// One generated daily marketing CSV. The file itself lives in object storage
 /// (same bucket as Documents); this row is the index the Reports > Marketing
 /// page lists, and the record of whether it reached the CEO.
+/// Lead sheet check — every few days, confirm the leads in the Meta lead-ad
+/// Google Sheets actually reached the CRM, and push any that didn't. A cron
+/// container calls the tick endpoint daily; the interval is enforced here
+/// against the last run, not by the cron schedule. See lib/sheet-check.ts.
+model SheetCheckSetting {
+  id           String    @id @default("singleton")
+  enabled      Boolean   @default(true)
+  intervalDays Int       @default(3)
+  recipients   String[]  @default(["ceo@trewellness.in"])
+  /// Create missing leads in the CRM, not just report them.
+  pushMissing  Boolean   @default(true)
+  /// Last time the cron container called in — shows on the page whether the
+  /// scheduler is alive at all.
+  lastTickAt   DateTime?
+  updatedBy    String?
+  updatedAt    DateTime  @updatedAt
+}
+
+model SheetCheckSource {
+  id            String    @id @default(uuid())
+  name          String
+  /// The link as pasted; spreadsheetId + gid are parsed out of it.
+  sheetUrl      String
+  spreadsheetId String
+  /// Tab id from the link's gid; null means the first tab.
+  gid           String?
+  /// Campaign label for leads pushed from this sheet. Blank derives it from
+  /// the row, the same way the n8n workflow does.
+  campaignLabel String?
+  enabled       Boolean   @default(true)
+  /// Watermark for "since the last check": the highest sheet row seen and
+  /// when. Only advanced by a real (not report-only) run.
+  lastRowNumber Int?
+  lastCheckedAt DateTime?
+  lastStatus    String?
+  lastMessage   String?
+  createdBy     String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model SheetCheckRun {
+  id              String    @id @default(uuid())
+  /// "schedule" | "manual"
+  trigger         String
+  /// Report only: nothing pushed, nothing emailed, watermark untouched.
+  dryRun          Boolean   @default(false)
+  /// "running" | "ok" | "issues" | "failed"
+  status          String    @default("running")
+  checkedCount    Int       @default(0)
+  missingCount    Int       @default(0)
+  pushedCount     Int       @default(0)
+  pushFailedCount Int       @default(0)
+  sheetErrors     Int       @default(0)
+  /// Per-sheet counts and errors. No lead details — those are in the CSV.
+  summary         Json      @default("[]")
+  csvKey          String?
+  csvFilename     String?
+  emailedAt       DateTime?
+  emailedTo       String?
+  emailError      String?
+  error           String?
+  createdBy       String?
+  startedAt       DateTime  @default(now())
+  finishedAt      DateTime?
+
+  @@index([startedAt])
+}
+
+/// Settings for the weekly Cresent report — leads received in a week that
+/// carry ANY of `tags`, with their first three contacts. Singleton. Emailed
+/// every Monday morning to `recipients` for the previous Monday–Sunday, but
+/// only while enabled and with at least one tag and one recipient: this goes
+/// to outside addresses, so "no tags" must never mean "every lead".
+/// See lib/cresent-report.ts.
+model CresentReportSetting {
+  id         String   @id @default("singleton")
+  enabled    Boolean  @default(false)
+  recipients String[] @default([])
+  tags       String[] @default([])
+  updatedBy  String?
+  updatedAt  DateTime @updatedAt
+}
+
+/// One Cresent report send — scheduled or manual. Nothing is stored beyond
+/// this log: the report is rebuilt from the leads on demand.
+model CresentReport {
+  id         String    @id @default(uuid())
+  /// First IST day covered — the Monday for a weekly send.
+  weekStart  DateTime  @db.Date
+  /// Last IST day covered, inclusive. Null on sends from before custom
+  /// ranges existed, which were always a whole week.
+  rangeEnd   DateTime? @db.Date
+  /// Set only for the automatic Monday send, and unique, so a restart or a
+  /// second instance can't email the same week twice. Null for manual sends.
+  scheduledWeek DateTime? @unique @db.Date
+  tags       String[]  @default([])
+  rowCount   Int       @default(0)
+  emailedAt  DateTime?
+  emailedTo  String?
+  emailError String?
+  createdBy  String?
+  createdAt  DateTime  @default(now())
+
+  @@index([weekStart])
+}
+
 model MarketingReport {
   id         String   @id @default(uuid())
   /// The calendar DAY a SCHEDULED report covers (its leads' received date),
@@ -639,6 +1131,14 @@ enum LeadAssignmentCategory {
   email
   call
   google_sheets
+  website_form
+  instagram
+  facebook
+  /// Pre-arrival (medical screening) forms. Not a lead source — a form that
+  /// arrives by email about a guest who is nearly here, which Front Office
+  /// handles. Routed on its own so it can go to them without sending every
+  /// other email enquiry the same way.
+  medical_form
 }
 
 enum LeadAssignmentStrategy {
@@ -656,6 +1156,12 @@ model LeadAssignmentSettings {
   category     LeadAssignmentCategory @id
   strategy     LeadAssignmentStrategy @default(round_robin)
   eligibleSubs String[]               @default([])
+  /// Only read for `medical_form`: whether a form arriving for a lead that
+  /// ALREADY has an owner hands it over, or only new leads are routed here.
+  /// A pre-arrival form means the guest is nearly here and the job becomes
+  /// Front Office's, but taking a card off the rep mid-conversation is a
+  /// decision for whoever sets the rule, not a default worth assuming.
+  reassignExisting Boolean            @default(false)
   updatedAt    DateTime               @updatedAt
 }
 
@@ -667,6 +1173,54 @@ model LeadAssignmentSettings {
 /// existing "campaign:<slug>" system tag already uses — so a rule set up
 /// once matches every enquiry for that campaign regardless of exact casing/
 /// spacing in the label as submitted.
+/// Routes a lead opened by an inbound WhatsApp message to a specific pool
+/// based on WHICH of our numbers received it — the sibling of
+/// CampaignAssignmentRule, and checked before it. See lib/lead-assignment.ts.
+model WhatsAppNumberAssignmentRule {
+  /// Our own receiving number in E.164, e.g. "+918712623061".
+  ///
+  /// Keyed on the number, never on WhatsAppNumber.id or Evolution's
+  /// instanceName: a QR-paired line gets a fresh instance (and row) every
+  /// time it re-pairs — this deployment has 12 instance names for 3 real
+  /// numbers — so an id-keyed rule would silently orphan itself on the next
+  /// re-pair. The number is the thing that stays constant, and it is also
+  /// what Meta scopes its 24-hour window to.
+  ourNumber    String                 @id
+  /// The number's label as the admin saw it when the rule was made, kept
+  /// alongside so the settings UI reads well without a join.
+  label        String
+  strategy     LeadAssignmentStrategy @default(round_robin)
+  eligibleSubs String[]               @default([])
+  updatedAt    DateTime               @updatedAt
+}
+
+/// Route a lead by a TAG it carries at creation.
+///
+/// Sits below the campaign rule on purpose. A campaign is singular — a lead
+/// belongs to one — whereas a lead can arrive with several tags, so a tag
+/// match is the looser signal of the two. `priority` breaks that tie
+/// explicitly rather than leaving it to whichever tag sorted first.
+///
+/// Routes on the tags a lead HAS AT CREATION — both the ones the caller
+/// supplies and the system ones computed from the lead itself (foreign,
+/// revisit, age band, source:, campaign:). Auto-tags derived from a later
+/// inbound message are deliberately excluded: they land after the owner is
+/// chosen, and silently reassigning a lead somebody has started working
+/// would be worse than not routing it.
+model TagAssignmentRule {
+  /// Slugified, matching how tags are stored on Enquiry.tags.
+  tag          String                 @id
+  /// The tag as the admin typed it, so the settings UI reads well.
+  label        String
+  strategy     LeadAssignmentStrategy @default(round_robin)
+  eligibleSubs String[]               @default([])
+  /// Lower runs first when a lead carries more than one matching tag.
+  priority     Int                    @default(0)
+  updatedAt    DateTime               @updatedAt
+
+  @@index([priority])
+}
+
 model CampaignAssignmentRule {
   campaignSlug  String                 @id
   /// Display label as an admin typed it, kept alongside the slug purely so
@@ -697,11 +1251,45 @@ model MessageTemplate {
   /// staff member's own name/phone (StaffProfile) — all resolved client-side
   /// at send time, never stored resolved.
   body      String
+  /// The folder this template is filed in. Null only for the moment between
+  /// a folder being deleted and its templates being moved — the UI always
+  /// files a new template somewhere, "Others" if nowhere else.
+  folderId  String?
+  folderRef MessageTemplateFolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
   createdBy String?
+  /// Hidden from every template picker and, by default, from the templates
+  /// page. Kept rather than deleted so a seasonal or retired message can be
+  /// brought back without being rewritten. Null = active.
+  archivedAt DateTime?
+  archivedBy String?
   createdAt DateTime               @default(now())
   updatedAt DateTime               @updatedAt
 
   @@index([channel])
+  @@index([folderId])
+}
+
+/// A folder of message templates, one tree per channel.
+///
+/// Folders nest: "Detox" can hold "Pricing shared", because that is how staff
+/// already talk about their templates. A real row rather than a string on the
+/// template so a folder can exist while empty — you make the folder, then put
+/// things in it, not the other way round — and so renaming one is a single
+/// write instead of an update across every template inside it.
+model MessageTemplateFolder {
+  id        String                 @id @default(uuid())
+  channel   MessageTemplateChannel
+  name      String
+  /// Null for a folder at the top level of its channel.
+  parentId  String?
+  parent    MessageTemplateFolder?  @relation("TemplateFolderTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children  MessageTemplateFolder[] @relation("TemplateFolderTree")
+  templates MessageTemplate[]
+  createdBy String?
+  createdAt DateTime               @default(now())
+  updatedAt DateTime               @updatedAt
+
+  @@index([channel, parentId])
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +1316,12 @@ model BroadcastJob {
   /// text to a broadcast recipient outside an open 24h window.
   templateName       String?
   templateLanguage   String?
+  /// The approved BODY text, captured when the job starts. Stored so each
+  /// message can keep what the guest actually read: without it the thread
+  /// shows "[template: rakhi_2026_1]", which tells a rep nothing about what
+  /// was said. Meta owns the wording and can change or retire a template, so
+  /// it is captured at send time rather than looked up later.
+  templateBody       String?
   /// Positional {{1}}, {{2}}, … BODY parameter templates — each may contain
   /// {name}/{salutation} tokens, personalized per recipient same as message.
   templateBodyParams Json?
@@ -752,6 +1346,34 @@ model BroadcastJob {
   /// the env kill-switch can be flipped between jobs, so the flag's current
   /// value doesn't tell you how an old job was sent.
   usedMarketingApi Boolean         @default(false)
+  /// Tag applied to a lead when that guest REPLIES to this broadcast (see
+  /// lib/reply-tag.ts). Stored slugified, same vocabulary as every other
+  /// lead tag. Null = replies to this broadcast aren't tagged.
+  replyTag         String?
+  /// Hold the job until this time. Null = start immediately. A job waiting on
+  /// a future scheduledAt is deliberately NOT "active": it must not block
+  /// other broadcasts for the days it sits there (see getActiveBroadcast).
+  scheduledAt      DateTime?
+  /// Set when this job is the follow-up to an earlier campaign. Its recipient
+  /// list is then resolved WHEN IT STARTS, not now — anyone who replies or
+  /// calls in the meantime must drop out of it (see lib/broadcast-followup.ts).
+  followUpOfJobId  String?
+  /// Narrows the follow-up to guests whose reply CONTAINED this text — i.e.
+  /// the ones who tapped a specific template button ("Enquire Now" / "See
+  /// details"). Null = anyone who engaged at all, however they did it.
+  followUpTrigger  String?
+  /// Don't message anyone we've contacted more recently than this many hours,
+  /// so a live conversation is never interrupted. Null = 24. In ROLLING mode
+  /// this doubles as the per-guest delay, because "we spoke last and it has
+  /// been N hours" IS "N hours after our last message to them".
+  followUpQuietHours Int?
+  /// Set to run this follow-up on each GUEST's own clock instead of sending
+  /// one batch: the job re-checks on a timer and messages each person once,
+  /// as soon as they individually cross followUpQuietHours. This value is when
+  /// to stop — without it the job would chase new arrivals forever.
+  followUpRollingUntil DateTime?
+  followUpOf       BroadcastJob?  @relation("BroadcastFollowUp", fields: [followUpOfJobId], references: [id])
+  followUps        BroadcastJob[] @relation("BroadcastFollowUp")
   /// WhatsAppNumber.id to send from — null falls back to the org default number.
   numberId         String?
   /// seconds between sends — default 3s ≈ 20/minute
@@ -776,6 +1398,7 @@ model BroadcastJob {
   messages         Message[]
 
   @@index([status])
+  @@index([scheduledAt])
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +1441,15 @@ model Call {
   transcriptEnglish  String?
   /// detected spoken language code (e.g. "te", "hi") or "mixed"
   transcriptLanguage String?
+  /// Transcription attempts so far, and when the last one started. A
+  /// telephony recording that will never decode must stop being re-queued:
+  /// without a cap the retry pass re-decodes it every tick forever and
+  /// starves every other call — see lib/ai/call-analysis-queue.ts.
+  transcriptAttempts  Int      @default(0)
+  transcriptAttemptAt DateTime?
+  /// Why there is no transcript ("call wasn't answered", "no speech was
+  /// recognised"), so the Calls tab can say so instead of showing a blank.
+  transcriptError    String?
   aiSummary     String?
   /// overall call quality 0–100
   aiScore       Int?
@@ -855,6 +1487,53 @@ enum AiDecisionKind {
   /// only model call in the inbound-question analysis (see
   /// lib/ai/inbound-analysis.ts); the grouping itself is deterministic.
   template_suggestion
+  /// Drafting a lead remark from what a rep captured — typed shorthand, a
+  /// photo of a handwritten note, a voice memo. The draft goes back to the
+  /// rep's remark box, never straight into the lead's history.
+  remark_draft
+  /// An admin's plain-English question turned into a read-only SQL query —
+  /// the only model call that composes its own database access, so the SQL it
+  /// ran is kept in `output` alongside the row count.
+  db_question
+}
+
+/// What one merge moved, so it can be undone.
+///
+/// Merging two cards for the same person re-points their messages, calls,
+/// notes, tasks and documents onto the surviving lead. That is the right
+/// outcome and a frightening one to perform blind — the last person who tried
+/// to tidy a duplicate by hand deleted the other card and took its WhatsApp
+/// history with it. Every row id that moved is written down here, so the move
+/// is reversible rather than merely careful.
+model LeadMerge {
+  id              String   @id @default(uuid())
+  /// The lead that survived, and the one folded into it (now soft-deleted).
+  targetEnquiryId String
+  sourceEnquiryId String
+  targetGuestId   String
+  sourceGuestId   String
+  /// The ids moved, per table, so an undo puts each row back where it was.
+  movedMessageIds  String[] @default([])
+  movedCallIds     String[] @default([])
+  movedNoteIds     String[] @default([])
+  movedTaskIds     String[] @default([])
+  movedDocumentIds String[] @default([])
+  movedActivityIds String[] @default([])
+  movedAiDecisionIds String[] @default([])
+  movedMembershipIds String[] @default([])
+  movedHealthProfileIds String[] @default([])
+  /// Guest fields copied onto the survivor (phone/email/…), with what the
+  /// source held, so an undo can hand them back.
+  guestFieldsMoved Json     @default("{}")
+  /// Set when the merge has been undone; the record is kept either way.
+  undoneAt        DateTime?
+  undoneBySub     String?
+  mergedBySub     String
+  mergedByName    String?
+  createdAt       DateTime @default(now())
+
+  @@index([targetEnquiryId])
+  @@index([sourceEnquiryId])
 }
 
 /// Append-only. No DELETE for the app role, same posture as Activity.

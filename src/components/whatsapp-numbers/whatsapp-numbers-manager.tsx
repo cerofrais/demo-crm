@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   MessageCircle, Plus, Loader2, Pencil, Trash2, RefreshCw,
   Star, ShieldAlert, QrCode, FileText,
+  Clock,
 } from "lucide-react";
 import { Card, Badge, Button, Input, Dialog } from "@/components/ui";
 import { api } from "@/lib/client";
@@ -497,6 +498,9 @@ function PairModal({
   const [state, setState] = useState<string>("connecting");
   const [phoneNumber, setPhoneNumber] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Seconds until this number may ask WhatsApp for another pairing code. The
+  // server decides this; the dialog only counts it down and stops asking.
+  const [cooldown, setCooldown] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -504,11 +508,15 @@ function PairModal({
 
     async function poll() {
       try {
-        const res = await api.get<{ state: string; phoneNumber: string | null; qrCodeDataUrl: string | null }>(
-          `/api/admin/whatsapp/numbers/${number.id}/qr`,
-        );
+        const res = await api.get<{
+          state: string;
+          phoneNumber: string | null;
+          qrCodeDataUrl: string | null;
+          retryAfterSec?: number;
+        }>(`/api/admin/whatsapp/numbers/${number.id}/qr?pair=1`);
         if (cancelled) return;
         setState(res.state);
+        setCooldown(res.retryAfterSec ?? 0);
         if (res.qrCodeDataUrl) setQr(res.qrCodeDataUrl);
         if (res.state === "open") {
           setPhoneNumber(res.phoneNumber);
@@ -527,6 +535,15 @@ function PairModal({
     };
   }, [number.id]);
 
+  // While cooling down, tick locally rather than polling — asking the server
+  // is what makes WhatsApp issue a code, which is the thing being paused.
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    if (timerRef.current) clearInterval(timerRef.current);
+    const t = setInterval(() => setCooldown((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(t);
+  }, [cooldown > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <Dialog open onClose={onClose} title={`Connect ${number.label}`} className="md:max-w-sm">
       <div className="p-4 md:p-5">
@@ -544,7 +561,19 @@ function PairModal({
               Open WhatsApp on the phone for this number → Settings → Linked devices → Link a device, then scan.
             </p>
             <div className="mt-3 flex items-center justify-center rounded-md border border-border bg-secondary/40 p-4">
-              {qr ? (
+              {cooldown > 0 ? (
+                <div className="flex h-56 w-56 max-w-full flex-col items-center justify-center gap-2 px-3 text-center">
+                  <Clock className="h-6 w-6 text-amber-600" />
+                  <p className="text-sm font-medium text-foreground">
+                    Paused for {Math.floor(cooldown / 60)}:{String(cooldown % 60).padStart(2, "0")}
+                  </p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Three codes went unscanned. WhatsApp reads repeated pairing attempts as
+                    automated behaviour and can restrict the number, so this waits before asking
+                    for another. Have the phone ready before trying again.
+                  </p>
+                </div>
+              ) : qr ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img src={qr} alt="WhatsApp pairing QR code" className="h-56 w-56 max-w-full" />
               ) : (

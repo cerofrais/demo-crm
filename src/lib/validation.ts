@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { STAGE_IDS } from "./kanban";
 import { CRM_ROLES } from "./keycloak-roles";
+import { DOC_CATEGORIES } from "./rbac";
 
 // ---------------------------------------------------------------------------
 // Phone validation — international E.164 (accepts all countries, not just +91).
@@ -45,6 +46,9 @@ export const createEnquirySchema = z.object({
   phone: z.string().regex(PHONE_RE, PHONE_MSG),
   email: z.string().email().optional().or(z.literal("")).transform((v) => v || undefined),
   city: z.string().optional(),
+  /** Where the guest works and what they do — free text, both optional. */
+  businessName: z.string().optional(),
+  businessRole: z.string().optional(),
   gender: z.enum(["male", "female", "other"]).optional(),
   /** Approximate — derived from a self-reported "Age" form field, not a real
    *  birth date. Only ever used to backfill a guest that has none yet. */
@@ -72,6 +76,8 @@ export const createGuestSchema = z
     phone: z.string().regex(PHONE_RE, PHONE_MSG).optional().or(z.literal("")),
     email: z.string().email().optional().or(z.literal("")),
     city: z.string().optional(),
+    businessName: z.string().optional(),
+    businessRole: z.string().optional(),
     gender: z.enum(["male", "female", "other"]).optional(),
     dateOfBirth: z.string().optional(), // ISO date (yyyy-mm-dd)
   })
@@ -89,6 +95,8 @@ export const updateGuestSchema = z.object({
   phone: z.string().regex(PHONE_RE, PHONE_MSG).optional().or(z.literal("")),
   email: z.string().email().optional().or(z.literal("")),
   city: z.string().optional(),
+  businessName: z.string().optional(),
+  businessRole: z.string().optional(),
   gender: z.enum(["male", "female", "other"]).optional(),
   dateOfBirth: z.string().optional(), // ISO date (yyyy-mm-dd)
 });
@@ -105,6 +113,9 @@ export const addNoteSchema = z
     // A voice note or file already uploaded via upload-url/confirm — same
     // "Document scoped to this guest/enquiry" shape as Message attachments.
     attachmentDocumentId: z.string().uuid().optional(),
+    // "comment" is internal chatter: same box, same timeline, but left out of
+    // the Cresent report the client reads.
+    kind: z.enum(["remark", "comment"]).optional().default("remark"),
   })
   .refine((v) => v.body.trim().length > 0 || v.attachmentDocumentId, {
     message: "Note cannot be empty",
@@ -117,6 +128,31 @@ export const createTaskSchema = z.object({
   unit: z.enum(["hours", "days"]),
 });
 
+/**
+ * A field the lead drawer is allowed to CLEAR.
+ *
+ * Three states have to stay distinct here, and only two of them are obvious:
+ * `undefined` (key absent) means "leave it alone", which is what the PATCH
+ * route keys off to avoid wiping fields the form never showed; `null` and ""
+ * both mean "unset it". The empty string matters because a blanked <input>
+ * or <select> posts "", not null — the same trap preferredCheckIn documents
+ * below, where z.coerce.date() turned "" into an Invalid Date.
+ */
+function blankable<T extends z.ZodTypeAny>(inner: T) {
+  return (
+    z
+      .union([inner, z.literal("")])
+      .nullable()
+      .optional()
+      // Annotated because inference alone keeps "" in the OUTPUT type even
+      // though this transform has just removed it, and every consumer then
+      // has to widen its own field to `| ""` to compile.
+      .transform((v): z.infer<T> | null | undefined =>
+        v === "" ? null : (v as z.infer<T> | null | undefined),
+      )
+  );
+}
+
 export const updateEnquirySchema = z.object({
   fullName: z.string().min(1, "Name is required").optional(),
   phone: z
@@ -126,6 +162,9 @@ export const updateEnquirySchema = z.object({
     .or(z.literal("")),
   email: z.string().email().optional().or(z.literal("")),
   city: z.string().optional(),
+  // Set by a rep in the lead drawer — no intake form carries it. "" clears it,
+  // the same convention as occupancy.
+  gender: blankable(z.enum(["female", "male", "other"])),
   assignedToSub: z.string().nullable().optional(),
   assignedToName: z.string().nullable().optional(),
   quotedPriceINR: z.number().int().nullable().optional(),
@@ -140,6 +179,19 @@ export const updateEnquirySchema = z.object({
     .nullable()
     .optional()
     .transform((v) => (v === "" ? null : v)),
+  // Booking detail, filled in by a rep as a stay firms up. All independent:
+  // a lead may have a room category and no price. companionName is only
+  // collected for double occupancy, but is NOT validated against `occupancy`
+  // — the drawer clears it on the switch, and rejecting the pair here would
+  // fail an otherwise-fine PATCH that happens to send both keys.
+  occupancy: blankable(z.enum(["single", "double"])),
+  companionName: blankable(z.string().max(120)),
+  // A stay is days, not hours or years; the bounds keep a typo'd 2024 out of
+  // the total shown next to the price.
+  stayDays: blankable(z.number().int().min(1).max(365)),
+  roomCount: blankable(z.number().int().min(1).max(50)),
+  pricePerDayINR: blankable(z.number().int().min(0)),
+  roomCategory: blankable(z.enum(["premium", "executive"])),
 });
 
 export const tagMutationSchema = z
@@ -166,7 +218,7 @@ export const referralSchema = z.object({
   issuedToGuestId: z.string().uuid().optional(),
 });
 
-const DOC_CATEGORIES = ["medical", "consent", "operational", "marketing"] as const;
+// Derived, never re-listed — see the note on DOC_CATEGORIES in lib/rbac.
 
 export const uploadUrlSchema = z.object({
   filename: z.string().min(1),
@@ -188,6 +240,10 @@ export const confirmUploadSchema = z.object({
   sizeBytes: z.number().int().nonnegative(),
   guestId: z.string().uuid().optional(),
   enquiryId: z.string().uuid().optional(),
+  /// Deliberately overwrite the file of this name that is already here (the
+  /// id the confirm route handed back with DUPLICATE_FILENAME). Without it a
+  /// same-name upload is refused rather than quietly making a second copy.
+  replaceDocumentId: z.string().uuid().optional(),
 });
 
 // Public website webhook payload (spec §6.3)
@@ -233,6 +289,12 @@ export const updateStaffUserSchema = z.object({
   enabled: z.boolean().optional(),
   role: z.enum(CRM_ROLES).optional(),
   phone: z.string().regex(PHONE_RE, PHONE_MSG).optional().or(z.literal("")),
+  // WhatsApp lines this person may send from, E.164. An empty array removes
+  // the restriction. See lib/whatsapp-number-access.ts.
+  allowedWhatsAppNumbers: z
+    .array(z.string().regex(/^\+[1-9]\d{6,14}$/, "Use the full number, e.g. +918712623060"))
+    .max(20)
+    .optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -267,8 +329,23 @@ export const sendWhatsAppMessageSchema = z
     /** A Document already created via /api/files/upload-url + /confirm — sent
      * as the WhatsApp media, with `body` (if any) as the caption. */
     attachmentDocumentId: z.string().uuid().optional(),
+    /** An approved Meta template, sent as a template rather than as text —
+     *  the only way to open a conversation on a Cloud API number outside the
+     *  24-hour window. The body that reaches the guest is built server-side
+     *  from Meta's own copy of the template; only its name, language and the
+     *  placeholder values come from the page. */
+    template: z
+      .object({
+        name: z.string().min(1).max(512),
+        language: z.string().min(2).max(16),
+        params: z.array(z.string().max(1000)).max(20).default([]),
+        /** A Document (already uploaded via upload-url/confirm) to use as the
+         *  template's header image, for templates that require one. */
+        headerDocumentId: z.string().uuid().optional(),
+      })
+      .optional(),
   })
-  .refine((d) => (d.body && d.body.trim().length > 0) || d.attachmentDocumentId, {
+  .refine((d) => (d.body && d.body.trim().length > 0) || d.attachmentDocumentId || d.template, {
     message: "Message body or an attachment is required",
     path: ["body"],
   });

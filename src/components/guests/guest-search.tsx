@@ -11,6 +11,7 @@ import {
   Loader2,
   CheckCircle2,
   Trash2,
+  TagIcon,
   Upload,
   Download,
   MessageCircle,
@@ -28,13 +29,18 @@ import {
   ArrowUpDown,
 } from "lucide-react";
 import { Input, Card, Badge, Avatar, Button, Select, Textarea, Dialog, RichTextEditor } from "@/components/ui";
+import { templateNeedsHeaderImage, templateBodyParams } from "@/lib/whatsapp-template";
 import { api } from "@/lib/client";
+import { templateBodyToHtml } from "@/lib/message-templates";
 import { cn, formatINR } from "@/lib/utils";
 import { formatTag, sortTags, isSystemTag } from "@/lib/lead-tags";
+import { MAX_BULK_GUESTS, MAX_BROADCAST_RECIPIENTS } from "@/lib/limits";
 import { formatPackageForEmail } from "@/lib/packages";
 import { TemplatePicker } from "@/components/messaging/template-picker";
 import { PackagePicker } from "@/components/messaging/package-picker";
 import { AttachmentPicker, type AttachmentSelection } from "@/components/messaging/attachment-picker";
+import { TagMatchToggle } from "@/components/leads/tag-match-toggle";
+import type { TagMatch } from "@/lib/tag-match";
 
 interface Pkg {
   id: string;
@@ -52,6 +58,8 @@ interface GuestRow {
   phone: string;
   email: string | null;
   city: string | null;
+  businessName: string | null;
+  businessRole: string | null;
   gender: string | null;
   ageGroup: string | null;
   isReturning: boolean;
@@ -155,6 +163,7 @@ function BulkEmailDialog({
   const [bodyHtml, setBodyHtml] = useState("");
   const [packages, setPackages] = useState<Pkg[]>([]);
   const [packageId, setPackageId] = useState("");
+  const [replyTag, setReplyTag] = useState("");
   const [sending, setSending] = useState(false);
   const [attachment, setAttachment] = useState<AttachmentSelection | null>(null);
   const [attachNote, setAttachNote] = useState<string | null>(null);
@@ -235,6 +244,7 @@ function BulkEmailDialog({
           html: bodyHtml,
           attachmentDocumentId,
           packageId: packageId || undefined,
+          replyTag: replyTag.trim() || undefined,
         },
       );
       setResult(res);
@@ -296,7 +306,7 @@ function BulkEmailDialog({
                   channel="email"
                   onSelect={(t) => {
                     if (t.subject) setSubject(t.subject);
-                    setBodyHtml(t.body.replace(/\n/g, "<br>"));
+                    setBodyHtml(templateBodyToHtml(t.body));
                   }}
                 />
               </div>
@@ -342,6 +352,19 @@ function BulkEmailDialog({
                 )
               )}
               {attachNote && <p className="text-[11px] text-muted-foreground">{attachNote}</p>}
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-foreground">Reply tag (optional)</label>
+              <Input
+                value={replyTag}
+                onChange={(e) => setReplyTag(e.target.value)}
+                disabled={sending}
+                placeholder="e.g. independence-offer"
+              />
+              <p className="text-[11px] text-muted-foreground">
+                Applied to a guest&apos;s lead only if they <em>reply</em> to this
+                email — so you can filter for who actually responded. Left blank, replies aren&apos;t tagged.
+              </p>
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-foreground">Include package details (optional)</label>
@@ -572,6 +595,8 @@ function NewGuestDialog({
   const [phone, setPhone] = useState("");
   const [email, setEmail] = useState("");
   const [city, setCity] = useState("");
+  const [businessName, setBusinessName] = useState("");
+  const [businessRole, setBusinessRole] = useState("");
   const [gender, setGender] = useState("");
   const [dateOfBirth, setDateOfBirth] = useState("");
   const [saving, setSaving] = useState(false);
@@ -588,6 +613,8 @@ function NewGuestDialog({
         phone: phone.trim() || undefined,
         email: email.trim() || undefined,
         city: city.trim() || undefined,
+        businessName: businessName.trim() || undefined,
+        businessRole: businessRole.trim() || undefined,
         gender: gender || undefined,
         dateOfBirth: dateOfBirth || undefined,
       });
@@ -653,6 +680,16 @@ function NewGuestDialog({
             </div>
           </div>
           <p className="text-[11px] text-muted-foreground">At least one of phone or email is required.</p>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-foreground">Business name</label>
+              <Input value={businessName} onChange={(e) => setBusinessName(e.target.value)} disabled={saving} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-foreground">Role</label>
+              <Input value={businessRole} onChange={(e) => setBusinessRole(e.target.value)} disabled={saving} />
+            </div>
+          </div>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-foreground">City</label>
@@ -712,6 +749,8 @@ function EditGuestDialog({
   const [phone, setPhone] = useState(guest.phone ?? "");
   const [email, setEmail] = useState(guest.email ?? "");
   const [city, setCity] = useState(guest.city ?? "");
+  const [businessName, setBusinessName] = useState(guest.businessName ?? "");
+  const [businessRole, setBusinessRole] = useState(guest.businessRole ?? "");
   const [gender, setGender] = useState(guest.gender ?? "");
   const [dateOfBirth, setDateOfBirth] = useState("");
   const [loadingDob, setLoadingDob] = useState(true);
@@ -744,6 +783,8 @@ function EditGuestDialog({
         phone: phone.trim(),
         email: email.trim(),
         city: city.trim(),
+        businessName: businessName.trim(),
+        businessRole: businessRole.trim(),
         gender: gender || undefined,
         dateOfBirth: dateOfBirth || undefined,
       });
@@ -778,6 +819,16 @@ function EditGuestDialog({
           </div>
         </div>
         <p className="text-[11px] text-muted-foreground">At least one of phone or email is required.</p>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-foreground">Business name</label>
+            <Input value={businessName} onChange={(e) => setBusinessName(e.target.value)} disabled={saving} />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-foreground">Role</label>
+            <Input value={businessRole} onChange={(e) => setBusinessRole(e.target.value)} disabled={saving} />
+          </div>
+        </div>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-foreground">City</label>
@@ -824,6 +875,7 @@ function EditGuestDialog({
 interface BroadcastStatusDTO {
   id: string;
   status: "queued" | "running" | "completed" | "cancelled" | "failed";
+  templateName: string | null;
   totalCount: number;
   sentCount: number;
   failedCount: number;
@@ -851,29 +903,6 @@ interface WhatsAppTemplateOption {
    *  API rather than the Cloud API. Not a choice — routing follows the
    *  category — so it's shown, not offered. */
   viaMarketingApi?: boolean;
-}
-
-/** True when the template's HEADER requires media — the send fails outright
- *  without one (Meta rejects the whole message, see docs/17). */
-function templateNeedsHeaderImage(t: WhatsAppTemplateOption): boolean {
-  return t.components.some((c) => c.type === "HEADER" && c.format === "IMAGE");
-}
-
-/**
- * A template's BODY placeholders, in order of first appearance — either
- * positional ({{1}}, {{2}}, …) or named ({{customer_name}}, …). Meta never
- * mixes the two within one template, so one non-numeric token is enough to
- * treat the whole template as named — matters because named params need a
- * `parameter_name` sent alongside each value, positional ones don't (see
- * broadcast.ts / whatsapp-cloud-api.ts).
- */
-function templateBodyParams(t: WhatsAppTemplateOption): { names: string[]; isNamed: boolean } {
-  const body = t.components.find((c) => c.type === "BODY")?.text ?? "";
-  const tokens = [...body.matchAll(/\{\{([a-zA-Z0-9_]+)\}\}/g)].map((m) => m[1]);
-  const unique = Array.from(new Set(tokens));
-  const isNamed = unique.some((tok) => !/^\d+$/.test(tok));
-  const names = isNamed ? unique : unique.sort((a, b) => Number(a) - Number(b));
-  return { names, isNamed };
 }
 
 function BroadcastProgress({ job, onCancel, cancelling }: {
@@ -907,14 +936,14 @@ function BroadcastProgress({ job, onCancel, cancelling }: {
 function BroadcastDialog({
   guests,
   usingSelection,
-  activeBroadcast,
+  activeBroadcasts,
   onClose,
   onStarted,
   onCancelled,
 }: {
   guests: GuestRow[];
   usingSelection: boolean;
-  activeBroadcast: BroadcastStatusDTO | null;
+  activeBroadcasts: BroadcastStatusDTO[];
   onClose: () => void;
   onStarted: () => void;
   onCancelled: () => void;
@@ -922,12 +951,15 @@ function BroadcastDialog({
   const withPhone = guests.filter((g) => g.phone);
   const [message, setMessage] = useState("");
   const [delaySec, setDelaySec] = useState("3");
+  const [replyTag, setReplyTag] = useState("");
   const [numbers, setNumbers] = useState<NumberOption[]>([]);
   const [numberId, setNumberId] = useState("");
   const [image, setImage] = useState<File | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const [starting, setStarting] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
+  // Holds the id being cancelled, not a bare flag — several broadcasts can be
+  // running, and only the one whose button was pressed should show a spinner.
+  const [cancelling, setCancelling] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [templates, setTemplates] = useState<WhatsAppTemplateOption[] | null>(null);
@@ -1010,6 +1042,7 @@ function BroadcastDialog({
         delaySec: Math.max(1, parseInt(delaySec, 10) || 3),
         numberId: numberId || undefined,
         imageDocumentId,
+        replyTag: replyTag.trim() || undefined,
         template: isCloudApi && selectedTemplate
           ? {
               name: selectedTemplate.name,
@@ -1029,23 +1062,38 @@ function BroadcastDialog({
     }
   }
 
-  async function cancel() {
-    if (!activeBroadcast) return;
-    setCancelling(true);
+  async function cancel(id: string) {
+    setCancelling(id);
     try {
-      await api.post(`/api/guests/broadcast/${activeBroadcast.id}/cancel`, {});
+      await api.post(`/api/guests/broadcast/${id}/cancel`, {});
       onCancelled();
     } finally {
-      setCancelling(false);
+      setCancelling(null);
     }
   }
 
   return (
     <Dialog open onClose={onClose} title="WhatsApp Broadcast" className="md:max-w-lg">
-      {activeBroadcast ? (
-        <BroadcastProgress job={activeBroadcast} onCancel={cancel} cancelling={cancelling} />
-      ) : (
-        <div className="space-y-4 px-4 py-5 md:px-6">
+      {activeBroadcasts.length > 0 && (
+        <div className="space-y-2 border-b border-border bg-secondary/40 px-4 py-3 md:px-6">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            {activeBroadcasts.length} broadcast{activeBroadcasts.length === 1 ? "" : "s"} running
+          </p>
+          {activeBroadcasts.map((job) => (
+            <BroadcastProgress
+              key={job.id}
+              job={job}
+              onCancel={() => cancel(job.id)}
+              cancelling={cancelling === job.id}
+            />
+          ))}
+          <p className="text-[11px] text-muted-foreground">
+            These keep sending in the background — you can start another below without
+            waiting. Full history is on the Broadcast Status page.
+          </p>
+        </div>
+      )}
+      <div className="space-y-4 px-4 py-5 md:px-6">
           <p className="text-xs text-muted-foreground">
             Sending to {usingSelection ? "your selected" : "all"} {guests.length} guest
             {guests.length !== 1 ? "s" : ""}{usingSelection ? "" : " in the current view"} —{" "}
@@ -1086,6 +1134,20 @@ function BroadcastDialog({
               </div>
             </div>
           </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-foreground">Reply tag (optional)</label>
+              <Input
+                value={replyTag}
+                onChange={(e) => setReplyTag(e.target.value)}
+                disabled={starting}
+                placeholder="e.g. independence-offer"
+              />
+              <p className="text-[11px] text-muted-foreground">
+                Applied to a guest&apos;s lead only if they <em>reply</em> to this
+                broadcast — so you can filter for who actually responded. Left blank, replies aren&apos;t tagged.
+              </p>
+            </div>
 
           {isCloudApi ? (
             <div className="space-y-1.5">
@@ -1240,7 +1302,6 @@ function BroadcastDialog({
             </Button>
           </div>
         </div>
-      )}
     </Dialog>
   );
 }
@@ -1506,6 +1567,124 @@ function BlockGuestDialog({
 // ---------------------------------------------------------------------------
 // Bulk delete confirmation dialog
 // ---------------------------------------------------------------------------
+/**
+ * Takes one or more tags off the selected guests. The natural pairing with
+ * the tag filter: narrow the directory to everyone carrying a tag, select
+ * them, then strip it.
+ *
+ * Offers only tags the SELECTED guests actually carry, so you can't remove
+ * something that would change nothing — and shows how many of them hold each
+ * one, since "remove from 300 guests" reads very differently when only 4 of
+ * them have it.
+ */
+function RemoveTagDialog({
+  guests,
+  suggested,
+  onCancel,
+  onRemoved,
+}: {
+  guests: GuestRow[];
+  suggested: string[];
+  onCancel: () => void;
+  onRemoved: (removedTags: string[]) => void;
+}) {
+  const counts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const g of guests) {
+      for (const t of g.tags) {
+        // System tags are recomputed on the next write, so removing one is
+        // undone by the CRM itself — the API refuses them for the same reason.
+        if (!isSystemTag(t)) m.set(t, (m.get(t) ?? 0) + 1);
+      }
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  }, [guests]);
+
+  const [picked, setPicked] = useState<string[]>(() =>
+    suggested.filter((t) => !isSystemTag(t) && guests.some((g) => g.tags.includes(t))),
+  );
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // How many of the selected guests are actually touched — the honest number
+  // to put on the button.
+  const affected = guests.filter((g) => g.tags.some((t) => picked.includes(t))).length;
+
+  async function confirm() {
+    if (!picked.length) return;
+    setWorking(true);
+    setError(null);
+    try {
+      const res = await api.post<{ updated: number }>("/api/guests/bulk-remove-tag", {
+        guestIds: guests.map((g) => g.id),
+        tags: picked,
+      });
+      if (res.updated === 0) setError("Nothing changed — none of the selected guests carried those tags.");
+      else onRemoved(picked);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't remove the tag");
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  return (
+    <Dialog open onClose={onCancel} title="Remove tags" className="md:max-w-md">
+      <div className="p-4 md:p-5">
+        {counts.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            None of the {guests.length} selected guest{guests.length !== 1 ? "s" : ""} carry a removable
+            tag. Source, age and campaign tags are worked out automatically and can&apos;t be taken off.
+          </p>
+        ) : (
+          <>
+            <p className="text-sm text-muted-foreground">
+              Pick the tags to take off the {guests.length} selected guest
+              {guests.length !== 1 ? "s" : ""}. Their other tags are left alone.
+            </p>
+            <div className="mt-3 flex flex-wrap gap-1.5">
+              {counts.map(([tag, n]) => {
+                const active = picked.includes(tag);
+                return (
+                  <button
+                    key={tag}
+                    onClick={() =>
+                      setPicked((prev) => (active ? prev.filter((t) => t !== tag) : [...prev, tag]))
+                    }
+                    className={cn(
+                      "rounded-full px-2.5 py-0.5 text-xs font-medium transition-all",
+                      active
+                        ? "bg-destructive text-white ring-2 ring-destructive/30"
+                        : "bg-secondary text-secondary-foreground hover:opacity-80",
+                    )}
+                  >
+                    {formatTag(tag).label} · {n}
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        )}
+        {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+        <div className="mt-4 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          <Button variant="outline" onClick={onCancel} disabled={working} className="w-full sm:w-auto">
+            Cancel
+          </Button>
+          <Button
+            variant="destructive"
+            onClick={confirm}
+            disabled={working || picked.length === 0}
+            className="w-full sm:w-auto"
+          >
+            {working && <Loader2 className="h-4 w-4 animate-spin" />}
+            Remove from {affected} guest{affected !== 1 ? "s" : ""}
+          </Button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
 function BulkDeleteGuestsDialog({
   guests,
   activeTags,
@@ -1660,18 +1839,23 @@ export function GuestSearch({
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [gender, setGender] = useState("");
   const [returning, setReturning] = useState("");
+  const [sort, setSort] = useState("recent");
   const [rows, setRows] = useState<GuestRow[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [activeTags, setActiveTags] = useState<string[]>([]);
+  // "All" is this page's long-standing behaviour — see the guests route.
+  const [tagMatch, setTagMatch] = useState<TagMatch>("all");
+  const [untagged, setUntagged] = useState(false);
   const [showBulkEmail, setShowBulkEmail] = useState(false);
   const [showBulkImport, setShowBulkImport] = useState(false);
   const [showNewGuest, setShowNewGuest] = useState(false);
   const [showBroadcast, setShowBroadcast] = useState(false);
-  const [activeBroadcast, setActiveBroadcast] = useState<BroadcastStatusDTO | null>(null);
+  const [activeBroadcasts, setActiveBroadcasts] = useState<BroadcastStatusDTO[]>([]);
   const [deleteTarget, setDeleteTarget] = useState<GuestRow | null>(null);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
+  const [showRemoveTag, setShowRemoveTag] = useState(false);
   const [blockTarget, setBlockTarget] = useState<GuestRow | null>(null);
   const [blockBusyId, setBlockBusyId] = useState<string | null>(null);
   const [editTarget, setEditTarget] = useState<GuestRow | null>(null);
@@ -1683,6 +1867,7 @@ export function GuestSearch({
   const [tagVocab, setTagVocab] = useState<string[]>([]);
   const [tagOptions, setTagOptions] = useState<string[]>([]);
   const [leadNotice, setLeadNotice] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
   const debounce = useRef<ReturnType<typeof setTimeout>>();
   const router = useRouter();
 
@@ -1783,9 +1968,16 @@ export function GuestSearch({
     if (q) params.set("q", q);
     if (gender) params.set("gender", gender);
     if (returning) params.set("returning", returning);
-    if (activeTags.length) params.set("tags", activeTags.join(","));
+    if (untagged) params.set("untagged", "true");
+    else if (activeTags.length) {
+      params.set("tags", activeTags.join(","));
+      params.set("tagMatch", tagMatch);
+    }
+    // Sent from here rather than only on the first page, so "load more" and
+    // select-all-matching stay in the same order as what's already on screen.
+    if (sort !== "recent") params.set("sort", sort);
     return params;
-  }, [q, gender, returning, activeTags]);
+  }, [q, gender, returning, activeTags, tagMatch, sort, untagged]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1819,13 +2011,14 @@ export function GuestSearch({
 
   // Selects every guest matching the current search/filters — not just
   // what's loaded — so a broadcast can target more than the 200 (or however
-  // many) rows currently on screen. Capped at 5000, matching the broadcast
-  // API's own recipient limit.
+  // many) rows currently on screen. Capped at MAX_BULK_GUESTS; the broadcast
+  // API caps recipients under its own constant, which is currently the same
+  // number but tuned for a different reason (see lib/limits.ts).
   async function selectAllMatching() {
     setSelectingAll(true);
     try {
       const params = filterParams();
-      params.set("take", "5000");
+      params.set("take", String(MAX_BULK_GUESTS));
       const data = await api.get<{ items: GuestRow[]; total: number }>(`/api/guests?${params}`);
       setSelected(new Map(data.items.map((g) => [g.id, g])));
     } finally {
@@ -1836,7 +2029,7 @@ export function GuestSearch({
   const pollBroadcast = useCallback(async () => {
     if (!canBroadcast) return;
     try {
-      setActiveBroadcast(await api.get<BroadcastStatusDTO | null>("/api/guests/broadcast/status"));
+      setActiveBroadcasts(await api.get<BroadcastStatusDTO[]>("/api/guests/broadcast/status"));
     } catch {
       // transient — next poll will retry
     }
@@ -1845,12 +2038,13 @@ export function GuestSearch({
   useEffect(() => {
     if (!canBroadcast) return;
     pollBroadcast();
-    const isActive = activeBroadcast && (activeBroadcast.status === "queued" || activeBroadcast.status === "running");
-    const interval = setInterval(pollBroadcast, isActive ? 3000 : 15000);
+    const interval = setInterval(pollBroadcast, activeBroadcasts.length ? 3000 : 15000);
     return () => clearInterval(interval);
-  }, [canBroadcast, pollBroadcast, activeBroadcast?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [canBroadcast, pollBroadcast, activeBroadcasts.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function toggleTag(tag: string) {
+    // Picking a tag leaves the untagged view — the two can't both hold.
+    setUntagged(false);
     setActiveTags((prev) =>
       prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag],
     );
@@ -1879,6 +2073,37 @@ export function GuestSearch({
   // nothing picked, "everyone currently in view" is the target — unchanged
   // from before this existed.
   const targetGuests = selected.size > 0 ? Array.from(selected.values()) : visible;
+
+  /**
+   * Download the chosen guests as a CSV.
+   *
+   * The ids go to the server and the file comes back from there: the rows on
+   * screen carry what the list needs to draw, while an export wants what it
+   * leaves out — when they first came in, when they were last touched, their
+   * consent, the stage and owner of their newest lead.
+   */
+  async function exportCsv() {
+    if (!targetGuests.length || exporting) return;
+    setExporting(true);
+    try {
+      const res = await fetch("/api/guests/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ guestIds: targetGuests.map((g) => g.id) }),
+      });
+      if (!res.ok) throw new Error(`Export failed (${res.status})`);
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `guests-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setLeadNotice(err instanceof Error ? err.message : "Couldn't export those guests.");
+    } finally {
+      setExporting(false);
+    }
+  }
   const emailCount = targetGuests.filter((g) => g.email).length;
   const allVisibleSelected = visible.length > 0 && visible.every((g) => selected.has(g.id));
 
@@ -1928,6 +2153,11 @@ export function GuestSearch({
             <option value="true">Returning only</option>
           </Select>
 
+          <Select value={sort} onChange={(e) => setSort(e.target.value)} className="w-40">
+            <option value="recent">Recently updated</option>
+            <option value="name">Name (A–Z)</option>
+          </Select>
+
           {/* View toggle — same shape as the Leads page's Pipeline/List switch. */}
           <div className="flex rounded-lg border border-border bg-secondary p-0.5">
             <button
@@ -1968,7 +2198,7 @@ export function GuestSearch({
               ) : (
                 <>{total} guest{total !== 1 ? "s" : ""}</>
               )}
-              {activeTags.length > 0 && " (tag filtered)"}
+              {untagged ? " (no tags)" : activeTags.length > 0 ? " (tag filtered)" : ""}
               {rows.length < total && (
                 <>
                   <button
@@ -1982,9 +2212,13 @@ export function GuestSearch({
                     onClick={selectAllMatching}
                     disabled={selectingAll}
                     className="ml-1.5 font-medium text-brand-700 underline-offset-2 hover:underline disabled:opacity-60"
-                    title={total > 5000 ? "Broadcasts cap at 5000 recipients" : undefined}
+                    title={
+                      total > MAX_BULK_GUESTS
+                        ? `Selection caps at ${MAX_BULK_GUESTS}`
+                        : undefined
+                    }
                   >
-                    {selectingAll ? "Selecting…" : `Select all ${Math.min(total, 5000)} matching`}
+                    {selectingAll ? "Selecting…" : `Select all ${Math.min(total, MAX_BULK_GUESTS)} matching`}
                   </button>
                 </>
               )}
@@ -1995,6 +2229,15 @@ export function GuestSearch({
                 <button onClick={clearSelection} className="underline-offset-2 hover:underline">
                   Clear
                 </button>
+                {canEditTags && (
+                  <button
+                    onClick={() => setShowRemoveTag(true)}
+                    title={`Remove a tag from ${selected.size} selected guest${selected.size !== 1 ? "s" : ""}`}
+                    className="rounded-md p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+                  >
+                    <TagIcon className="h-3.5 w-3.5" />
+                  </button>
+                )}
                 {canDelete && (
                   <button
                     onClick={() => setShowBulkDelete(true)}
@@ -2032,6 +2275,23 @@ export function GuestSearch({
             </Button>
           )}
 
+          {/* Exports the selection, or everything in view when nothing is
+              picked — the same rule the bulk actions beside it follow. */}
+          <Button
+            variant="outline"
+            onClick={exportCsv}
+            disabled={exporting || targetGuests.length === 0}
+            title={`Download ${targetGuests.length} guest${targetGuests.length === 1 ? "" : "s"} as a CSV`}
+          >
+            {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+            Export CSV
+            {targetGuests.length > 0 && (
+              <span className="ml-1 rounded-full bg-brand-100 px-1.5 py-0.5 text-[10px] font-semibold text-brand-700">
+                {targetGuests.length}
+              </span>
+            )}
+          </Button>
+
           {canBulkImport && (
             <Button variant="outline" onClick={() => setShowBulkImport(true)}>
               <Upload className="h-4 w-4" />
@@ -2043,13 +2303,15 @@ export function GuestSearch({
             <Button
               variant="outline"
               onClick={() => setShowBroadcast(true)}
-              className={cn(activeBroadcast && "border-brand-300 bg-brand-50 text-brand-700")}
+              className={cn(activeBroadcasts.length > 0 && "border-brand-300 bg-brand-50 text-brand-700")}
             >
               <MessageCircle className="h-4 w-4" />
-              {activeBroadcast ? (
+              {activeBroadcasts.length > 0 ? (
                 <>
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  {activeBroadcast.cursor}/{activeBroadcast.totalCount}
+                  {activeBroadcasts.reduce((n, j) => n + j.cursor, 0)}/
+                  {activeBroadcasts.reduce((n, j) => n + j.totalCount, 0)}
+                  {activeBroadcasts.length > 1 && ` · ${activeBroadcasts.length} jobs`}
                 </>
               ) : (
                 "WhatsApp Broadcast"
@@ -2065,6 +2327,18 @@ export function GuestSearch({
           <span className="mr-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
             Tags
           </span>
+          <button
+            onClick={() => { setUntagged((v) => !v); setActiveTags([]); }}
+            title="Guests carrying no tags at all"
+            className={cn(
+              "rounded-full px-2.5 py-0.5 text-xs font-medium transition-all",
+              untagged
+                ? "bg-brand-700 text-white ring-2 ring-brand-300"
+                : "bg-secondary text-secondary-foreground hover:opacity-80",
+            )}
+          >
+            No tags
+          </button>
           {availableTags.map((t) => {
             const f = formatTag(t);
             const active = activeTags.includes(t);
@@ -2083,12 +2357,15 @@ export function GuestSearch({
               </button>
             );
           })}
-          {activeTags.length > 0 && (
+          {activeTags.length >= 2 && (
+            <TagMatchToggle value={tagMatch} onChange={setTagMatch} className="ml-1 border-l border-border pl-2" />
+          )}
+          {(activeTags.length > 0 || untagged) && (
             <button
-              onClick={() => setActiveTags([])}
+              onClick={() => { setActiveTags([]); setUntagged(false); }}
               className="ml-1 text-xs font-medium text-muted-foreground underline-offset-2 hover:underline"
             >
-              Clear ({activeTags.length})
+              Clear{activeTags.length > 0 ? ` (${activeTags.length})` : ""}
             </button>
           )}
         </div>
@@ -2321,6 +2598,11 @@ export function GuestSearch({
                     {g.email && (
                       <div className="truncate text-xs text-muted-foreground">{g.email}</div>
                     )}
+                    {(g.businessRole || g.businessName) && (
+                      <div className="truncate text-xs text-muted-foreground">
+                        {[g.businessRole, g.businessName].filter(Boolean).join(" · ")}
+                      </div>
+                    )}
                     <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
                       {g.city && <span>{g.city}</span>}
                       {g.ageGroup && g.ageGroup !== "—" && <span>· {g.ageGroup}</span>}
@@ -2383,7 +2665,7 @@ export function GuestSearch({
         <BroadcastDialog
           guests={targetGuests}
           usingSelection={selected.size > 0}
-          activeBroadcast={activeBroadcast}
+          activeBroadcasts={activeBroadcasts}
           onClose={() => setShowBroadcast(false)}
           onStarted={() => { setShowBroadcast(false); pollBroadcast(); }}
           onCancelled={() => { setShowBroadcast(false); pollBroadcast(); }}
@@ -2397,6 +2679,26 @@ export function GuestSearch({
           onDeleted={(id) => {
             setRows((prev) => prev.filter((r) => r.id !== id));
             setDeleteTarget(null);
+          }}
+        />
+      )}
+
+      {showRemoveTag && (
+        <RemoveTagDialog
+          guests={targetGuests}
+          suggested={activeTags}
+          onCancel={() => setShowRemoveTag(false)}
+          onRemoved={(removed) => {
+            const gone = new Set(removed);
+            setRows((prev) =>
+              prev.map((r) =>
+                selected.has(r.id) ? { ...r, tags: r.tags.filter((t) => !gone.has(t)) } : r,
+              ),
+            );
+            setShowRemoveTag(false);
+            // The tag chips and any active tag filter are now stale — a
+            // guest just lost the tag the list may be filtered by.
+            load();
           }}
         />
       )}

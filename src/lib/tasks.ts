@@ -242,3 +242,125 @@ export async function createDoctorReviewTask(
     },
   });
 }
+
+export const PAYMENT_PENDING_TITLE_PREFIX = "Chase payment: ";
+
+/**
+ * 08:00 IST, today if it is still to come and tomorrow otherwise.
+ *
+ * IST is UTC+5:30 with no daylight saving, so 08:00 IST is 02:30 UTC on the
+ * same calendar day — computed directly rather than through a local-time
+ * constructor, which would read the SERVER's timezone and put the reminder at
+ * 08:00 UTC (13:30 IST, well past the morning it is meant for).
+ */
+export function nextEightAmIst(now: Date = new Date()): Date {
+  const target = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 2, 30, 0, 0),
+  );
+  if (target.getTime() <= now.getTime()) target.setUTCDate(target.getUTCDate() + 1);
+  return target;
+}
+
+/**
+ * The standing chase on a lead sitting in Payment Pending.
+ *
+ * One open task per lead, owned by whoever owns the lead, due at 08:00 IST.
+ * It is not a cadence and does not repeat: it stays open — and sorts to the
+ * top of the Tasks list — until the lead leaves the stage, at which point
+ * closePaymentPendingTasks resolves it. The point is that a lead waiting on
+ * money is visible every morning without anybody scheduling anything.
+ *
+ * Idempotent, like the other system tasks: re-entering the stage while one is
+ * already open is a no-op rather than a second chase.
+ *
+ * An unassigned lead gets an unassigned task, which is how it surfaces in
+ * Tasks -> All staff for a manager to pick up, rather than being invented an
+ * owner it does not have.
+ */
+export async function createPaymentPendingTask(
+  enquiryId: string,
+  guestName: string,
+  ownerSub: string | null,
+  createdBySub: string,
+): Promise<void> {
+  const existing = await prisma.task.count({
+    where: { enquiryId, status: "open", kind: "payment_pending" },
+  });
+  if (existing > 0) return;
+
+  await prisma.task.create({
+    data: {
+      enquiryId,
+      title: `${PAYMENT_PENDING_TITLE_PREFIX}${guestName}`,
+      kind: "payment_pending",
+      dueAt: nextEightAmIst(),
+      assignedToSub: ownerSub,
+      createdBy: createdBySub,
+    },
+  });
+}
+
+/**
+ * Close the chase when the lead leaves Payment Pending — whether it moved
+ * forward to Booking Confirmed or backwards. Marked done rather than deleted
+ * so the lead's timeline keeps the task_completed entry PATCH would have
+ * written by hand.
+ *
+ * Returns how many were closed, so the caller can skip writing an activity
+ * row when there was nothing to close.
+ */
+export async function closePaymentPendingTasks(enquiryId: string): Promise<number> {
+  const { count } = await prisma.task.updateMany({
+    where: { enquiryId, status: "open", kind: "payment_pending" },
+    data: { status: "done" },
+  });
+  return count;
+}
+
+/** How many of a lead's open tasks travel with it for the card's hover list. */
+export const OPEN_TASK_PREVIEW = 5;
+
+export interface OpenTasksSummary {
+  /** Every open task on the lead, not just the previewed ones. */
+  count: number;
+  /** The soonest-due few, for the card's hover list. */
+  items: { id: string; title: string; dueAt: string | null; kind: string }[];
+}
+
+/**
+ * Open tasks for many leads in one query — the board shows this on every
+ * card, so it is batched the same way RNR progress and the WhatsApp window
+ * are. Soonest due first; a task with no due date sorts last.
+ */
+export async function getOpenTasksBatch(enquiryIds: string[]): Promise<Map<string, OpenTasksSummary>> {
+  const out = new Map<string, OpenTasksSummary>();
+  if (!enquiryIds.length) return out;
+  const rows = await prisma.task.findMany({
+    where: { enquiryId: { in: enquiryIds }, status: "open" },
+    orderBy: [{ dueAt: "asc" }, { createdAt: "asc" }],
+    select: { id: true, enquiryId: true, title: true, dueAt: true, kind: true },
+  });
+  for (const r of rows) {
+    const summary = out.get(r.enquiryId) ?? { count: 0, items: [] };
+    summary.count += 1;
+    if (summary.items.length < OPEN_TASK_PREVIEW) {
+      summary.items.push({ id: r.id, title: r.title, dueAt: r.dueAt?.toISOString() ?? null, kind: r.kind });
+    }
+    out.set(r.enquiryId, summary);
+  }
+  return out;
+}
+
+/**
+ * Attaches the open-task summary to one already-built lead.
+ *
+ * Needed on every route that hands a single lead back to the board, not just
+ * the board list: the board replaces a card with whatever a save returns, so a
+ * lead returned without this would lose its task icon after any edit.
+ */
+export async function withOpenTasks<T extends { id: string }>(
+  dto: T,
+): Promise<T & { openTasks: OpenTasksSummary }> {
+  const byId = await getOpenTasksBatch([dto.id]);
+  return { ...dto, openTasks: byId.get(dto.id) ?? { count: 0, items: [] } };
+}

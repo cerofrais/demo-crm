@@ -24,6 +24,7 @@ import { MessageBody } from "@/components/messaging/message-body";
 import { cn, formatIST } from "@/lib/utils";
 import { formatTag, sortTags } from "@/lib/lead-tags";
 import { TagFilterBar } from "@/components/leads/tag-filter-bar";
+import type { TagMatch } from "@/lib/tag-match";
 import type { DeletedLeadDetailDTO, DeletedLeadListItemDTO } from "@/lib/deleted-leads";
 
 function when(iso: string): string {
@@ -346,6 +347,7 @@ export function DeletedLeadsExplorer() {
   const [q, setQ] = useState("");
   const [source, setSource] = useState("");
   const [activeTags, setActiveTags] = useState<string[]>([]);
+  const [tagMatch, setTagMatch] = useState<TagMatch>("any");
   // The full tag universe across ALL deleted leads, not just the current
   // page — the list is cursor-paginated, so deriving this from `items` (the
   // way the live board derives it from its one already-loaded page) would
@@ -403,7 +405,10 @@ export function DeletedLeadsExplorer() {
       const params = new URLSearchParams();
       if (q.trim()) params.set("q", q.trim());
       if (source) params.set("source", source);
-      if (activeTags.length) params.set("tags", activeTags.join(","));
+      if (activeTags.length) {
+        params.set("tags", activeTags.join(","));
+        params.set("tagMatch", tagMatch);
+      }
       if (cursor) params.set("cursor", cursor);
       try {
         const res = await api.get<{
@@ -421,7 +426,7 @@ export function DeletedLeadsExplorer() {
         setLoading(false);
       }
     },
-    [q, source, activeTags],
+    [q, source, activeTags, tagMatch],
   );
 
   useEffect(() => {
@@ -531,6 +536,8 @@ export function DeletedLeadsExplorer() {
         activeTags={activeTags}
         onToggle={toggleTag}
         onClear={() => setActiveTags([])}
+        match={tagMatch}
+        onMatchChange={setTagMatch}
       />
 
       {error && <Card className="border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">{error}</Card>}

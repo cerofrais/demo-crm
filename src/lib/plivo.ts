@@ -3,6 +3,7 @@
  * No npm package needed; Plivo's API is plain HTTP/JSON + XML responses.
  */
 import crypto from "node:crypto";
+import { logger } from "./logger";
 
 const AUTH_ID = process.env.PLIVO_AUTH_ID ?? "";
 const AUTH_TOKEN = process.env.PLIVO_AUTH_TOKEN ?? "";
@@ -27,27 +28,63 @@ export interface PlivoCallCreateResult {
 export async function createCall(opts: {
   to: string;               // rep's E.164 phone
   answerUrl: string;
+  /** Plivo fetches this instead when answerUrl can't be reached — the same
+   *  route on our other tunnel. Omitted when only one origin is configured. */
+  fallbackUrl?: string;
   hangupUrl: string;
   customData: string;       // JSON blob echoed back in webhooks
   ringTimeout?: number;
 }): Promise<PlivoCallCreateResult> {
-  const res = await fetch(`${BASE}/Account/${AUTH_ID}/Call/`, {
-    method: "POST",
-    headers: {
-      Authorization: basicAuth(),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from: PLIVO_NUMBER,
-      to: opts.to,
-      answer_url: opts.answerUrl,
-      answer_method: "POST",
-      hangup_url: opts.hangupUrl,
-      hangup_method: "POST",
-      ring_timeout: opts.ringTimeout ?? 30,
-      custom_data: opts.customData,
-    }),
+  const body = (fallbackUrl?: string) => ({
+    from: PLIVO_NUMBER,
+    to: opts.to,
+    answer_url: opts.answerUrl,
+    answer_method: "POST",
+    ...(fallbackUrl
+      ? { fallback_url: fallbackUrl, fallback_method: "POST" }
+      : {}),
+    hangup_url: opts.hangupUrl,
+    hangup_method: "POST",
+    ring_timeout: opts.ringTimeout ?? 30,
+    custom_data: opts.customData,
   });
+
+  const post = (fallbackUrl?: string) =>
+    fetch(`${BASE}/Account/${AUTH_ID}/Call/`, {
+      method: "POST",
+      headers: {
+        Authorization: basicAuth(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body(fallbackUrl)),
+    });
+
+  let res = await post(opts.fallbackUrl);
+
+  // A fallback origin Plivo won't accept must not take the primary down with
+  // it. Plivo validates fallback_url when the call is created — it resolves
+  // the host, so an origin that isn't in PUBLIC DNS is rejected outright with
+  // 400 "fallback_url parameter is not valid" and NO call is placed. That is
+  // how a Tailscale Funnel origin (`*.ts.net` resolves inside the tailnet
+  // only) failed 100% of outbound calls on 30 Aug while the primary
+  // Cloudflare tunnel was healthy the whole time. Note the port is not the
+  // issue — Plivo accepts a non-standard one; unresolvable hostnames are.
+  // Drop the fallback and place the call on the primary alone rather than
+  // failing: degraded failover beats no calling at all.
+  if (!res.ok && res.status === 400 && opts.fallbackUrl) {
+    const text = await res.text();
+    if (/fallback_url/i.test(text)) {
+      logger.error(
+        { fallbackUrl: opts.fallbackUrl, plivoError: text },
+        "plivo rejected fallback_url — retrying on the primary origin alone. " +
+          "Fix or clear PLIVO_WEBHOOK_FALLBACK_BASE_URL: it must be publicly resolvable.",
+      );
+      res = await post(undefined);
+    } else {
+      throw new Error(`Plivo createCall 400: ${text}`);
+    }
+  }
+
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`Plivo createCall ${res.status}: ${text}`);
@@ -192,17 +229,29 @@ export function outboundRepConferenceXml(
   recordingCallbackUrl: string,
   waitSoundUrl: string,
 ): Response {
-  // recordSession: a bare <Record> is a BLOCKING voicemail-style recorder —
-  // it records only this leg's mic, stops after 15s of silence (or 60s max),
-  // and never captures the conference audio. Found 2026-07-23: every outbound
-  // "recording" was a few seconds of the rep talking to nobody (or their
-  // carrier voicemail greeting) and the real conversation was never recorded.
-  // recordSession records the whole call in the background until hangup;
-  // maxLength still applies to session recordings (default 60s), so raise it.
+  // Recording lives on the <Conference>, not on this leg.
+  //
+  // Two earlier attempts both recorded the wrong thing. A bare <Record> is a
+  // BLOCKING voicemail-style recorder — this leg's mic only, stopping after
+  // 15s of silence (2026-07-23). Switching it to recordSession="true" fixed
+  // the blocking and the 60s cap but not the fundamental problem: a session
+  // recording captures THIS LEG, and the conversation happens inside the
+  // conference room. Measured on a real 149s call (2026-09-03): 5.6s of the
+  // prompt below, 30s of ring tone, then 112 seconds of pure silence — the
+  // entire actual conversation was absent. Across 30 days that left 908 of
+  // 2,025 outbound recordings with no transcript and 706 more truncated,
+  // while inbound calls (which use no conference) transcribed fine at 72%.
+  //
+  // record="true" on the Conference records the ROOM — every leg in it — for
+  // as long as the conference lasts. Plivo posts recording details to
+  // callbackUrl with ConferenceAction=record; the handler ignores the other
+  // conference events it will also now receive.
   return xml(
-    `<Record recordSession="true" maxLength="14400" callbackUrl="${recordingCallbackUrl}" callbackMethod="POST" />` +
     `<Speak voice="WOMAN" language="en-US">Connecting your customer now. This call will be recorded.</Speak>` +
-    `<Conference startConferenceOnEnter="true" endConferenceOnExit="true" waitSound="${escapeXml(waitSoundUrl)}">${escapeXml(roomName)}</Conference>`,
+    `<Conference startConferenceOnEnter="true" endConferenceOnExit="true"` +
+    ` record="true" recordFileFormat="mp3"` +
+    ` callbackUrl="${escapeXml(recordingCallbackUrl)}" callbackMethod="POST"` +
+    ` waitSound="${escapeXml(waitSoundUrl)}">${escapeXml(roomName)}</Conference>`,
   );
 }
 
@@ -331,8 +380,45 @@ export function verifyPlivoSignatureV2(url: string, signature: string): boolean 
  * the internal host behind a proxy and would never match the signature.
  */
 export function plivoSignedUrl(pathWithQuery: string): string {
-  const base = (process.env.PLIVO_WEBHOOK_BASE_URL ?? process.env.NEXTAUTH_URL ?? "").replace(/\/+$/, "");
-  return `${base}${pathWithQuery}`;
+  return `${plivoWebhookBases()[0] ?? ""}${pathWithQuery}`;
+}
+
+/**
+ * Every public origin Plivo may reach us on, most-preferred first.
+ *
+ * Two tunnels rather than one because a single one is a single point of
+ * failure for every call: when the Tailscale Funnel stopped answering Plivo
+ * after a reboot, every outbound call died with "Error Reaching Answer URL"
+ * even though the app itself was healthy the whole time. The primary is
+ * handed to Plivo as answer_url and the second as fallback_url, so Plivo
+ * itself fails over.
+ *
+ * Deduped and trailing-slash-trimmed: pointing both env vars at the same host
+ * must not make us verify the same URL twice or hand Plivo a fallback that is
+ * the thing that just failed.
+ *
+ * NEXTAUTH_URL substitutes for an unset primary — it is deliberately NOT a
+ * third entry. As one it silently became the fallback_url whenever no fallback
+ * was configured, and NEXTAUTH_URL is a tailnet host here, which is not in
+ * public DNS. Plivo resolves fallback_url when the call is created and 400s
+ * the whole request, so that alone failed 100% of outbound calls — clearing
+ * PLIVO_WEBHOOK_FALLBACK_BASE_URL did not help, it just promoted the next bad
+ * origin into the slot. Failover is opt-in via the fallback env var only.
+ */
+export function plivoWebhookBases(): string[] {
+  const raw = [
+    process.env.PLIVO_WEBHOOK_BASE_URL || process.env.NEXTAUTH_URL,
+    process.env.PLIVO_WEBHOOK_FALLBACK_BASE_URL,
+  ];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const b of raw) {
+    const clean = (b ?? "").trim().replace(/\/+$/, "");
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean);
+  }
+  return out;
 }
 
 /**
@@ -346,13 +432,41 @@ export function verifyPlivoRequest(
   params: Record<string, string>,
   headers: Headers,
 ): boolean {
-  if (!AUTH_TOKEN) return process.env.NODE_ENV !== "production";
-  const url = plivoSignedUrl(pathWithQuery);
+  return verifiedPlivoBase(pathWithQuery, params, headers) !== null;
+}
+
+/**
+ * Same check, but reports WHICH origin Plivo signed for — null if none did.
+ *
+ * That answer matters beyond authentication. Plivo signs the exact URL it
+ * called, so a valid signature identifies the tunnel it actually reached us
+ * through, and every URL we hand back in the XML (the hold tone, the customer
+ * leg's own answer_url) has to be built on that same origin. Building them
+ * from the configured primary instead would send the next hop straight back
+ * to the host that just failed — the call would connect and then break
+ * halfway, which is harder to diagnose than not connecting at all.
+ *
+ * Determined cryptographically rather than from a Host header, which is
+ * attacker-controlled on a public endpoint.
+ */
+export function verifiedPlivoBase(
+  pathWithQuery: string,
+  params: Record<string, string>,
+  headers: Headers,
+): string | null {
+  const bases = plivoWebhookBases();
+  if (!AUTH_TOKEN) {
+    // Dev convenience only — production refuses an unverifiable webhook.
+    return process.env.NODE_ENV !== "production" ? (bases[0] ?? "") : null;
+  }
   const v2 = headers.get("x-plivo-signature-v2");
-  if (v2 && verifyPlivoSignatureV2(url, v2)) return true;
   const v1 = headers.get("x-plivo-signature");
-  if (v1 && verifyPlivoSignature(url, params, v1)) return true;
-  return false;
+  for (const base of bases) {
+    const url = `${base}${pathWithQuery}`;
+    if (v2 && verifyPlivoSignatureV2(url, v2)) return base;
+    if (v1 && verifyPlivoSignature(url, params, v1)) return base;
+  }
+  return null;
 }
 
 /** Collect POST form fields into a plain record for signature verification. */

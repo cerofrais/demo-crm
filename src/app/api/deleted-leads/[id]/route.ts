@@ -20,7 +20,7 @@ export async function GET(
 ) {
   return handle(async () => {
     const ctx = await requireSession();
-    if (!can(ctx.roles, "leads.delete")) {
+    if (!can(ctx.roles, "leads.delete") && !can(ctx.roles, "leads.viewDeleted")) {
       throw new ApiError("FORBIDDEN", "Admin only", 403);
     }
 

@@ -28,7 +28,22 @@ export async function PATCH(
     // but never tick off would be worse than not showing it at all.
     const isOwner = task.assignedToSub === ctx.sub;
     const ownsLead = task.enquiry.assignedToSub === ctx.sub;
-    if (!isOwner && !ownsLead && !can(ctx.roles, "leads.manage")) {
+
+    // A doctor_review task is a clinical gate, not a to-do: it is resolved by
+    // the doctor recording their decision on the lead, never by ticking it
+    // off here. Nothing in the UI changes one through this route — clearing a
+    // review raised in error goes through DELETE below instead — so this is
+    // admin-only (leads.delete), deliberately narrower than the owner/manager
+    // rule the ordinary follow-ups use.
+    if (task.kind === "doctor_review") {
+      if (!can(ctx.roles, "leads.delete")) {
+        throw new ApiError(
+          "FORBIDDEN",
+          "A doctor review is resolved by the doctor's decision on the lead. Only an admin can remove one.",
+          403,
+        );
+      }
+    } else if (!isOwner && !ownsLead && !can(ctx.roles, "leads.manage")) {
       throw new ApiError("FORBIDDEN", "Not your task", 403);
     }
 
@@ -57,5 +72,57 @@ export async function PATCH(
     }
 
     return ok({ id: updated.id, status: updated.status });
+  });
+}
+
+/**
+ * DELETE /api/tasks/:id — erase a task outright. Admin only (leads.delete).
+ *
+ * Exists for a task that should never have been raised — chiefly a duplicate
+ * doctor review, or one on a lead that has since gone elsewhere. Cancelling
+ * such a task leaves it in the completed list looking like a decision someone
+ * made; erasing it is the honest outcome for something that was never a real
+ * item of work.
+ *
+ * The lead is untouched: same stage, same owner, same history. An Activity
+ * row is still written, and deliberately survives the task — it carries the
+ * title and id in its metadata, so a doctor review that disappears from the
+ * queue can still be accounted for afterwards. That row is the whole reason
+ * this is a delete of the Task and not of the trail.
+ */
+export async function DELETE(
+  _req: NextRequest,
+  { params }: { params: { id: string } },
+) {
+  return handle(async () => {
+    const ctx = await requireSession();
+    if (!can(ctx.roles, "leads.delete")) {
+      throw new ApiError("FORBIDDEN", "Only an admin can delete a task", 403);
+    }
+
+    const task = await prisma.task.findUnique({
+      where: { id: params.id },
+      include: { enquiry: { select: { guestId: true } } },
+    });
+    if (!task) throw new ApiError("NOT_FOUND", "Task not found", 404);
+
+    // Written BEFORE the delete: if the delete fails there is no orphan entry
+    // claiming a removal that never happened, and the row does not reference
+    // the Task by foreign key, so it outlives it cleanly.
+    await prisma.activity.create({
+      data: {
+        enquiryId: task.enquiryId,
+        guestId: task.enquiry.guestId,
+        actorSub: ctx.sub,
+        actorRole: ctx.roles[0] ?? "STAFF",
+        actorName: ctx.name,
+        actionType: "task_deleted",
+        metadata: { taskId: task.id, title: task.title, kind: task.kind },
+      },
+    });
+
+    await prisma.task.delete({ where: { id: params.id } });
+
+    return ok({ id: params.id, deleted: true });
   });
 }

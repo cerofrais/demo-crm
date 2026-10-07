@@ -1,11 +1,12 @@
 /**
  * GET /api/reports/activity — paginated, filterable staff activity feed
- * (admin/manager only). Query params: actorSub, actionType, from, to, cursor.
+ * (admin/manager only). Query params: actorSub, actionType, fromNumber, from,
+ * to, cursor.
  */
 import { NextRequest } from "next/server";
 import { handle, ok, requireSession, ApiError } from "@/lib/api";
 import { can } from "@/lib/rbac";
-import { listActivity, type ActivityFilters } from "@/lib/activity-log";
+import { listActivity, type ActivityFilters, parseActionTypeFilter } from "@/lib/activity-log";
 
 export const dynamic = "force-dynamic";
 
@@ -19,7 +20,9 @@ export async function GET(req: NextRequest) {
     const sp = req.nextUrl.searchParams;
     const filters: ActivityFilters = {
       actorSub: sp.get("actorSub") || undefined,
-      actionType: sp.get("actionType") || undefined,
+      ...parseActionTypeFilter(sp.get("actionType")),
+      // E.164 only; anything else is ignored rather than matched loosely.
+      fromNumber: /^\+\d{8,15}$/.test(sp.get("fromNumber") ?? "") ? sp.get("fromNumber")! : undefined,
       cursor: sp.get("cursor") || undefined,
     };
     const from = sp.get("from");

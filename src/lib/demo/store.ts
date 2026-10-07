@@ -1,7 +1,8 @@
 "use client";
 
 import type { DemoData } from "./types";
-import { generateSeed } from "./seed";
+import { DEMO_USERS, generateSeed } from "./seed";
+import { extendSeed } from "./ext-seed";
 
 const STORAGE_KEY = "meridian_demo_data_v1";
 // v2 — added seeded email threads (previously WhatsApp-only), so anyone
@@ -9,15 +10,21 @@ const STORAGE_KEY = "meridian_demo_data_v1";
 //      Email tab.
 // v3 — deleted-lead archive, Resources documents, campaign assignment rules
 //      and marketing reports, for the features merged from main.
+// v4 — booking details, attachment names, archived templates, payment
+//      chases, and the state behind September's features (email auto-replies
+//      and auto-tags, routing rules, shifts, health records, the weekly client
+//      report and lead-sheet checks).
 // Bumping forces a reseed; without it a stale payload renders the new pages
 // empty, which reads as a bug rather than as an out-of-date cache.
-const SEED_VERSION = 3;
+const SEED_VERSION = 4;
 
 let cache: DemoData | null = null;
 const listeners = new Set<() => void>();
 
 function freshSeed(): DemoData {
-  return generateSeed();
+  const db = generateSeed();
+  db.version = SEED_VERSION;
+  return extendSeed(db, DEMO_USERS);
 }
 
 function load(): DemoData {

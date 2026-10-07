@@ -411,6 +411,25 @@ describe("parseMedicalScreeningForm — fallback behavior", () => {
     const bodyMissingPhone = "First Name\nSiddhant\nLast Name\nGolechhaa\nCity\nHyderabad";
     expect(parseMedicalScreeningForm(bodyMissingPhone)).toBeNull();
   });
+
+  // A guest typing "+1..." into a field that already renders a "+" produces
+  // "++1...". That one stray character used to reject the whole submission —
+  // name, phone and every health answer with it. Real loss: Marc Boesch's
+  // form of 25 Aug 2026 was never stored.
+  it("accepts a doubled plus on an international number", () => {
+    const body = "First Name Marc Last Name Boesch Age 61 Mobile Number ++15087403910 Email m@example.com";
+    expect(parseMedicalScreeningForm(body)?.contact.phone).toBe("+15087403910");
+  });
+
+  it("still rejects a number that is too short to be real", () => {
+    const body = "First Name Marc Last Name Boesch Age 61 Mobile Number ++12 Email m@example.com";
+    expect(parseMedicalScreeningForm(body)).toBeNull();
+  });
+
+  it("keeps a bare Indian mobile working", () => {
+    const body = "First Name Nikki Last Name Siddi Age 27 Mobile Number 9848369909 Email n@example.com";
+    expect(parseMedicalScreeningForm(body)?.contact.phone).toBe("+919848369909");
+  });
 });
 
 describe("formatMedicalFormNotes", () => {

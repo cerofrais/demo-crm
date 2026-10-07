@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { auth } from "@/lib/auth";
-import { can, canMutateLeads, canWorkLeadStage, isAdmin } from "@/lib/rbac";
+import { can, canMutateLeads, canViewLeadStage, isAdmin } from "@/lib/rbac";
 import { STAGES } from "@/lib/kanban";
 import { LeadsWorkspace } from "@/components/leads/leads-workspace";
 import type { EnquiryDTO } from "@/lib/types";
@@ -23,11 +23,12 @@ export default async function LeadsPage() {
       initial={initial}
       canManage={can(roles, "leads.manage")}
       isAdmin={isAdmin(roles)}
+      canFilterByPerson={can(roles, "leads.manage") || can(roles, "reports.allStaff")}
       canWorkLeads={canMutateLeads(roles)}
       canDelete={can(roles, "leads.delete")}
       canCreate={can(roles, "leads.manage") || can(roles, "leads.ownOnly")}
       canDoctorDecide={can(roles, "leads.doctorDecision")}
-      visibleStages={STAGES.filter((s) => canWorkLeadStage(roles, s.id))}
+      visibleStages={STAGES.filter((s) => canViewLeadStage(roles, s.id))}
       currentSub={session.user.sub}
     />
   );

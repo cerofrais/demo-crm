@@ -5,9 +5,10 @@ import { cn } from "@/lib/utils";
 import { cleanMessageBody, isLongMessage } from "@/lib/message-display";
 
 /**
- * A message body as a human wants to read it: tracking pixels gone, links
- * shortened to their domain, and anything long collapsed — with the exact
- * stored text one click away.
+ * A message body as a human wants to read it: tracking pixels gone and
+ * anything long collapsed — with the exact stored text one click away.
+ * Real links are shown in full; the address is often the point of the
+ * message, and a rep cannot act on a bare domain.
  *
  * The cleaning is display-only. `original` is always what was received, and
  * "Show original" reveals it verbatim, so nothing is hidden from someone who
@@ -26,9 +27,7 @@ export function MessageBody({ body, className }: { body: string; className?: str
   const note =
     cleaned.trackersRemoved > 0
       ? `${cleaned.trackersRemoved} tracking link${cleaned.trackersRemoved === 1 ? "" : "s"} hidden`
-      : cleaned.linksShortened > 0
-        ? `${cleaned.linksShortened} link${cleaned.linksShortened === 1 ? "" : "s"} shortened`
-        : null;
+      : null;
 
   return (
     <div className={className}>

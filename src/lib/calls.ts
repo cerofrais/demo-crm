@@ -3,6 +3,9 @@ import { createEnquiry } from "./enquiry-service";
 import { pickFromEligiblePool, type LeadAssignmentStrategy } from "./lead-assignment";
 import { logger } from "./logger";
 import type { CallDirection, CallStatus, CallRoutingScope, Prisma } from "@prisma/client";
+import { offSubsToday } from "./staff-availability";
+import { tagListFilter, type TagMatch } from "./tag-match";
+import { callTranscriptStatus } from "./ai/call-analysis-queue";
 export type { CallRoutingScope };
 
 /** Restricts inbound-call routing to a specific set of staff — set only for
@@ -53,6 +56,9 @@ export interface CallDTO {
   transcript: string | null;
   transcriptEnglish: string | null;
   transcriptLanguage: string | null;
+  /** Why there is no transcript, or that one is still coming. Null when the
+   *  call has one — see callTranscriptStatus. */
+  transcriptStatus: string | null;
   aiSummary: string | null;
   aiScore: number | null;
   aiTags: string[];
@@ -82,6 +88,8 @@ function toDTO(c: {
   transcript: string | null;
   transcriptEnglish: string | null;
   transcriptLanguage: string | null;
+  transcriptAttempts: number;
+  transcriptError: string | null;
   aiSummary: string | null;
   aiScore: number | null;
   aiTags: string[];
@@ -113,6 +121,7 @@ function toDTO(c: {
     transcript: c.transcript,
     transcriptEnglish: c.transcriptEnglish,
     transcriptLanguage: c.transcriptLanguage,
+    transcriptStatus: callTranscriptStatus(c),
     aiSummary: c.aiSummary,
     aiScore: c.aiScore,
     aiTags: c.aiTags,
@@ -163,6 +172,9 @@ export interface CallsListFilter {
    * the "new caller" tab, distinct from a missed call on an EXISTING lead
    * (which already surfaces via that lead's own Activity log). */
   unattendedOnly?: boolean;
+  /** Only calls on leads carrying these tags — any of them, or all of them. */
+  tags?: string[];
+  tagMatch?: TagMatch;
 }
 
 const MISSED_STATUSES: CallStatus[] = ["no_answer", "voicemail", "failed"];
@@ -186,6 +198,10 @@ export async function listCalls(filter: CallsListFilter, limit = 30): Promise<{ 
         guestId: null,
         direction: "inbound" as const,
         status: { in: MISSED_STATUSES },
+      }),
+      // A call's tags are its lead's. A call with no lead can't match a tag.
+      ...(filter.tags?.length && {
+        enquiry: { tags: tagListFilter(filter.tags, filter.tagMatch ?? "any") },
       }),
     },
     include: INCLUDE,
@@ -231,10 +247,16 @@ export async function pickAvailableRep(
 ): Promise<{ keycloakId: string; displayName: string; phone: string } | null> {
   const { scope } = await getCallRoutingSettings();
   const eligibleRoles = ROUTING_SCOPE_ROLES[scope];
+  // Off-days apply to the phone too: being off means off. isOnline stays the
+  // separate manual "out right now" switch, so both are checked.
+  const offToday = await offSubsToday(
+    (await prisma.staffProfile.findMany({ select: { keycloakId: true } })).map((p) => p.keycloakId),
+  );
   const profiles = await prisma.staffProfile.findMany({
     where: {
       isOnline: true,
       phone: { not: null },
+      ...(offToday.length && { keycloakId: { notIn: offToday } }),
       ...(eligibleRoles && { role: { in: eligibleRoles } }),
       ...(restrict && { keycloakId: { in: restrict.subs } }),
       ...(excludeSubs.length && { keycloakId: { notIn: excludeSubs } }),

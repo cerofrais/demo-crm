@@ -50,11 +50,18 @@
 #                        copying them just produces broken downloads. Plus two
 #                        ad-hoc *_backup tables left over from past fixes.
 #
-#   Safe to exclude these without breaking foreign keys: no excluded table is
-#   referenced BY an included one (checked against the live FK graph — the
-#   only edges near the boundary are AutoReply -> WhatsAppNumber, both
-#   excluded, and Message -> BroadcastJob, both copied). That is what lets the
-#   TRUNCATE ... CASCADE below stay inside the copied set.
+#   Excluding a table is NOT enough to protect it. TRUNCATE ... CASCADE wipes
+#   every table holding a foreign key into a truncated one, and it does that
+#   regardless of the FK's ON DELETE action — an ON DELETE SET NULL column
+#   does not soften it. On 2026-08-20 this silently emptied the live box's
+#   AutoReply during a sync, because AutoReply.attachmentDocumentId points at
+#   Document, and Document is copied. The rule had to be recovered from a
+#   backup.
+#
+#   So the guard is checked at RUN TIME, below: any excluded table with an FK
+#   into a copied one has its rows saved before the truncate and restored
+#   after. That keeps working when a future migration adds another such edge,
+#   which a hand-maintained comment demonstrably did not.
 #
 # ── DATA ONLY: the target's schema is left alone ─────────────────────────────
 #
@@ -83,6 +90,7 @@
 #   scripts/sync-db-to-zotac.sh              # prompt before overwriting
 #   scripts/sync-db-to-zotac.sh --yes        # no prompt (for cron)
 #   scripts/sync-db-to-zotac.sh --dry-run    # show the plan, change nothing
+#   scripts/sync-db-to-zotac.sh --force      # overwrite a target that looks live
 #   REMOTE=zotac@100.116.193.105 scripts/sync-db-to-zotac.sh
 # =============================================================================
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -95,9 +103,10 @@ DB="tre_crm"
 # Tables held back from the sync. See the header for the reasoning behind each
 # group; keep them grouped so a future reader can tell config from credentials.
 EXCLUDE=(
-  # credentials (and its FK child)
+  # credentials (and its FK children)
   WhatsAppNumber
   AutoReply
+  AutoTag
   # per-box config / cursors
   CallRoutingSettings
   LeadAssignmentSettings
@@ -107,20 +116,26 @@ EXCLUDE=(
   UserPreference
   # rows referencing storage objects that only exist on the source
   MarketingReport
-  # ad-hoc leftovers from past data fixes
-  transcript_fix_backup
-  wa_backfill_backup
   # schema bookkeeping — this sync never touches the target's schema, so its
   # migration ledger must keep describing its own schema, not the source's.
   _prisma_migrations
 )
 
+# Ad-hoc backup tables from past data fixes (transcript_fix_backup,
+# Enquiry_tag_backup_20260814, …) are excluded by PATTERN, not by name: they
+# are created outside migrations, so they exist only on the box where the fix
+# ran — a new one on the source aborted a sync ("relation does not exist" on
+# the target) the first time this list tried to keep up by hand.
+BACKUP_PATTERN_SQL="tablename NOT ILIKE '%backup%'"
+
 ASSUME_YES=false
 DRY_RUN=false
+FORCE=false
 for arg in "$@"; do
   case "$arg" in
     --yes|-y)   ASSUME_YES=true ;;
     --dry-run)  DRY_RUN=true ;;
+    --force)    FORCE=true ;;
     -h|--help)  sed -n '2,80p' "$0"; exit 0 ;;
     *)          die "Unknown option: $arg (try --help)" ;;
   esac
@@ -132,6 +147,13 @@ EXCLUDE_ARGS=()
 for t in "${EXCLUDE[@]}"; do
   EXCLUDE_ARGS+=(--exclude-table="public.\"$t\"")
 done
+# The backup-table pattern (see BACKUP_PATTERN_SQL above). Deliberately
+# UNquoted, unlike the named exclusions: pg_dump treats double-quoted pattern
+# text as literal (wildcards off), so "*backup*" would only match a table
+# literally named *backup*. Unquoted, * is a real wildcard and matches
+# case-sensitively, while the literal "backup" part is lowercase in every
+# such table ("Enquiry_tag_backup_20260814", "wa_backfill_backup", …).
+EXCLUDE_ARGS+=(--exclude-table='public.*backup*')
 
 # The copied set is derived from the live schema rather than hardcoded, so a
 # table added by a future migration is picked up automatically instead of
@@ -148,6 +170,50 @@ docker ps --format '{{.Names}}' | grep -qx "$CONTAINER" \
 
 ssh -o ConnectTimeout=10 -o BatchMode=yes "$REMOTE" true 2>/dev/null \
   || die "Can't reach $REMOTE over SSH. Is the box on, and is this machine's key authorised there?"
+
+# ---- direction guard --------------------------------------------------------
+#
+# Two layers, because each covers the other's blind spot.
+#
+# 1. EXPLICIT: STANDBY=true marks a box that is no longer live. Deterministic,
+#    and works from the very first second of a cutover.
+if [ "${STANDBY:-false}" = "true" ] && [ "$FORCE" != "true" ]; then
+  err "REFUSING: this box is marked STANDBY=true — it is not the live box."
+  err "Pushing its data to $REMOTE would overwrite the live database with a stale copy."
+  err "If you really mean to re-seed the target, re-run with --force."
+  exit 1
+fi
+#
+# 2. FRESHNESS: catches the case where nobody remembered to set the flag.
+#
+# This script only ever pushes THIS box's data over the target's. That is
+# correct while the target is a test box, and catastrophic the moment the
+# roles swap: on 2026-08-20 zotac became the live box, and a habitual re-run
+# here would silently replace real guest data with a stale copy.
+#
+# Rather than rely on remembering, compare freshness. The live box is the one
+# still receiving messages, so if the TARGET has newer traffic than the SOURCE,
+# the direction is wrong. --force overrides, for the deliberate case of
+# re-seeding a box you know is stale.
+newest_message() {
+  local runner="$1"
+  $runner "docker exec $CONTAINER psql -U postgres -d $DB -tAc \
+    \"SELECT COALESCE(EXTRACT(EPOCH FROM MAX(\\\"createdAt\\\"))::bigint, 0) FROM \\\"Message\\\";\"" 2>/dev/null | tr -d '[:space:]'
+}
+
+SRC_NEWEST="$(newest_message "bash -c")"
+TGT_NEWEST="$(newest_message "ssh $REMOTE")"
+
+if [ -n "$SRC_NEWEST" ] && [ -n "$TGT_NEWEST" ] && [ "$TGT_NEWEST" -gt "$((SRC_NEWEST + 300))" ]; then
+  gap=$(( (TGT_NEWEST - SRC_NEWEST) / 60 ))
+  if [ "$FORCE" != "true" ]; then
+    err "REFUSING: $REMOTE has newer data than this box (its newest message is ${gap} min ahead)."
+    err "That means the target is the LIVE box now and this sync would destroy real data."
+    err "If you genuinely mean to overwrite it, re-run with --force."
+    exit 1
+  fi
+  warn "Target is ${gap} min ahead of this box — overwriting anyway because --force was given."
+fi
 log "remote reachable: $REMOTE"
 
 ssh "$REMOTE" "docker ps --format '{{.Names}}' | grep -qx $CONTAINER" \
@@ -176,13 +242,30 @@ log "both boxes on migration: $SRC_MIG"
 
 # Every table except the held-back ones. Ordered for a stable, readable plan.
 mapfile -t INCLUDE < <(docker exec "$CONTAINER" psql -U "$DB" -d "$DB" -tAc \
-  "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename NOT IN ($EXCLUDE_SQL) ORDER BY tablename")
+  "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename NOT IN ($EXCLUDE_SQL) AND $BACKUP_PATTERN_SQL ORDER BY tablename")
 [ "${#INCLUDE[@]}" -gt 0 ] || die "Resolved zero tables to copy — refusing to run."
 
 # One statement: CASCADE stays inside the copied set (no excluded table
 # references an included one), and doing it in the same transaction as the
 # load means the target is never left empty.
 TRUNCATE_SQL="TRUNCATE $(printf '"%s",' "${INCLUDE[@]}" | sed 's/,$//') RESTART IDENTITY CASCADE;"
+
+# ---- cascade protection -----------------------------------------------------
+# Excluded tables that CASCADE would take with it: those holding an FK into a
+# table we're about to truncate. Discovered from the live FK graph rather than
+# listed by hand, so a new edge added by a future migration is covered too.
+INCLUDE_SQL="$(printf "'%s'," "${INCLUDE[@]}")"; INCLUDE_SQL="${INCLUDE_SQL%,}"
+mapfile -t CASCADE_VICTIMS < <(ssh "$REMOTE" "docker exec $CONTAINER psql -U postgres -d $DB -tAc \"
+  SELECT DISTINCT c.conrelid::regclass::text
+  FROM pg_constraint c
+  WHERE c.contype = 'f'
+    AND replace(c.conrelid::regclass::text, '\\\"', '') IN ($EXCLUDE_SQL)
+    AND replace(c.confrelid::regclass::text, '\\\"', '') IN ($INCLUDE_SQL);\"" 2>/dev/null \
+  | tr -d '[:space:]"' | grep . || true)
+
+if [ "${#CASCADE_VICTIMS[@]}" -gt 0 ]; then
+  log "Held-back tables that CASCADE would wipe (rows preserved across the sync): ${CASCADE_VICTIMS[*]}"
+fi
 
 SRC_ROWS="$(docker exec "$CONTAINER" psql -U "$DB" -d "$DB" -tAc 'SELECT count(*) FROM "Enquiry"')"
 DST_ROWS="$(ssh "$REMOTE" "docker exec $CONTAINER psql -U $DB -d $DB -tAc 'SELECT count(*) FROM \"Enquiry\"'" 2>/dev/null || echo "?")"
@@ -232,11 +315,24 @@ info "streaming dump over the tailnet (no intermediate file)"
 # --data-only: no DDL at all, so the target's schema and its enum types (which
 # the held-back tables still depend on) are never touched. pg_dump orders the
 # COPY blocks by dependency, so foreign keys hold as the data lands.
+# Snapshot the tables CASCADE would take with it. Taken from the TARGET (they
+# are the target's own config — that is why they're held back), and replayed
+# after the copy so the cascade's damage is undone inside the same
+# transaction. Empty when nothing is at risk.
+CASCADE_RESTORE_SQL=""
+for t in "${CASCADE_VICTIMS[@]}"; do
+  dump="$(ssh "$REMOTE" "docker exec $CONTAINER pg_dump -U postgres --data-only --no-owner --no-acl -t 'public.\"$t\"' $DB" 2>/dev/null || true)"
+  [ -n "$dump" ] && CASCADE_RESTORE_SQL+="$dump"$'\n'
+done
+
 set +e
 {
   echo "$TRUNCATE_SQL"
   docker exec "$CONTAINER" pg_dump -U postgres --data-only --no-owner --no-acl \
     "${EXCLUDE_ARGS[@]}" "$DB"
+  # Replayed last: the copied Documents/numbers these rows reference are in
+  # place by now, so the foreign keys hold.
+  printf '%s' "$CASCADE_RESTORE_SQL"
 } \
   | gzip -1 \
   | ssh "$REMOTE" "gunzip | docker exec -i $CONTAINER psql -U postgres -d $DB -v ON_ERROR_STOP=1 --single-transaction" \

@@ -10,5 +10,8 @@ export default async function HealthPage() {
   if (!session?.user) redirect("/login");
   if (!can(session.roles ?? [], "health.view")) redirect("/leads");
 
-  return <HealthWorkspace />;
+  // Reading and editing are separate permissions — Viewer holds only the
+  // first. Passed down so the editor renders read-only rather than showing
+  // Save and Delete buttons that the API would refuse.
+  return <HealthWorkspace canEdit={can(session.roles ?? [], "health.edit")} />;
 }

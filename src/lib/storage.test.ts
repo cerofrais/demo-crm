@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { buildStorageKey, isAllowedUploadType, isInlineType, maxUploadBytes } from "./storage";
+import { DOC_CATEGORIES } from "./rbac";
+import { confirmUploadSchema, uploadUrlSchema } from "./validation";
 
 describe("isAllowedUploadType (F46 MIME allowlist)", () => {
   it("allows a PDF for every category", () => {
-    for (const category of ["medical", "consent", "operational", "marketing"]) {
+    for (const category of DOC_CATEGORIES) {
       expect(isAllowedUploadType(category, "application/pdf")).toBe(true);
     }
   });
@@ -114,5 +116,48 @@ describe("buildStorageKey", () => {
     const a = buildStorageKey({ category: "operational", filename: "report.pdf", guestId: "g1" });
     const b = buildStorageKey({ category: "operational", filename: "report.pdf", guestId: "g1" });
     expect(a).not.toBe(b);
+  });
+});
+
+describe("upload policy covers every document category", () => {
+  // A category that exists in the enum but is missing from one of these maps
+  // fails at UPLOAD time, not at review time — and the schema rejection is
+  // returned as a 4xx without a server-side log, so it looks like "the file
+  // just didn't appear". That is exactly how `private` shipped broken.
+  it.each(DOC_CATEGORIES)("%s accepts a PDF and has a size cap", (category) => {
+    expect(isAllowedUploadType(category, "application/pdf")).toBe(true);
+    expect(maxUploadBytes(category)).toBeGreaterThan(0);
+  });
+
+  it.each(DOC_CATEGORIES)("%s is accepted by the upload-url schema", (category) => {
+    const parsed = uploadUrlSchema.safeParse({
+      filename: "a.pdf",
+      mimeType: "application/pdf",
+      category,
+      sizeBytes: 1024,
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it.each(DOC_CATEGORIES)("%s is accepted by the confirm schema", (category) => {
+    const parsed = confirmUploadSchema.safeParse({
+      storageKey: `${category}/general/x-a.pdf`,
+      filename: "a.pdf",
+      mimeType: "application/pdf",
+      category,
+      sizeBytes: 1024,
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("still rejects a category that isn't real", () => {
+    expect(
+      uploadUrlSchema.safeParse({
+        filename: "a.pdf",
+        mimeType: "application/pdf",
+        category: "secret",
+        sizeBytes: 1024,
+      }).success,
+    ).toBe(false);
   });
 });

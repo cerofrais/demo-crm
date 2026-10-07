@@ -1,12 +1,17 @@
 import type { Message, Document } from "@prisma/client";
 import { prisma } from "./prisma";
 import type { MessageDTO } from "./types";
+import { transcriptStatusText, transcriptText } from "./voice-note";
+import { voiceNoteTranscriptionEnabled } from "./ai/config";
 
 type MessageWithAttachment = Message & { attachmentDocument: Document | null };
 
 export function toMessageDTO(
   m: MessageWithAttachment,
   fromLabel: string | null = null,
+  /** The sending number's integration ("cloud_api" | "baileys") — decides
+   *  whether a missing delivery status is meaningful. See isStatusStale. */
+  integration: string | null = null,
   replyTo: MessageDTO["replyTo"] = null,
 ): MessageDTO {
   return {
@@ -20,6 +25,7 @@ export function toMessageDTO(
     toEmail: m.toEmail,
     status: m.status,
     needsReview: m.needsReview,
+    metaTemplateName: m.metaTemplateName ?? null,
     createdAt: m.createdAt.toISOString(),
     attachment: m.attachmentDocument
       ? {
@@ -28,7 +34,17 @@ export function toMessageDTO(
           mimeType: m.attachmentDocument.mimeType,
         }
       : null,
+    attachmentNames: m.attachmentNames ?? [],
+    // Deleted messages are redacted in the thread — the transcript goes with
+    // the body, not around it.
+    transcript: m.deletedAt ? null : m.transcript,
+    transcriptEnglish: m.deletedAt ? null : m.transcriptEnglish,
+    transcriptLanguage: m.transcriptLanguage,
+    transcriptStatus: m.deletedAt
+      ? null
+      : transcriptStatusText(m, { enabled: voiceNoteTranscriptionEnabled() }),
     fromLabel,
+    integration,
     editedAt: m.editedAt?.toISOString() ?? null,
     deletedAt: m.deletedAt?.toISOString() ?? null,
     replyTo,

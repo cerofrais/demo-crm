@@ -6,6 +6,7 @@ import { NextRequest } from "next/server";
 import { handle, ok, requirePermission, requireAnyPermission } from "@/lib/api";
 import { createStaffUserSchema } from "@/lib/validation";
 import { listUsers, createUser } from "@/lib/keycloak-admin";
+import { lastActiveBySub } from "@/lib/user-activity";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,7 +15,10 @@ export async function GET() {
   return handle(async () => {
     await requireAnyPermission(["users.manage", "users.view"]);
     const users = await listUsers();
-    return ok(users);
+    // Last activity-log action per person. Kept out of listUsers' cache so
+    // the column is current on every load, not up to a minute stale.
+    const lastActive = await lastActiveBySub(users.map((u) => u.id));
+    return ok(users.map((u) => ({ ...u, lastActiveAt: lastActive.get(u.id) ?? null })));
   });
 }
 

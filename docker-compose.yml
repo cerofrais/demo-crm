@@ -133,13 +133,16 @@ services:
       # happened. See handleMessagesUpdate in the webhook route.
       WEBHOOK_EVENTS_MESSAGES_UPDATE: "true"
       LANGUAGE: en
-      # Official Meta Cloud API mode (WHATSAPP-BUSINESS integration, as
-      # opposed to the QR-paired WHATSAPP-BAILEYS numbers above) — Evolution
-      # itself receives Meta's webhook at /webhook/meta (reached via the app's
-      # /api/webhooks/whatsapp-cloud-relay pass-through, since this container
-      # has no public address of its own) and validates it against
-      # WA_BUSINESS_TOKEN_WEBHOOK, the same value registered as the "Verify
-      # token" in Meta's console.
+      # Vestigial. Evolution used to front the official Cloud API numbers too
+      # (WHATSAPP-BUSINESS integration) and receive Meta's webhook at
+      # /webhook/meta, relayed through the app because this container has no
+      # public address. That path is gone: Cloud API numbers now talk to
+      # graph.facebook.com directly and Meta calls the app at
+      # /api/webhooks/whatsapp-cloud, which does the verify handshake against
+      # WA_BUSINESS_TOKEN_WEBHOOK itself (same value, read from .env by the
+      # nextjs service). Left here so an existing WHATSAPP-BUSINESS instance
+      # doesn't change behaviour under a running container; removable once
+      # that instance is deleted from Evolution.
       WA_BUSINESS_TOKEN_WEBHOOK: ${WA_BUSINESS_TOKEN_WEBHOOK}
       WA_BUSINESS_URL: https://graph.facebook.com
       WA_BUSINESS_VERSION: v20.0
@@ -357,19 +360,53 @@ services:
     networks: [tre]
 
   # ---------------------------------------------------------------------------
-  # ngrok — DEV ONLY. Exposes the app over HTTPS for Plivo webhooks.
-  # Requires NGROK_AUTHTOKEN + NGROK_DOMAIN in .env.
-  # DO NOT deploy to production — use a real reverse proxy instead.
+  # sheet-check-cron — once a day, asks the CRM to run the lead sheet check
+  # (Meta lead-ad Google Sheets vs the CRM; see src/lib/sheet-check.ts). The
+  # CRM decides whether a check is due — every N days, set on the Lead Sheet
+  # Check page — so this container only needs to be reliably daily.
+  #
+  # Needs SHEET_CHECK_CRON_SECRET in .env (the nextjs service reads the same
+  # value from env_file); without it the container refuses to start.
+  # Run a tick by hand: docker exec tre-sheet-check-cron sh /opt/sheet-check/tick.sh
   # ---------------------------------------------------------------------------
-  ngrok:
-    image: ngrok/ngrok:latest
-    container_name: tre-ngrok
+  sheet-check-cron:
+    image: alpine:3.20
+    container_name: tre-sheet-check-cron
     restart: unless-stopped
-    command: http --url=${NGROK_DOMAIN} http://nextjs:3000
     environment:
-      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
-    ports:
-      - "4040:4040"  # ngrok web inspector UI
+      SHEET_CHECK_CRON_SECRET: "${SHEET_CHECK_CRON_SECRET:-}"
+      SHEET_CHECK_URL: "http://nextjs:3000/api/internal/sheet-check/tick"
+    volumes:
+      - ./infra/cron/sheet-check:/opt/sheet-check:ro
+    entrypoint: ["/bin/sh", "/opt/sheet-check/entrypoint.sh"]
+    depends_on:
+      nextjs:
+        condition: service_started
+    profiles: ["app"]
+    networks: [tre]
+
+  # ---------------------------------------------------------------------------
+  # cloudflared — Cloudflare Tunnel to webhooks.splarawellness.com.
+  #
+  # The durable answer to a problem the ngrok tunnels kept causing: a free
+  # account exhausted its monthly bandwidth mid-day (ERR_NGROK_725) and every
+  # Plivo webhook started returning 403, taking outbound calls down with it.
+  # Cloudflare Tunnel is unmetered and terminates on 443, which also sidesteps
+  # the Tailscale Funnel's problem — it can only publish on 10000, and webhook
+  # senders generally dial 443 only.
+  #
+  # Which paths are public is decided in the Cloudflare dashboard, not here,
+  # and deliberately covers ONLY /api/plivo and /sounds. Unlike the ngrok
+  # tunnels, which expose the whole app and leave Keycloak as the only thing
+  # between the internet and the CRM, nothing else is reachable.
+  #
+  # Needs CLOUDFLARE_TUNNEL_TOKEN in .env; without it the service never starts.
+  # ---------------------------------------------------------------------------
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: tre-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
     profiles: ["dev"]
     networks: [tre]
 
@@ -380,6 +417,49 @@ services:
   # Then set:     AI_TRANSCRIBE_BASE_URL=http://whisper:8000/v1
   #               AI_TRANSCRIBE_MODEL=Systran/faster-whisper-small
   # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # n8n — lead-gen automation (Google Sheets -> CRM, WhatsApp task bot).
+  #
+  # Behind its own profile, deliberately. Production already runs n8n from a
+  # SEPARATE compose project (~/Desktop/gitrepo/n8n) that owns the external
+  # `n8n_data` volume and port 5678; if this service were in the `app` profile,
+  # the next deploy there would try to stand up a second n8n against the same
+  # port and volume. Start it explicitly instead:
+  #
+  #     docker compose --profile n8n up -d n8n
+  #
+  # SAFETY: the lead-gen workflows POST to a CRM webhook URL baked into each
+  # workflow, and they poll shared Google Sheets. Two instances running the
+  # same active workflows means the same sheet row is pushed twice — the
+  # duplicate-lead burst of 2026-08-14 was exactly that. Imported workflows
+  # must stay INACTIVE on any box that isn't the live one, and their webhook
+  # URL must point at that box's own CRM.
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    container_name: n8n
+    profiles: ["n8n"]
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    environment:
+      - N8N_SECURE_COOKIE=false
+      - NODE_FUNCTION_ALLOW_BUILTIN=crypto
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      # Read by the workflows when they sign a request to the CRM webhook.
+      - ENQUIRY_WEBHOOK_SECRET=${ENQUIRY_WEBHOOK_SECRET:-}
+      - CONNECTOR_SECRET=${CONNECTOR_SECRET:-}
+      # Where imported workflows should send leads on THIS box. Referenced by
+      # the workflow's HTTP node instead of a hardcoded host, so a copy on a
+      # test box can never inject into production.
+      - CRM_WEBHOOK_BASE_URL=${CRM_WEBHOOK_BASE_URL:-http://nextjs:3000}
+    volumes:
+      - n8ndata:/home/node/.n8n
+    # Same network as the app: the workflows POST leads to http://nextjs:3000,
+    # which only resolves inside `tre`. Left off, n8n lands on the project's
+    # default network and every lead-ingest run dies on a DNS lookup.
+    networks: [tre]
+    restart: unless-stopped
+
   whisper:
     image: fedirz/faster-whisper-server:latest-cpu
     container_name: tre-whisper
@@ -426,6 +506,7 @@ volumes:
   whispermodels:
   indicasrmodels:
   keycloakimport:
+  n8ndata:
   evolutioninstances:
 
 networks:

@@ -40,9 +40,26 @@ const schema = z.object({
   SMTP_HOST: z.string().default("localhost"),
   SMTP_PORT: z.coerce.number().default(1025),
 
-  // Reserved for a future official Meta Cloud API webhook verification
-  // handshake — not used by the Evolution API (Baileys) integration below.
+  // Meta lead-ads / enquiry-form webhook verification handshake — see
+  // /api/webhooks/enquiry-form. Distinct from WA_BUSINESS_TOKEN_WEBHOOK below.
   WHATSAPP_VERIFY_TOKEN: z.string().optional(),
+
+  // Meta WhatsApp Cloud API webhook (POST /api/webhooks/whatsapp-cloud).
+  //
+  // WA_BUSINESS_TOKEN_WEBHOOK is the "Verify Token" registered in the Meta
+  // app dashboard; Meta echoes it back on the GET subscription handshake.
+  // Name kept as-is because it is already set in .env — it used to belong to
+  // the evolution-api container, which handled this handshake back when Cloud
+  // API traffic was relayed through it.
+  //
+  // META_APP_SECRET is the Meta app's App Secret, used to verify the
+  // X-Hub-Signature-256 on every webhook POST. Optional so a deploy can't be
+  // taken down by a missing value, but the route logs a warning on every
+  // unverified request while it is unset: this endpoint creates leads and
+  // updates delivery statuses from its payload, so anyone who learns the URL
+  // can forge both until it is set.
+  WA_BUSINESS_TOKEN_WEBHOOK: z.string().optional(),
+  META_APP_SECRET: z.string().optional(),
 
   // Evolution API (self-hosted WhatsApp gateway, Baileys-based) — see
   // docs/17-whatsapp-integration.md. EVOLUTION_API_KEY is the GLOBAL admin

@@ -39,7 +39,7 @@ export async function PATCH(
         actorRole: ctx.roles[0] ?? "STAFF",
         actorName: ctx.name,
         actionType: "message_edited",
-        metadata: { messageId: message.id, oldBody, newBody: body },
+        metadata: { channel: message.channel, messageId: message.id, oldBody, newBody: body },
       },
     });
 
@@ -70,7 +70,7 @@ export async function DELETE(
         actorRole: ctx.roles[0] ?? "STAFF",
         actorName: ctx.name,
         actionType: "message_deleted",
-        metadata: { messageId: message.id },
+        metadata: { channel: message.channel, messageId: message.id },
       },
     });
 

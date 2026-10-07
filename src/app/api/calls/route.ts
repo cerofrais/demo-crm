@@ -1,12 +1,14 @@
 /**
  * GET /api/calls — paginated call list (admin/manager: all; others: own calls only)
- * Query params: direction, status, cursor (ISO startedAt), guestId, enquiryId
+ * Query params: direction, status, cursor (ISO startedAt), guestId, enquiryId,
+ * tags (comma-separated lead tags) + tagMatch (any|all)
  */
 import { NextRequest, NextResponse } from "next/server";
 import { handle, requireSession, ApiError } from "@/lib/api";
 import { can } from "@/lib/rbac";
 import { listCalls, getCallsForGuest, getCallsForEnquiry } from "@/lib/calls";
 import type { CallDirection, CallStatus } from "@prisma/client";
+import { parseTagMatch } from "@/lib/tag-match";
 
 export const runtime = "nodejs";
 
@@ -52,6 +54,8 @@ export async function GET(req: NextRequest) {
       dateTo: sp.get("to") ? new Date(sp.get("to")!) : undefined,
       cursor: sp.get("cursor") ?? undefined,
       unattendedOnly: unattended,
+      tags: sp.get("tags")?.split(",").map((t) => t.trim()).filter(Boolean).slice(0, 30),
+      tagMatch: parseTagMatch(sp.get("tagMatch"), "any"),
     });
 
     return NextResponse.json(items);

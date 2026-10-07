@@ -12,7 +12,12 @@ import { z } from "zod";
 import { logAiDecision } from "./audit";
 import { chatJSON } from "./provider";
 import { DATA_FENCE_RULES, fence, llmString, parseLlm } from "./safety";
-import { collapseRepetitions, isPredominantlyLatin, isUsableTranscript } from "./transcript-quality";
+import {
+  collapseRepetitions,
+  isPredominantlyLatin,
+  isUsableTranscript,
+  type TranscriptFloor,
+} from "./transcript-quality";
 
 export interface TranscriptAttempt {
   language: string; // ISO code passed to the ASR backend, e.g. "te" | "hi"
@@ -52,7 +57,14 @@ ${DATA_FENCE_RULES}`;
  */
 export async function reconcileTranscript(
   attempts: TranscriptAttempt[],
-  context: { callId?: string; enquiryId?: string },
+  context: {
+    callId?: string;
+    enquiryId?: string;
+    guestId?: string;
+    /** How short an attempt may be and still count as speech — a voice note
+     *  is a sentence, not a call. Defaults to the call floor. */
+    floor?: TranscriptFloor;
+  },
 ): Promise<ReconciledTranscript | null> {
   // Hard gate, independent of the prompt above. A failed decode comes back as
   // "" or a few stray syllables rather than an error, and asking the model to
@@ -60,7 +72,7 @@ export async function reconcileTranscript(
   // fluent, entirely fabricated conversations that were stored on the call
   // record and scored as real. Prompt instructions alone are not a sufficient
   // defence here — if nothing usable came back, don't call the LLM at all.
-  const usable = attempts.filter((a) => isUsableTranscript(a.text));
+  const usable = attempts.filter((a) => isUsableTranscript(a.text, context.floor));
   if (!usable.length) return null;
 
   // Fast path: a single attempt that is already Latin-script English needs
@@ -105,6 +117,7 @@ export async function reconcileTranscript(
       kind: "transcript_translation",
       callId: context.callId,
       enquiryId: context.enquiryId,
+      guestId: context.guestId,
       promptSystem: SYSTEM,
       promptUser: userPrompt,
       success: false,
@@ -117,6 +130,7 @@ export async function reconcileTranscript(
     kind: "transcript_translation",
     callId: context.callId,
     enquiryId: context.enquiryId,
+    guestId: context.guestId,
     promptSystem: SYSTEM,
     promptUser: userPrompt,
     output: result,
@@ -127,7 +141,10 @@ export async function reconcileTranscript(
   // The model may correctly decline (returning empty strings, as instructed) on
   // input it can't recover. Treat that the same as "no transcript" rather than
   // persisting a blank one over the call record.
-  if (!isUsableTranscript(result.nativeText) && !isUsableTranscript(result.englishText)) {
+  if (
+    !isUsableTranscript(result.nativeText, context.floor) &&
+    !isUsableTranscript(result.englishText, context.floor)
+  ) {
     return null;
   }
   return result;

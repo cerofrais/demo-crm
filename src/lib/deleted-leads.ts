@@ -17,11 +17,16 @@
  * rows outright and leaves nothing for this to find.
  */
 import type { Prisma } from "@prisma/client";
+import { tagListFilter, type TagMatch } from "./tag-match";
 import { prisma } from "./prisma";
 import { logger } from "./logger";
 import { deleteObject } from "./storage";
+import { guestResetAfterHardDelete } from "./hard-delete-guest";
+import { refreshGuestVisited } from "./guest-visits";
+import { recomputeWhatsAppLineTags } from "./whatsapp-number-tag";
 import { formatActionLabel } from "./activity-log";
 import { mergeLeadTags, sortTags } from "./lead-tags";
+import { getStaffNamesBatch } from "./enquiries";
 
 export interface DeletedLeadListItemDTO {
   id: string;
@@ -109,16 +114,17 @@ export interface DeletedLeadFilters {
   to?: string;
   /** LeadSource — where the lead originally came from. */
   source?: string;
-  /** AND semantics (a lead must carry every tag listed), matching the live
-   *  board's own multi-select tag filter (leads-workspace.tsx). */
+  /** Tags to filter on; `tagMatch` says whether a lead needs any of them
+   *  (default, matching the live board) or all of them. */
   tags?: string[];
+  tagMatch?: TagMatch;
 }
 
 function buildWhere(filters: DeletedLeadFilters) {
   const q = filters.q?.trim();
   return {
     ...(filters.source ? { source: filters.source as Prisma.EnquiryWhereInput["source"] } : {}),
-    ...(filters.tags?.length ? { tags: { hasEvery: filters.tags } } : {}),
+    ...(filters.tags?.length ? { tags: tagListFilter(filters.tags, filters.tagMatch ?? "any") } : {}),
     deletedAt: {
       not: null,
       ...(filters.from ? { gte: new Date(filters.from) } : {}),
@@ -223,6 +229,17 @@ export async function listDeletedLeads(
     }
   }
 
+  // Resolved from StaffProfile rather than trusted from the row, the same way
+  // the live board does it (toEnquiryDTOList). Enquiry.assignedToName is a
+  // denormalised copy of the staff member's display name and nothing updates
+  // it when someone is renamed, so the column drifts. The board never showed
+  // that because it overrides on read; this page did not, and was displaying
+  // owners who had been renamed months earlier — 14 of the 17 stale rows found
+  // on 2026-09-03 were soft-deleted leads, i.e. exactly this page.
+  const ownerNames = await getStaffNamesBatch(
+    page.map((e) => e.assignedToSub).filter((s): s is string => Boolean(s)),
+  );
+
   return {
     items: page.map((e) => ({
       id: e.id,
@@ -233,7 +250,8 @@ export async function listDeletedLeads(
       stage: e.stage,
       source: e.source,
       campaignLabel: e.campaignLabel,
-      assignedToName: e.assignedToName,
+      assignedToName:
+        (e.assignedToSub ? ownerNames.get(e.assignedToSub) : null) ?? e.assignedToName,
       deletedAt: e.deletedAt!.toISOString(),
       createdAt: e.createdAt.toISOString(),
       // Recomputed live, not the raw persisted column — see the comment on
@@ -286,7 +304,7 @@ export async function hardDeleteLead(
   const lead = await prisma.enquiry.findFirst({
     where: { id: enquiryId, deletedAt: { not: null } },
     include: {
-      guest: { select: { id: true, fullName: true } },
+      guest: { select: { id: true, fullName: true, isBlocked: true } },
       _count: {
         select: { activities: true, messages: true, calls: true, notes: true, tasks: true, documents: true },
       },
@@ -342,6 +360,22 @@ export async function hardDeleteLead(
     }),
   ]);
 
+  // The guest row outlives the purge, and so did state derived from what was
+  // just erased — the WhatsApp line tags above all (see hard-delete-guest.ts).
+  // With no lead left, the guest is reset outright; with another live lead,
+  // only the line tags are rebuilt from the messages that remain, since the
+  // rest may belong to that lead's conversation.
+  const remaining = await prisma.enquiry.count({ where: { guestId: lead.guest.id } });
+  if (remaining === 0) {
+    await prisma.guest.update({
+      where: { id: lead.guest.id },
+      data: guestResetAfterHardDelete({ isBlocked: lead.guest.isBlocked }),
+    });
+  } else {
+    await recomputeWhatsAppLineTags(lead.guest.id);
+  }
+  await refreshGuestVisited(lead.guest.id);
+
   // Storage objects last: a failure here leaks a file but must not roll back
   // the erasure, and the rows referencing them are already gone.
   await Promise.all(
@@ -386,6 +420,11 @@ export async function getDeletedLead(id: string): Promise<DeletedLeadDetailDTO |
   });
   if (!e) return null;
 
+  // Same reasoning as the list above — the stored name can be stale.
+  const ownerName = e.assignedToSub
+    ? ((await getStaffNamesBatch([e.assignedToSub])).get(e.assignedToSub) ?? e.assignedToName)
+    : e.assignedToName;
+
   return {
     id: e.id,
     guestId: e.guestId,
@@ -395,7 +434,7 @@ export async function getDeletedLead(id: string): Promise<DeletedLeadDetailDTO |
     stage: e.stage,
     source: e.source,
     campaignLabel: e.campaignLabel,
-    assignedToName: e.assignedToName,
+    assignedToName: ownerName,
     deletedAt: e.deletedAt!.toISOString(),
     createdAt: e.createdAt.toISOString(),
     counts: {
@@ -420,7 +459,7 @@ export async function getDeletedLead(id: string): Promise<DeletedLeadDetailDTO |
       actorName: a.actorName,
       actorRole: a.actorRole,
       actionType: a.actionType,
-      actionLabel: formatActionLabel(a.actionType),
+      actionLabel: formatActionLabel(a.actionType, a.metadata),
       metadata: a.metadata,
     })),
     messages: e.messages.map((m) => ({

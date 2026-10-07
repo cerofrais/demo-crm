@@ -6,6 +6,8 @@ import { prisma } from "@/lib/prisma";
 import { ageFromDob, ageGroup } from "@/lib/utils";
 import { updateGuestSchema } from "@/lib/validation";
 import { deleteGuestRecord } from "@/lib/guest-delete";
+import { syncTagsForGuest } from "@/lib/tags-service";
+import { logger } from "@/lib/logger";
 
 export const dynamic = "force-dynamic";
 
@@ -22,7 +24,7 @@ export async function GET(
     const g = await prisma.guest.findFirst({
       where: { id: params.id, deletedAt: null },
       include: {
-        healthProfile: { select: { id: true, updatedAt: true } },
+        healthProfiles: { select: { id: true, updatedAt: true }, orderBy: { updatedAt: 'desc' } },
         _count: { select: { enquiries: true } },
       },
     });
@@ -35,6 +37,8 @@ export async function GET(
       phone: g.phone,
       email: g.email,
       city: g.city,
+      businessName: g.businessName,
+      businessRole: g.businessRole,
       gender: g.gender,
       dateOfBirth: g.dateOfBirth?.toISOString() ?? null,
       age,
@@ -43,8 +47,8 @@ export async function GET(
       isBlocked: g.isBlocked,
       tags: g.tags,
       enquiryCount: g._count.enquiries,
-      hasHealthProfile: Boolean(g.healthProfile),
-      healthUpdatedAt: g.healthProfile?.updatedAt.toISOString() ?? null,
+      hasHealthProfile: g.healthProfiles.length > 0,
+      healthUpdatedAt: g.healthProfiles[0]?.updatedAt.toISOString() ?? null,
     });
   });
 }
@@ -81,12 +85,14 @@ export async function PATCH(
           phone: input.phone !== undefined ? nextPhone : undefined,
           email: input.email !== undefined ? nextEmail : undefined,
           city: input.city !== undefined ? (input.city.trim() || null) : undefined,
+          businessName: input.businessName !== undefined ? (input.businessName.trim() || null) : undefined,
+          businessRole: input.businessRole !== undefined ? (input.businessRole.trim() || null) : undefined,
           gender: input.gender ?? undefined,
           dateOfBirth: input.dateOfBirth !== undefined
             ? (input.dateOfBirth ? new Date(input.dateOfBirth) : null)
             : undefined,
         },
-        include: { _count: { select: { enquiries: true } }, healthProfile: { select: { id: true } } },
+        include: { _count: { select: { enquiries: true } }, healthProfiles: { select: { id: true } } },
       });
     } catch (err) {
       // phone/email are unique — editing into a value another guest already
@@ -98,19 +104,30 @@ export async function PATCH(
       throw err;
     }
 
+    // The age bucket is derived from dateOfBirth, so changing it invalidates
+    // the `age:*` tag stored on this guest's leads — which is what tag
+    // filters query. Re-sync so a lead keeps matching the tag it displays.
+    if (input.dateOfBirth !== undefined) {
+      await syncTagsForGuest(updated.id).catch((err) =>
+        logger.error({ err, guestId: updated.id }, "guest update: lead tag re-sync failed"),
+      );
+    }
+
     return ok({
       id: updated.id,
       fullName: updated.fullName,
       phone: updated.phone,
       email: updated.email,
       city: updated.city,
+      businessName: updated.businessName,
+      businessRole: updated.businessRole,
       gender: updated.gender,
       ageGroup: ageGroup(ageFromDob(updated.dateOfBirth)),
       isReturning: updated.isReturning,
       isBlocked: updated.isBlocked,
       tags: updated.tags,
       enquiryCount: updated._count.enquiries,
-      hasHealthProfile: Boolean(updated.healthProfile),
+      hasHealthProfile: updated.healthProfiles.length > 0,
     });
   });
 }

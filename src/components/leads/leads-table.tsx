@@ -74,8 +74,26 @@ export function LeadsTable({
                   <td className="px-4 py-3">
                     <span className="inline-flex items-center gap-1.5">
                       {e.guest.fullName}
-                      {(e.guest.isReturning || e.isReturningFlag) && (
+                      {e.isReturningFlag && (
                         <RefreshCw className="h-3 w-3 text-brand-600" />
+                      )}
+                      {/* Same signal as the board card — a WhatsApp message
+                          we were never told arrived. `relative` is required
+                          for the same reason as there: an unanchored .sr-only
+                          escapes to <html> and stretches the document. */}
+                      {e.unconfirmedMessages > 0 && (
+                        <span
+                          title={
+                            e.unconfirmedMessages === 1
+                              ? "1 WhatsApp message was never confirmed delivered — it may not have arrived"
+                              : `${e.unconfirmedMessages} WhatsApp messages were never confirmed delivered — they may not have arrived`
+                          }
+                          className="relative inline-flex items-center gap-0.5 rounded bg-destructive/10 px-1 py-0.5 text-[10px] font-semibold leading-none text-destructive"
+                        >
+                          <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden />
+                          {e.unconfirmedMessages}
+                          <span className="sr-only">unconfirmed WhatsApp messages</span>
+                        </span>
                       )}
                     </span>
                   </td>

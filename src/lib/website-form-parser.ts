@@ -26,12 +26,19 @@ export interface WebsiteFormLead {
   phone: string | null;
   age: number | null;
   city: string | null;
+  businessName: string | null;
+  businessRole: string | null;
   checkinDate: string | null;
   package: string | null;
   lookingFor: string | null;
   wellnessFocus: string | null;
   message: string | null;
   pageUrl: string | null;
+  /** Landing-page forms only: the programme the page is for ("Sleep
+   *  Restoration"), from the notification's subject line. */
+  program?: string | null;
+  /** Bridal landing page only. */
+  weddingDate?: string | null;
 }
 
 const FIELD_BY_NORMALIZED_LABEL: Record<string, string> = {
@@ -49,6 +56,25 @@ const FIELD_BY_NORMALIZED_LABEL: Record<string, string> = {
   age: "age",
   email: "email",
   city: "city",
+  // Business name and role. The forms don't send these yet, so the label list
+  // is deliberately wide: whichever wording the form ends up using, one of
+  // these catches it without needing a code change first. "Occupation" is
+  // here because the medical screening form already uses it for the same
+  // thing.
+  businessname: "businessName",
+  companyname: "businessName",
+  company: "businessName",
+  organisation: "businessName",
+  organization: "businessName",
+  organisationname: "businessName",
+  organizationname: "businessName",
+  business: "businessName",
+  role: "businessRole",
+  designation: "businessRole",
+  jobtitle: "businessRole",
+  jobrole: "businessRole",
+  occupation: "businessRole",
+  profession: "businessRole",
 };
 
 // Ordered so a longer/more specific label (e.g. "Package Preference") is
@@ -56,7 +82,7 @@ const FIELD_BY_NORMALIZED_LABEL: Record<string, string> = {
 // alternation picks the first alternative that matches at a given position,
 // so array order is precedence order here.
 const LABEL_RE =
-  /\b(page\s*url|preferred\s*check[\s-]*in\s*date|package\s*preference|wellness\s*focus|(?:are\s*you\s*)?looking\s*for|phone(?:\s*number)?|package|message|name|age|email|city)\s*:/gi;
+  /\b(page\s*url|preferred\s*check[\s-]*in\s*date|package\s*preference|wellness\s*focus|(?:are\s*you\s*)?looking\s*for|phone(?:\s*number)?|business\s*name|company\s*name|organi[sz]ation\s*name|organi[sz]ation|designation|job\s*title|job\s*role|occupation|profession|company|business|package|message|name|age|email|city|role)\s*:/gi;
 
 function normalizeLabel(raw: string): string {
   return raw.toLowerCase().replace(/[\s-]+/g, "");
@@ -170,6 +196,8 @@ export function parseWebsiteFormEmail(rawText: string): WebsiteFormLead | null {
     phone: values.phone ? normalizeFormPhone(values.phone) : null,
     age: Number.isFinite(age) ? age : null,
     city: values.city ?? null,
+    businessName: values.businessName ?? null,
+    businessRole: values.businessRole ?? null,
     checkinDate: values.checkin ?? null,
     package: values.package ?? null,
     lookingFor: values.lookingFor ?? null,
@@ -179,8 +207,8 @@ export function parseWebsiteFormEmail(rawText: string): WebsiteFormLead | null {
   };
 }
 
-/** The leftover fields (beyond name/email/phone/city, which map to Guest/
- *  Enquiry columns directly) formatted as intake notes. */
+/** The leftover fields (beyond name/email/phone/city/business name/role,
+ *  which map to Guest/Enquiry columns directly) formatted as intake notes. */
 export function formatWebsiteFormNotes(lead: WebsiteFormLead): string | undefined {
   const lines: string[] = [];
   if (lead.age != null) lines.push(`Age: ${lead.age}`);
@@ -188,7 +216,128 @@ export function formatWebsiteFormNotes(lead: WebsiteFormLead): string | undefine
   if (lead.package) lines.push(`Package: ${lead.package}`);
   if (lead.lookingFor) lines.push(`Looking for: ${lead.lookingFor}`);
   if (lead.wellnessFocus) lines.push(`Wellness focus: ${lead.wellnessFocus}`);
+  if (lead.program) lines.push(`Programme: ${lead.program}`);
+  if (lead.weddingDate) lines.push(`Wedding date: ${lead.weddingDate}`);
   if (lead.pageUrl) lines.push(`Submitted via: ${lead.pageUrl}`);
   if (lead.message) lines.push(`Message: ${lead.message}`);
   return lines.length ? lines.join("\n") : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Landing-page programme forms (added Sep 2026)
+// ---------------------------------------------------------------------------
+
+/**
+ * The programme landing pages on trewellness.in — Weight Loss, Sleep
+ * Restoration, Bridal, Harmonising Hormones — notify with a subject of the
+ * form "New <Programme> Inquiry - trewellness.in" and a body the general
+ * parser above can't read:
+ *
+ *   Your Name : Harsh Parekh Contact No : 7574841963 Email ID : x@y.com
+ *   Wedding Date : 2026-10-10 Retreat Date : 2026-09-26 Thanks, Bridal
+ *   Wellness Retreat trewellness.in Tel No.:- +91 87126 23060
+ *
+ * "Email ID" and "Contact No" aren't labels it knows, and the Sleep
+ * Restoration form has no email at all — so every one of these fell through
+ * to ordinary email handling and landed on the site's own sender, the
+ * "trē wellness" guest. Two traps are handled here on purpose:
+ *
+ *  • the signature carries OUR number ("Tel No.:- +91 87126 23060"), so the
+ *    body is cut at "Thanks," before any field is read;
+ *  • phone-only submissions are accepted, which the general parser must never
+ *    do (any email signature with "Name:" and "Phone:" would become a lead) —
+ *    safe here only because the subject line has already identified the form.
+ */
+export const LANDING_FORM_SUBJECT_RE = /^\s*new\s+(.+?)\s+inquiry\s*-\s*trewellness\.in\s*$/i;
+
+/** The page each programme's form lives on — the email doesn't say. */
+const LANDING_PAGE_URL: Record<string, string> = {
+  "weight loss management": "https://trewellness.in/weightloss/",
+  "sleep restoration": "https://trewellness.in/sleep-restoration/",
+  "bridal campaign": "https://trewellness.in/bridal/",
+  "harmonising hormones": "https://trewellness.in/harmonising-hormones/",
+};
+
+const LANDING_FIELD: Record<string, "name" | "phone" | "email" | "dates" | "program" | "wedding"> = {
+  yourname: "name",
+  name: "name",
+  fullname: "name",
+  contactno: "phone",
+  contactnumber: "phone",
+  phonenumber: "phone",
+  phone: "phone",
+  emailid: "email",
+  emailaddress: "email",
+  email: "email",
+  retreatdates: "dates",
+  retreatdate: "dates",
+  tentativeretreatdates: "dates",
+  preferreddates: "dates",
+  preferreddate: "dates",
+  dates: "dates",
+  preferredprogram: "program",
+  weddingdate: "wedding",
+};
+
+// Longest alternatives first — alternation takes the first that matches.
+const LANDING_LABEL_RE =
+  /\b(tentative\s*retreat\s*dates?|retreat\s*dates?|preferred\s*dates?|preferred\s*program(?:me)?|wedding\s*date|your\s*name|full\s*name|contact\s*(?:no|number)\.?|phone\s*number|email\s*(?:id|address)|phone|email|dates|name)\s*:/gi;
+
+/** The programme named in a landing-page notification's subject, or null
+ *  when the subject isn't one. Replies ("Re: New …") are not submissions. */
+export function landingFormProgram(subject: string | null | undefined): string | null {
+  const m = subject ? LANDING_FORM_SUBJECT_RE.exec(subject) : null;
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * Parse a landing-page programme form. Returns null unless the subject is one
+ * of these notifications AND the body yields a name plus a phone or email —
+ * callers then fall back to normal handling rather than guessing.
+ */
+export function parseLandingPageForm(subject: string | null | undefined, rawText: string): WebsiteFormLead | null {
+  const program = landingFormProgram(subject);
+  if (!program) return null;
+
+  // Everything from "Thanks," on is the site's signature — including our own
+  // phone number, which must never be read as the guest's.
+  const text = rawText.replace(/\s+/g, " ").split(/\s+thanks\s*,/i)[0].trim();
+
+  const found: Array<{ field: string; start: number; end: number }> = [];
+  LANDING_LABEL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = LANDING_LABEL_RE.exec(text))) {
+    const field = LANDING_FIELD[m[1].toLowerCase().replace(/[^a-z]/g, "")];
+    if (field) found.push({ field, start: m.index, end: LANDING_LABEL_RE.lastIndex });
+  }
+
+  const values: Record<string, string> = {};
+  for (let i = 0; i < found.length; i++) {
+    const value = text.slice(found[i].end, found[i + 1]?.start ?? text.length).trim();
+    // First occurrence wins: the fields come before anything free-text.
+    if (value && !values[found[i].field]) values[found[i].field] = value;
+  }
+
+  const name = values.name ? stripSalutation(values.name) : "";
+  const email = values.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email) ? values.email.toLowerCase() : null;
+  const phone = values.phone ? normalizeFormPhone(values.phone) : null;
+  if (!name || (!email && !phone)) return null;
+
+  return {
+    fullName: name,
+    email,
+    phone,
+    age: null,
+    city: null,
+    businessName: null,
+    businessRole: null,
+    checkinDate: values.dates ?? null,
+    package: values.program ?? null,
+    lookingFor: null,
+    wellnessFocus: null,
+    message: null,
+    pageUrl: LANDING_PAGE_URL[program.toLowerCase()] ?? null,
+    program,
+    weddingDate: values.wedding ?? null,
+  };
 }

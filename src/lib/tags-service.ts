@@ -23,6 +23,25 @@ export async function syncEnquiryTags(enquiryId: string): Promise<string[]> {
   return merged;
 }
 
+/**
+ * Re-sync every live lead belonging to one guest.
+ *
+ * Some computed system tags (`age:*`, `foreign`) are derived from the GUEST,
+ * not the enquiry — so editing a guest's date of birth or phone silently
+ * invalidates the tags stored on their leads. Those
+ * leads keep rendering the right tags (toEnquiryDTO merges on read), but the
+ * persisted column — which is what tag FILTERS query — falls behind, and the
+ * lead stops matching a filter for the tag it visibly carries. Call this
+ * wherever guest demographics change.
+ */
+export async function syncTagsForGuest(guestId: string): Promise<void> {
+  const enquiries = await prisma.enquiry.findMany({
+    where: { guestId, deletedAt: null },
+    select: { id: true },
+  });
+  for (const e of enquiries) await syncEnquiryTags(e.id);
+}
+
 /** Add a custom tag to a lead and register it in the shared vocabulary. */
 export async function addCustomTag(
   enquiryId: string,

@@ -35,6 +35,27 @@ interface GuestRow {
   ageGroup: string | null;
   hasHealthProfile: boolean;
 }
+/** One row per RECORD. Several rows can share a phone — a family submits one
+ *  screening form each and they all resolve to the same guest. */
+interface RecordRow {
+  recordId: string;
+  guestId: string;
+  name: string;
+  phone: string;
+  guestName: string;
+  hasDuplicate: boolean;
+  updatedAt: string;
+}
+/** One screening-form submission. A guest can have several — a family shares
+ *  a phone number, and Guest.phone is unique. */
+interface HealthRecordRow {
+  id: string;
+  subjectName: string | null;
+  hasDuplicate: boolean;
+  updatedAt: string;
+  record: HealthRecord;
+  schemaMismatch: boolean;
+}
 interface GuestDetail {
   id: string;
   fullName: string;
@@ -46,18 +67,37 @@ interface GuestDetail {
   isReturning: boolean;
 }
 
-export function HealthWorkspace() {
+export function HealthWorkspace({ canEdit }: { canEdit: boolean }) {
   const [q, setQ] = useState("");
+  // Default ON: this screen exists to work on health records, and listing
+  // every guest in the CRM buried the few hundred that actually have one.
+  const [onlyWithRecords, setOnlyWithRecords] = useState(true);
   const [rows, setRows] = useState<GuestRow[]>([]);
+  const [recordRows, setRecordRows] = useState<RecordRow[]>([]);
   const [searching, setSearching] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Which record the detail pane opens on. Set when a record row is clicked;
+  // null means "the guest's first", which is what picking a guest gives you.
+  const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
   const debounce = useRef<ReturnType<typeof setTimeout>>();
 
-  const search = useCallback(async (term: string) => {
+  const search = useCallback(async (term: string, onlyWithRecordsNow: boolean) => {
     setSearching(true);
     try {
-      const data = await api.get<{ items: GuestRow[]; total: number }>(`/api/guests?q=${encodeURIComponent(term)}`);
-      setRows(data.items);
+      const params = new URLSearchParams({ q: term });
+      if (onlyWithRecordsNow) {
+        // Records, one row each. Listing guests here showed a family of three
+        // as a single line and buried two of their records inside it.
+        const data = await api.get<{ items: RecordRow[] }>(`/api/health/records?${params}`);
+        setRecordRows(data.items);
+        setRows([]);
+      } else {
+        // Guests, including those with no record — the only way to start one
+        // for somebody who has never submitted a form.
+        const data = await api.get<{ items: GuestRow[]; total: number }>(`/api/guests?${params}`);
+        setRows(data.items);
+        setRecordRows([]);
+      }
     } finally {
       setSearching(false);
     }
@@ -65,9 +105,10 @@ export function HealthWorkspace() {
 
   useEffect(() => {
     clearTimeout(debounce.current);
-    debounce.current = setTimeout(() => search(q), 250);
+    // The checkbox settles immediately; only typing is debounced.
+    debounce.current = setTimeout(() => search(q, onlyWithRecords), q ? 250 : 0);
     return () => clearTimeout(debounce.current);
-  }, [q, search]);
+  }, [q, onlyWithRecords, search]);
 
   return (
     <div className="flex h-full">
@@ -92,14 +133,62 @@ export function HealthWorkspace() {
               className="pl-8"
             />
           </div>
+          <label className="mt-2 flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={onlyWithRecords}
+              onChange={(e) => setOnlyWithRecords(e.target.checked)}
+              className="h-3.5 w-3.5 rounded border-input accent-brand-600"
+            />
+            Only people with a health record
+          </label>
         </div>
         {/* data-scroll-container: real scroller on this screen (<main> doesn't
             scroll here) so overlays can lock it — see ui/sheet.tsx. */}
         <div data-scroll-container className="flex-1 overflow-y-auto p-2">
+          {/* Record rows: one per health record, so each family member is
+              their own line. Two rows sharing a phone is normal here. */}
+          {recordRows.map((r) => (
+            <button
+              key={r.recordId}
+              onClick={() => {
+                setSelectedId(r.guestId);
+                setSelectedRecordId(r.recordId);
+              }}
+              className={cn(
+                "mb-1 flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
+                selectedRecordId === r.recordId
+                  ? "bg-brand-50 ring-1 ring-brand-200"
+                  : "hover:bg-secondary",
+              )}
+            >
+              <Avatar name={r.name} className="h-8 w-8" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate text-sm font-medium text-foreground">{r.name}</span>
+                  {r.hasDuplicate && (
+                    <Badge className="shrink-0 bg-amber-100 text-amber-900">Duplicate</Badge>
+                  )}
+                </div>
+                <div className="truncate text-xs text-muted-foreground">
+                  {r.phone}
+                  {/* Only when the record is about somebody other than the
+                      guest whose number it arrived on — otherwise it would
+                      just repeat the line above. */}
+                  {r.name.trim().toLowerCase() !== r.guestName.trim().toLowerCase() &&
+                    ` · via ${r.guestName}`}
+                </div>
+              </div>
+              <HeartPulse className="h-4 w-4 shrink-0 text-brand-600" />
+            </button>
+          ))}
           {rows.map((g) => (
             <button
               key={g.id}
-              onClick={() => setSelectedId(g.id)}
+              onClick={() => {
+                setSelectedId(g.id);
+                setSelectedRecordId(null);
+              }}
               className={cn(
                 "mb-1 flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
                 selectedId === g.id ? "bg-brand-50 ring-1 ring-brand-200" : "hover:bg-secondary",
@@ -117,9 +206,9 @@ export function HealthWorkspace() {
               )}
             </button>
           ))}
-          {!searching && rows.length === 0 && (
+          {!searching && rows.length === 0 && recordRows.length === 0 && (
             <p className="px-2 py-8 text-center text-sm text-muted-foreground">
-              No guests found.
+              {onlyWithRecords ? "No health records found." : "No guests found."}
             </p>
           )}
         </div>
@@ -142,9 +231,14 @@ export function HealthWorkspace() {
               <ChevronLeft className="h-4 w-4" /> Back to guests
             </button>
             <HealthDetail
-              key={selectedId}
+              key={`${selectedId}:${selectedRecordId ?? "first"}`}
               guestId={selectedId}
-              onSaved={() => search(q)}
+              initialRecordId={selectedRecordId}
+              onRecordChange={setSelectedRecordId}
+              canEdit={canEdit}
+              // Re-run under the CURRENT filter: saving a record for a guest
+              // who had none is exactly what makes them match it.
+              onSaved={() => search(q, onlyWithRecords)}
             />
           </>
         ) : (
@@ -160,14 +254,26 @@ export function HealthWorkspace() {
 
 function HealthDetail({
   guestId,
+  initialRecordId,
+  onRecordChange,
+  canEdit,
   onSaved,
 }: {
   guestId: string;
+  /** Open on this record. Null = the guest's first, which is what clicking a
+   *  guest (rather than a record) means. */
+  initialRecordId: string | null;
+  /** Reports the record now open, so the list highlight follows the tabs. */
+  onRecordChange: (id: string | null) => void;
+  canEdit: boolean;
   onSaved: () => void;
 }) {
   const [guest, setGuest] = useState<GuestDetail | null>(null);
   const [view, setView] = useState<"record" | "conversation">("record");
   const [record, setRecord] = useState<HealthRecord>(emptyHealthRecord());
+  const [records, setRecords] = useState<HealthRecordRow[]>([]);
+  // Which record is open. Null means the guest has none and Save creates one.
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [exists, setExists] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -188,20 +294,41 @@ function HealthDetail({
     setAckMismatch(false);
     Promise.all([
       api.get<GuestDetail>(`/api/guests/${guestId}`),
-      api.get<{ exists: boolean; record: HealthRecord; updatedAt: string | null; schemaMismatch?: boolean }>(
-        `/api/guests/${guestId}/health`,
-      ),
+      api.get<{ records: HealthRecordRow[] }>(`/api/guests/${guestId}/health`),
     ])
       .then(([g, h]) => {
+        const rows = h.records ?? [];
         setGuest(g);
-        setRecord(h.record);
-        setExists(h.exists);
-        setUpdatedAt(h.updatedAt);
-        setSchemaMismatch(Boolean(h.schemaMismatch));
+        setRecords(rows);
+        // Honour the record the list row asked for; fall back to the first if
+        // it has since been deleted.
+        const open = rows.find((r) => r.id === initialRecordId) ?? rows[0] ?? null;
+        setActiveId(open?.id ?? null);
+        setRecord(open?.record ?? emptyHealthRecord());
+        setExists(rows.length > 0);
+        setUpdatedAt(open?.updatedAt ?? null);
+        setSchemaMismatch(Boolean(open?.schemaMismatch));
       })
       .catch((e) => setError(e instanceof Error ? e.message : "Failed to load"))
       .finally(() => setLoading(false));
-  }, [guestId]);
+  }, [guestId, initialRecordId]);
+
+  /** Open a different record for the same guest. Deliberately drops any
+   *  unsaved edit rather than carrying it across — copying one family
+   *  member's answers onto another's record is the exact harm this screen
+   *  now exists to prevent. */
+  const activeRecord = records.find((r) => r.id === activeId) ?? null;
+
+  function openRecord(row: HealthRecordRow) {
+    setActiveId(row.id);
+    onRecordChange(row.id);
+    setRecord(row.record);
+    setUpdatedAt(row.updatedAt);
+    setSchemaMismatch(row.schemaMismatch);
+    setAckMismatch(false);
+    setSavedAt(null);
+    setError(null);
+  }
 
   function set<K extends keyof HealthRecord>(k: K, v: HealthRecord[K]) {
     setRecord((r) => ({ ...r, [k]: v }));
@@ -213,12 +340,21 @@ function HealthDetail({
     try {
       // Only send the acknowledgement when the record was flagged as an outdated
       // shape and the doctor has explicitly confirmed the overwrite.
-      const url =
-        schemaMismatch && ackMismatch
-          ? `/api/guests/${guestId}/health?acknowledgeSchemaMismatch=true`
-          : `/api/guests/${guestId}/health`;
-      const res = await api.put<{ saved: boolean; updatedAt: string }>(url, record);
+      // recordId is what stops a save landing on a sibling's record when the
+      // guest has more than one; the API refuses an ambiguous write anyway.
+      const params = new URLSearchParams();
+      if (activeId) params.set("recordId", activeId);
+      if (schemaMismatch && ackMismatch) params.set("acknowledgeSchemaMismatch", "true");
+      const qs = params.toString();
+      const url = `/api/guests/${guestId}/health${qs ? `?${qs}` : ""}`;
+      const res = await api.put<{ saved: boolean; recordId: string; updatedAt: string }>(url, record);
       setExists(true);
+      setActiveId(res.recordId);
+      setRecords((rs) =>
+        rs.some((r) => r.id === res.recordId)
+          ? rs.map((r) => (r.id === res.recordId ? { ...r, record, updatedAt: res.updatedAt, schemaMismatch: false } : r))
+          : [...rs, { id: res.recordId, subjectName: null, hasDuplicate: false, updatedAt: res.updatedAt, record, schemaMismatch: false }],
+      );
       setUpdatedAt(res.updatedAt);
       setSavedAt(formatIST(new Date(), { timeStyle: "medium" }));
       setSchemaMismatch(false);
@@ -235,10 +371,19 @@ function HealthDetail({
     setDeleting(true);
     setError(null);
     try {
-      await api.delete(`/api/guests/${guestId}/health`);
-      setRecord(emptyHealthRecord());
-      setExists(false);
-      setUpdatedAt(null);
+      await api.delete(
+        `/api/guests/${guestId}/health${activeId ? `?recordId=${encodeURIComponent(activeId)}` : ""}`,
+      );
+      // Fall back to whatever record is left rather than blanking the screen:
+      // deleting one of a family's records must not look like the guest lost
+      // all of them.
+      const remaining = records.filter((r) => r.id !== activeId);
+      setRecords(remaining);
+      const next = remaining[0] ?? null;
+      setActiveId(next?.id ?? null);
+      setRecord(next?.record ?? emptyHealthRecord());
+      setExists(remaining.length > 0);
+      setUpdatedAt(next?.updatedAt ?? null);
       setSavedAt(null);
       setConfirmingDelete(false);
       onSaved();
@@ -312,16 +457,18 @@ function HealthDetail({
                 <Printer className="h-4 w-4" />
                 Print / Save as PDF
               </Button>
-              <Button
-                variant="secondary"
-                onClick={save}
-                disabled={saving || (schemaMismatch && !ackMismatch)}
-                className="bg-white text-brand-700 hover:bg-white/90"
-              >
-                {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                {exists ? "Save changes" : "Create record"}
-              </Button>
-              {exists && (
+              {canEdit && (
+                <Button
+                  variant="secondary"
+                  onClick={save}
+                  disabled={saving || (schemaMismatch && !ackMismatch)}
+                  className="bg-white text-brand-700 hover:bg-white/90"
+                >
+                  {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                  {exists ? "Save changes" : "Create record"}
+                </Button>
+              )}
+              {canEdit && exists && (
                 <Button
                   variant="secondary"
                   onClick={() => setConfirmingDelete(true)}
@@ -335,6 +482,62 @@ function HealthDetail({
           )}
         </div>
       </div>
+
+      {/* Save and Delete are already hidden without health.edit, but a form
+          full of editable-looking fields still reads as one you can change.
+          Said plainly instead. */}
+      {view === "record" && !canEdit && (
+        <div className="no-print border-b border-border bg-secondary/50 px-6 py-2 text-sm text-muted-foreground">
+          Read-only — you can view this record but not change it.
+        </div>
+      )}
+
+      {/* Record picker — only when there is a choice to make. A family shares
+          one phone and Guest.phone is unique, so several people's screening
+          forms legitimately land on one guest; each is its own record and the
+          subject name is the only thing that tells them apart. */}
+      {view === "record" && records.length > 1 && (
+        <div className="no-print flex flex-wrap items-center gap-2 border-b border-border bg-secondary/40 px-6 py-3">
+          <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            {records.length} records on this number
+          </span>
+          {records.map((r, i) => (
+            <button
+              key={r.id}
+              onClick={() => openRecord(r)}
+              className={cn(
+                "flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm transition-colors",
+                r.id === activeId
+                  ? "border-brand-300 bg-brand-50 font-medium text-brand-800"
+                  : "border-border bg-background text-muted-foreground hover:bg-secondary",
+              )}
+            >
+              {r.subjectName ?? `Record ${i + 1}`}
+              {r.hasDuplicate && (
+                <Badge className="bg-amber-100 text-amber-900">Duplicate</Badge>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* The open record is about someone other than the guest whose page
+          this is — worth saying plainly, since everything else on screen is
+          headed with the guest's name. */}
+      {view === "record" && activeRecord?.subjectName &&
+        activeRecord.subjectName.trim().toLowerCase() !== guest?.fullName.trim().toLowerCase() && (
+        <div className="no-print border-b border-amber-200 bg-amber-50 px-6 py-2 text-sm text-amber-900">
+          This record is for <strong>{activeRecord.subjectName}</strong>, submitted from{" "}
+          {guest?.fullName}&apos;s number.
+        </div>
+      )}
+
+      {view === "record" && activeRecord?.hasDuplicate && (
+        <div className="no-print border-b border-amber-200 bg-amber-50 px-6 py-2 text-sm text-amber-900">
+          More than one screening form was submitted for this person. Both are kept — decide
+          whether the extra one is a correction or a second visit, then delete the one you don&apos;t want.
+        </div>
+      )}
 
       {confirmingDelete && (
         <Dialog open onClose={() => setConfirmingDelete(false)} title="Delete health record" className="md:max-w-sm">

@@ -4,32 +4,63 @@ import { findReturningGuest, toEnquiryDTO, withCurrentAssigneeName } from "./enq
 import { reviveGuestIfDeleted } from "./guest-revive";
 import { syncEnquiryTags } from "./tags-service";
 import { assignNextRep } from "./lead-routing";
-import { pickAssigneeForCategory, pickAssigneeForCampaign } from "./lead-assignment";
-import { slugifyTag } from "./lead-tags";
+import {
+  pickAssigneeForCategory,
+  pickAssigneeForCampaign,
+  pickAssigneeForTags,
+  pickAssigneeForWhatsAppNumber,
+  isSourceRouted,
+} from "./lead-assignment";
+import { slugifyTag, computeSystemTags } from "./lead-tags";
 import type { CreateEnquiryInput } from "./validation";
 import type { EnquiryDTO } from "./types";
+import { holdAssignment } from "./held-assignment";
 
-// A burst of near-simultaneous submissions for the same guest — a double
-// click on a web form, or two lead-gen integrations firing for one real
-// conversion — used to open a separate card per submission. Anything this
-// close together for a guest whose card hasn't been touched yet is treated
-// as the same lead event and folded into the first card instead.
-const DUPLICATE_MERGE_WINDOW_MS = 30 * 60 * 1000;
+/**
+ * Stages that mean "this lead is finished" — a submission arriving now is new
+ * business, not the same conversation, so it earns its own card. Everything
+ * else is still being worked, and a second submission belongs on it.
+ */
+const CLOSED_STAGES = ["lost", "non_leads"] as const;
 
 /** A campaign rule (if the lead's campaignLabel matches one) wins over the
  *  channel default — it's more specific targeting. WhatsApp/email/Google
  *  Sheets can also be restricted to specific staff via the admin
  *  lead-assignment page; every other source/uncovered campaign keeps the
  *  default pool. */
-async function resolveAutoAssignee(
+/**
+ * Exported so the held-assignment worker can replay exactly this decision
+ * when somebody comes on shift — see lib/held-assignment.ts. Anything that
+ * diverged from this would route a delayed lead differently from an
+ * immediate one.
+ */
+export async function resolveAutoAssignee(
   source: string,
   campaignLabel?: string | null,
+  ourWhatsAppNumber?: string | null,
+  tags?: string[] | null,
 ): Promise<{ sub: string; name: string } | null> {
+  // Which of our WhatsApp numbers received the message wins over everything
+  // below it: one line may be the doctor's and another the sales line, which
+  // is a far more specific routing fact than "arrived on WhatsApp". Only ever
+  // set for leads opened by an inbound WhatsApp message.
+  const byNumber = await pickAssigneeForWhatsAppNumber(ourWhatsAppNumber);
+  if (byNumber) return byNumber;
   const byCampaign = await pickAssigneeForCampaign(campaignLabel);
   if (byCampaign) return byCampaign;
-  return source === "whatsapp" || source === "email" || source === "google_sheets"
-    ? pickAssigneeForCategory(source)
-    : assignNextRep();
+  // Then a tag the lead arrived with. Below campaign because a lead belongs
+  // to one campaign but can carry several tags, so this is the looser match
+  // of the two; above the per-source default because it is still far more
+  // specific than "came in by email".
+  const byTag = await pickAssigneeForTags(tags);
+  if (byTag) return byTag;
+  // Any source that has its own settings row uses it; everything left over
+  // (phone, referral, walk_in, other) keeps the default pool. Driven by the
+  // enum rather than a hardcoded list, so a channel added there is routable
+  // immediately — the previous inline check silently excluded website_form,
+  // instagram and facebook, which is how those leads reached every Sales rep
+  // regardless of what an admin had configured.
+  return isSourceRouted(source) ? pickAssigneeForCategory(source) : assignNextRep();
 }
 
 export interface CreateResult {
@@ -90,19 +121,29 @@ async function mergeDuplicateSubmission(
   const dupTag = slugifyTag(`also ${input.source}`);
   const detail = input.campaignLabel ? ` (campaign: ${input.campaignLabel})` : "";
 
-  // The newer submission wins on the date. This only runs for an untouched
-  // new_lead card inside the 30-minute window, so there is no rep edit to
-  // clobber — and the guest correcting their own date minutes later is
-  // exactly the case worth honouring. The old value goes into the note so
-  // the change is visible rather than silent.
+  // On an untouched new_lead the newer submission wins the date: that's a
+  // guest correcting themselves minutes later, and there is no rep edit to
+  // clobber. Past new_lead a human has been working the card and may have
+  // agreed a date on a call, so a web form must NOT silently overwrite it —
+  // the submitted date is recorded in the note instead, for the rep to apply
+  // if it's right. (Before this merged worked cards, only the first case
+  // could occur, which is why the write was unconditional.)
   const newDate = input.preferredCheckIn ?? null;
-  const dateChanged =
+  const dateDiffers =
     newDate != null && target.preferredCheckIn?.getTime() !== newDate.getTime();
-  const dateNote = dateChanged
-    ? target.preferredCheckIn
-      ? ` — check-in updated to ${newDate.toISOString().slice(0, 10)} (was ${target.preferredCheckIn.toISOString().slice(0, 10)})`
-      : ` — check-in ${newDate.toISOString().slice(0, 10)}`
-    : "";
+  const mayOverwriteDate = target.stage === "new_lead";
+  const dateChanged = dateDiffers && mayOverwriteDate;
+  const dateNote = !dateDiffers
+    ? ""
+    : mayOverwriteDate
+      ? target.preferredCheckIn
+        ? ` — check-in updated to ${newDate!.toISOString().slice(0, 10)} (was ${target.preferredCheckIn.toISOString().slice(0, 10)})`
+        : ` — check-in ${newDate!.toISOString().slice(0, 10)}`
+      : ` — they asked for check-in ${newDate!.toISOString().slice(0, 10)}${
+          target.preferredCheckIn
+            ? ` (card still says ${target.preferredCheckIn.toISOString().slice(0, 10)} — left as is)`
+            : ""
+        }`;
 
   const noteLine = `[duplicate merged] ${new Date().toISOString()} — also submitted via ${input.source}${detail}${dateNote}`;
   // The second form's own answers (wellness focus, message, …). Skipped when
@@ -182,6 +223,10 @@ export async function createEnquiry(
     // Permanent dedup key for webhook-sourced leads (see Enquiry.externalRef).
     // Only ever set by the enquiry-form webhook today.
     externalRef?: string | null;
+    // Which of OUR WhatsApp numbers received the message that opened this
+    // lead, E.164. Set only on the inbound-WhatsApp path; routes the lead via
+    // WhatsAppNumberAssignmentRule ahead of the campaign and channel rules.
+    ourWhatsAppNumber?: string | null;
   },
   actor?: Actor | null,
 ): Promise<CreateResult> {
@@ -220,12 +265,18 @@ export async function createEnquiry(
     : null;
 
   let guestId: string;
+  // A guest we already know (phone/email matched) — reported to the caller.
   let isReturning = false;
+  // A guest who has actually stayed before (see guest-visits.ts) — what the
+  // lead's "Returning guest" flag and revisit tag mean. Knowing someone is
+  // not the same as them having visited.
+  let hasVisited = false;
   let priorEnquiries = 0;
   let lastStage: string | undefined;
 
   if (existing) {
     isReturning = true;
+    hasVisited = existing.isReturning;
     priorEnquiries = existing._count.enquiries;
     lastStage = existing.enquiries[0]?.stage;
     guestId = existing.id;
@@ -233,9 +284,10 @@ export async function createEnquiry(
     await prisma.guest.update({
       where: { id: existing.id },
       data: {
-        isReturning: true,
         email: existing.email ?? input.email,
         city: existing.city ?? input.city,
+        businessName: existing.businessName ?? input.businessName,
+        businessRole: existing.businessRole ?? input.businessRole,
         dateOfBirth: existing.dateOfBirth ?? input.dateOfBirth,
         tags: input.tags?.length
           ? Array.from(new Set([...existing.tags, ...input.tags]))
@@ -248,17 +300,26 @@ export async function createEnquiry(
     // already warns a staff member before they create a duplicate on
     // purpose — this guard is for submissions no human ever looked at.
     if (!actor) {
-      const recentOpen = await prisma.enquiry.findFirst({
+      // Any card still being worked, not just an untouched one from the last
+      // half hour. The old rule (stage new_lead AND under 30 minutes) only
+      // caught double-clicks; a guest who filled in the website form a week
+      // after messaging on WhatsApp got a SECOND card while the first was
+      // mid-conversation. Both then showed in the pipeline, and — worse — her
+      // later WhatsApp replies attached to whichever card was newest, so the
+      // thread was split across the two and neither rep saw all of it.
+      const openEnquiry = await prisma.enquiry.findFirst({
         where: {
           guestId: existing.id,
           deletedAt: null,
-          stage: "new_lead",
-          createdAt: { gte: new Date(Date.now() - DUPLICATE_MERGE_WINDOW_MS) },
+          stage: { notIn: [...CLOSED_STAGES] },
         },
-        orderBy: { createdAt: "desc" },
+        // Oldest first: the long-running card is the one carrying the history
+        // and the rep's context, so the new submission joins it rather than
+        // the other way round.
+        orderBy: { createdAt: "asc" },
       });
-      if (recentOpen) {
-        return mergeDuplicateSubmission(recentOpen, input, actor);
+      if (openEnquiry) {
+        return mergeDuplicateSubmission(openEnquiry, input, actor);
       }
     }
   } else {
@@ -268,6 +329,8 @@ export async function createEnquiry(
         phone: input.phone,
         email: input.email,
         city: input.city,
+        businessName: input.businessName,
+        businessRole: input.businessRole,
         gender: input.gender,
         dateOfBirth: input.dateOfBirth ?? undefined,
         tags: input.tags ?? [],
@@ -277,7 +340,44 @@ export async function createEnquiry(
     guestId = guest.id;
   }
 
-  const rep = input.assignedTo ?? (await resolveAutoAssignee(input.source, input.campaignLabel).catch(() => null));
+  // The tags a rule can route on: what the caller supplied PLUS the system
+  // tags this lead already qualifies for.
+  //
+  // The system half is not optional. "foreign" is derived from the guest's
+  // phone (see computeSystemTags) and is never passed in by a caller, so a
+  // rule keyed on it matched nothing at all — the phone was known here the
+  // whole time, it just never reached the resolver. Same for revisit, the
+  // age buckets and source:/campaign: tags.
+  //
+  // Computed from `input` rather than read back from the guest row so it
+  // works identically for a brand-new guest and an existing one, and needs
+  // no extra query.
+  const routingTags = [
+    ...(input.enquiryTags ?? []),
+    ...computeSystemTags(
+      { dateOfBirth: input.dateOfBirth, phone: input.phone },
+      {
+        source: input.source,
+        isReturningFlag: hasVisited,
+        campaignLabel: input.campaignLabel,
+        preferredCheckIn: input.preferredCheckIn,
+      },
+    ),
+  ];
+
+  const rep =
+    input.assignedTo ??
+    (await resolveAutoAssignee(
+      input.source,
+      input.campaignLabel,
+      input.ourWhatsAppNumber,
+      routingTags,
+    ).catch(() => null));
+  // Nobody on shift right now. The lead is created unassigned and queued, and
+  // the worker hands it over as soon as somebody's shift starts — see
+  // lib/held-assignment.ts. Only when we ASKED for an automatic assignee:
+  // a lead that arrived with an explicit owner was never waiting on anyone.
+  const shouldHold = !input.assignedTo && !rep;
 
   let enquiry;
   try {
@@ -286,7 +386,7 @@ export async function createEnquiry(
         guestId,
         source: input.source as never,
         stage: "new_lead",
-        isReturningFlag: isReturning,
+        isReturningFlag: hasVisited,
         campaignLabel: input.campaignLabel,
         // Plain field, not a Note/remark — simpler for automations (n8n, the
         // public enquiry-form webhook) to fill in without a second write, and
@@ -328,6 +428,20 @@ export async function createEnquiry(
     throw err;
   }
 
+  // Queued only once the lead actually exists, so a creation that threw
+  // leaves nothing behind in the queue pointing at no lead.
+  if (shouldHold) {
+    await holdAssignment({
+      enquiryId: enquiry.id,
+      source: input.source,
+      campaignLabel: input.campaignLabel,
+      ourWhatsAppNumber: input.ourWhatsAppNumber,
+      // The same list the live decision used, so a held lead placed an hour
+      // later routes identically to one placed immediately.
+      tags: routingTags,
+    });
+  }
+
   await prisma.activity.create({
     data: {
       enquiryId: enquiry.id,
@@ -336,7 +450,11 @@ export async function createEnquiry(
       actorRole: actor?.role ?? "system",
       actorName: actor?.name ?? "Inbound",
       actionType: "created",
-      metadata: { source: input.source, returning: isReturning },
+      // `manual` distinguishes a staff member typing the lead in through the
+      // "New lead" dialog from every auto-created path (webhook, inbound
+      // WhatsApp/email, call routing) — the timeline and the admin Activity
+      // Log both render it, so a hand-entered lead is visibly hand-entered.
+      metadata: { source: input.source, returning: isReturning, manual: Boolean(actor) },
     },
   });
 

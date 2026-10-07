@@ -8,7 +8,7 @@ import { NextRequest } from "next/server";
 import { handle, ok, requirePermission, ApiError } from "@/lib/api";
 import { prisma } from "@/lib/prisma";
 import { updateWhatsAppNumberSchema } from "@/lib/validation";
-import { logoutInstance, deleteInstance } from "@/lib/whatsapp-admin";
+import { logoutInstance, deleteInstance, resetQrAttempts } from "@/lib/whatsapp-admin";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -65,6 +65,7 @@ export async function DELETE(
 
     await logoutInstance(number.instanceName).catch(() => null);
     await deleteInstance(number.instanceName).catch(() => null);
+    resetQrAttempts(number.instanceName);
     await prisma.whatsAppNumber.delete({ where: { id: params.id } });
 
     return ok({ id: params.id });

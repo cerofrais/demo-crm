@@ -8,7 +8,11 @@ export default async function BroadcastStatusPage() {
   const session = await auth();
   if (!session?.user) redirect("/login");
   const roles = session.roles ?? [];
-  if (!can(roles, "messaging.broadcast")) redirect("/leads");
+  // Same permission as the sidebar and the middleware guard. It used to be
+  // messaging.broadcast, which let every sending role in and — because
+  // Viewer does not hold that — bounced the one read-only role the
+  // messaging.viewStatus permission was written for.
+  if (!can(roles, "messaging.viewStatus")) redirect("/leads");
   const canDelete = can(roles, "leads.manage");
 
   return (

@@ -72,13 +72,18 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const { instanceToken } = await createInstance(instanceName, cloudApi);
+      // No Evolution instance is created: a Cloud API number talks to Meta
+      // directly in both directions (lib/whatsapp-cloud-api.ts for sends,
+      // /api/webhooks/whatsapp-cloud for inbound and statuses). instanceName
+      // is still needed — it is this number's Message.mailboxId — but there
+      // is no Evolution-scoped token behind it, hence the marker below rather
+      // than a secret that doesn't exist.
       const number = await prisma.whatsAppNumber.create({
         data: {
           label,
           phoneNumber: `+${String(info.display_phone_number).replace(/\D/g, "")}`,
           instanceName,
-          instanceToken,
+          instanceToken: "cloud-api",
           status: "connected",
           integration: "cloud_api",
           wabaId: cloudApi.wabaId,

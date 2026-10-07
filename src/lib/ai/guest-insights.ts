@@ -72,7 +72,7 @@ export async function generateGuestInsight(guestId: string): Promise<void> {
         },
       },
       memberships: { where: { status: "active" } },
-      healthProfile: true,
+      healthProfiles: { orderBy: { createdAt: 'asc' } },
     },
   });
   if (!guest) return;
@@ -92,12 +92,15 @@ export async function generateGuestInsight(guestId: string): Promise<void> {
 
   // Decrypt the health profile (best effort — key may differ across envs).
   let health = "none on file";
-  if (guest.healthProfile) {
+  // Only the first record: the AI summary describes the guest, and a
+  // family member's record attached to the same phone is not about them.
+  const primaryHealth = guest.healthProfiles[0];
+  if (primaryHealth) {
     try {
       const rec = decryptJson<HealthRecord>({
-        ciphertext: guest.healthProfile.encryptedData,
-        iv: guest.healthProfile.iv,
-        authTag: guest.healthProfile.authTag,
+        ciphertext: primaryHealth.encryptedData,
+        iv: primaryHealth.iv,
+        authTag: primaryHealth.authTag,
       } as EncryptedBlob);
       health = redactPhi
         ? coarseHealth(rec)

@@ -1,14 +1,17 @@
 /**
- * Direct Meta WhatsApp Cloud API client — used only for numbers connected
- * via the official Cloud API (see docs/17-whatsapp-integration.md), not the
- * QR-paired Baileys numbers. Evolution API still owns instance lifecycle and
- * inbound webhook relay for these numbers (whatsapp-admin.ts /
- * /api/webhooks/whatsapp-cloud-relay) — this file talks to
- * graph.facebook.com directly for the two things Evolution doesn't cleanly
- * abstract across both integration modes: listing a WABA's approved message
- * templates, and sending one. Bulk/marketing sends on a Cloud API number
- * must use an approved template outside an open 24h customer-service
- * window, which is the normal case for a broadcast.
+ * Direct Meta WhatsApp Cloud API client — everything a number connected via
+ * the official Cloud API does, talking to graph.facebook.com itself (see
+ * docs/17-whatsapp-integration.md). Evolution API is NOT in this path at all:
+ * it stays behind the QR-paired Baileys numbers, which need its Web-protocol
+ * implementation, while a Cloud API number is just HTTPS to Meta and gains
+ * nothing from a proxy in front of it.
+ *
+ * Covers listing a WABA's approved message templates and sending one
+ * (bulk/marketing outside an open 24h customer-service window must use an
+ * approved template, which is the normal case for a broadcast), free-form
+ * text and media sends inside that window, and downloading inbound media.
+ * Inbound messages and delivery statuses arrive at
+ * /api/webhooks/whatsapp-cloud (Meta's webhook, called by Meta directly).
  */
 import { logger } from "./logger";
 
@@ -164,4 +167,151 @@ export async function sendTemplateMessage(
     "whatsapp cloud api: template sent",
   );
   return { externalId };
+}
+
+// ---------------------------------------------------------------------------
+// Free-form (non-template) send + inbound media, direct to Meta
+//
+// These used to go through Evolution API's /message/sendText and
+// /chat/getBase64FromMediaMessage even for Cloud API numbers, so a Cloud API
+// message made two hops (CRM -> Evolution -> Meta) where only the second one
+// carried any meaning: Evolution's Cloud API mode is a thin proxy over the
+// very Graph endpoints below. That extra hop is also where Cloud API delivery
+// statuses were being lost (Evolution v2.3.7 crashes normalizing them). Cloud
+// API numbers now talk to Meta directly end to end; Evolution stays in place
+// for the QR-paired Baileys numbers, which genuinely need it.
+// ---------------------------------------------------------------------------
+
+/** The Cloud API credentials a send needs, pulled off a WhatsAppNumber row. */
+export interface CloudApiCreds {
+  phoneNumberId: string;
+  accessToken: string;
+}
+
+/**
+ * Reads the Cloud API credentials off a number row, throwing a clear error
+ * rather than letting an undefined phone-number-id build a Graph URL that
+ * 404s with something unreadable. A cloud_api row without these was created
+ * before the column existed, or had them cleared by hand.
+ */
+export function cloudApiCredsOf(number: {
+  integration: string;
+  metaPhoneNumberId: string | null;
+  metaAccessToken: string | null;
+  label: string;
+}): CloudApiCreds {
+  if (!number.metaPhoneNumberId || !number.metaAccessToken) {
+    throw new Error(
+      `WhatsApp number "${number.label}" is set to cloud_api but has no Meta Phone Number ID / access token`,
+    );
+  }
+  return { phoneNumberId: number.metaPhoneNumberId, accessToken: number.metaAccessToken };
+}
+
+async function postMessage(
+  creds: CloudApiCreds,
+  payload: Record<string, unknown>,
+): Promise<{ externalId: string | null }> {
+  const url = `${META_GRAPH_BASE}/${META_GRAPH_VERSION}/${creds.phoneNumberId}/messages`;
+  const res = await metaFetchOk(url, creds.accessToken, {
+    method: "POST",
+    body: JSON.stringify({ messaging_product: "whatsapp", recipient_type: "individual", ...payload }),
+  });
+  const data = await res.json();
+  return { externalId: data?.messages?.[0]?.id ?? null };
+}
+
+/**
+ * Free-form text — only deliverable inside an open 24h customer-service
+ * window; outside it Meta rejects with 131047 and the caller must use
+ * sendTemplateMessage instead. `preview_url` is on so a link in the body
+ * renders as a rich preview, matching what Baileys does by default.
+ */
+export async function sendCloudApiText(
+  creds: CloudApiCreds,
+  to: string,
+  text: string,
+): Promise<{ externalId: string | null }> {
+  return postMessage(creds, {
+    to: to.replace(/^\+/, ""),
+    type: "text",
+    text: { preview_url: true, body: text },
+  });
+}
+
+/**
+ * Free-form media. Meta takes an uploaded media id (or a public link), never
+ * inline bytes, so this uploads first and then sends — two calls where
+ * Evolution's sendMedia was one, but the upload is the same one Meta's own
+ * API requires and Evolution was doing it internally anyway.
+ *
+ * Audio deliberately goes out as `type: "audio"`, which is what renders as a
+ * voice note on the recipient's phone — the equivalent of Evolution's
+ * separate sendWhatsAppAudio endpoint. Meta ignores a caption on audio, so
+ * one isn't sent.
+ */
+export async function sendCloudApiMedia(
+  creds: CloudApiCreds,
+  to: string,
+  opts: { mimeType: string; fileName: string; base64: string; caption?: string },
+): Promise<{ externalId: string | null }> {
+  const buffer = Buffer.from(opts.base64, "base64");
+  const { mediaId } = await uploadMedia(
+    creds.phoneNumberId,
+    creds.accessToken,
+    buffer,
+    opts.mimeType,
+    opts.fileName,
+  );
+  const recipient = to.replace(/^\+/, "");
+  const caption = opts.caption?.trim() || undefined;
+
+  if (opts.mimeType.startsWith("audio/")) {
+    return postMessage(creds, { to: recipient, type: "audio", audio: { id: mediaId } });
+  }
+  if (opts.mimeType.startsWith("image/")) {
+    return postMessage(creds, { to: recipient, type: "image", image: { id: mediaId, caption } });
+  }
+  if (opts.mimeType.startsWith("video/")) {
+    return postMessage(creds, { to: recipient, type: "video", video: { id: mediaId, caption } });
+  }
+  return postMessage(creds, {
+    to: recipient,
+    type: "document",
+    document: { id: mediaId, caption, filename: opts.fileName },
+  });
+}
+
+export interface CloudApiMedia {
+  buffer: Buffer;
+  mimeType: string;
+}
+
+/**
+ * Downloads an inbound media message's bytes. Meta's webhook carries only a
+ * media id; resolving it is two hops — the id gives a short-lived lookaside
+ * URL, and that URL still needs the bearer token to fetch. Both are done
+ * here so callers see one call, mirroring getMediaBase64's shape for the
+ * Baileys path.
+ */
+export async function fetchCloudApiMedia(
+  creds: CloudApiCreds,
+  mediaId: string,
+): Promise<CloudApiMedia> {
+  const metaUrl = `${META_GRAPH_BASE}/${META_GRAPH_VERSION}/${mediaId}`;
+  const metaRes = await metaFetchOk(metaUrl, creds.accessToken);
+  const meta = await metaRes.json();
+  const url: string | undefined = meta?.url;
+  if (!url) throw new Error(`Meta returned no download URL for media ${mediaId}`);
+
+  // NOT metaFetchOk: the lookaside host rejects a request carrying
+  // Content-Type: application/json on a GET, and the response is bytes.
+  const fileRes = await fetch(url, { headers: { Authorization: `Bearer ${creds.accessToken}` } });
+  if (!fileRes.ok) {
+    throw new Error(`Meta media download ${mediaId} -> ${fileRes.status}`);
+  }
+  return {
+    buffer: Buffer.from(await fileRes.arrayBuffer()),
+    mimeType: meta?.mime_type ?? fileRes.headers.get("content-type") ?? "application/octet-stream",
+  };
 }

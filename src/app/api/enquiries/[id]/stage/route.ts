@@ -2,10 +2,17 @@ import { NextRequest } from "next/server";
 import { handle, ok, requireSession, ApiError } from "@/lib/api";
 import { can, canWorkLeadStage, isPostBookingStage, isAdmin } from "@/lib/rbac";
 import { prisma } from "@/lib/prisma";
-import { toEnquiryDTO, withCurrentAssigneeName } from "@/lib/enquiries";
+import { applyStageTransition } from "@/lib/stage-transition";
+import { GUEST_WITH_HEALTH_COUNT, toEnquiryDTO, withCurrentAssigneeName } from "@/lib/enquiries";
+import { affectsVisited, refreshGuestVisited } from "@/lib/guest-visits";
 import { moveStageSchema } from "@/lib/validation";
-import { createDoctorReviewTask, createFollowUpTasks, reassignTasksForEnquiry, withRnrProgress, withLostRequestPending } from "@/lib/tasks";
+import { reassignTasksForEnquiry, withRnrProgress, withLostRequestPending, withOpenTasks,
+  createPaymentPendingTask,
+  closePaymentPendingTasks,
+  deleteTasksForEnquiry,
+} from "@/lib/tasks";
 import { syncEnquiryTags } from "@/lib/tags-service";
+import { logger } from "@/lib/logger";
 import type { EnquiryStage } from "@prisma/client";
 
 export const dynamic = "force-dynamic";
@@ -70,6 +77,12 @@ export async function PATCH(
     // clock so a later re-request/approval restarts it instead of reusing a
     // stale stamp.
     const leavingLost = stage !== "lost" && current.stage === "lost";
+    // Filing a card as a non-lead means nobody works it again, so its open
+    // follow-ups go with it — otherwise the RNR cadence keeps scheduling
+    // calls against a spam submission. Same clean-up Lost/Dead gets on
+    // approval; deletion-approval tasks are preserved either way, since one
+    // of those is the audit record of a transition.
+    const enteringNonLeads = stage === "non_leads" && current.stage !== "non_leads";
 
     const updated = await prisma.enquiry.update({
       where: { id: params.id },
@@ -83,9 +96,15 @@ export async function PATCH(
             ? { assignedToSub: ctx.sub, assignedToName: ctx.name }
             : {}),
         ...(leavingLost ? { lostAt: null } : {}),
+        ...(enteringNonLeads ? { needsAttention: false } : {}),
       },
-      include: { guest: true },
+      include: { guest: GUEST_WITH_HEALTH_COUNT },
     });
+
+    // Booking Confirmed / Converted is what makes a guest a returning guest.
+    if (affectsVisited(current.stage, stage)) {
+      await refreshGuestVisited(updated.guestId);
+    }
 
     if (willAssign) {
       await prisma.activity.create({
@@ -113,18 +132,12 @@ export async function PATCH(
       });
     }
 
-    if (current.stage !== stage) {
-      await prisma.activity.create({
-        data: {
-          enquiryId: updated.id,
-          guestId: updated.guestId,
-          actorSub: ctx.sub,
-          actorRole: ctx.roles[0] ?? "STAFF",
-          actorName: ctx.name,
-          actionType: "stage_change",
-          metadata: { from: current.stage, to: stage },
-        },
-      });
+    // Best-effort: the card has already moved, and a lingering follow-up is
+    // worth far less than the move failing after the fact.
+    if (enteringNonLeads) {
+      await deleteTasksForEnquiry(updated.id).catch((err) =>
+        logger.error({ err, enquiryId: updated.id }, "non-leads: could not clear follow-up tasks"),
+      );
     }
 
     // Reassignment (drag-to-claim, or auto-unassign into the post-booking
@@ -133,31 +146,22 @@ export async function PATCH(
       await reassignTasksForEnquiry(updated.id, updated.assignedToSub);
     }
 
-    // Entering RNR kicks off the 6-2-1 follow-up reminders for the owner.
-    if (stage === "rnr" && current.stage !== "rnr") {
-      await createFollowUpTasks(updated.id, updated.assignedToSub ?? ctx.sub);
-    }
-
-    // Entering Doctor Consultation opens a review task any doctor can pick up.
-    if (stage === "doctor_consultation" && current.stage !== "doctor_consultation") {
-      await createDoctorReviewTask(updated.id, updated.guest.fullName, ctx.sub);
-    }
-
-    // Referral redemption: count it once, when the lead is first booked (§6.5).
-    if (
-      stage === "booking_confirmed" &&
-      current.stage !== "booking_confirmed" &&
-      current.referralCodeId
-    ) {
-      await prisma.referralCode.update({
-        where: { id: current.referralCodeId },
-        data: { redemptionCount: { increment: 1 } },
-      });
-    }
+    // The stage move itself: the activity row and every task it raises or
+    // closes. Shared with the drawer's edit form — see lib/stage-transition.ts.
+    await applyStageTransition({
+      enquiryId: updated.id,
+      guestId: updated.guestId,
+      guestName: updated.guest.fullName,
+      from: current.stage,
+      to: stage as EnquiryStage,
+      assignedToSub: updated.assignedToSub,
+      referralCodeId: current.referralCodeId,
+      actor: { sub: ctx.sub, role: ctx.roles[0] ?? "STAFF", name: ctx.name },
+    });
 
     // Persist tags (re-affirms source/age/revisit on the moved card).
     updated.tags = await syncEnquiryTags(updated.id);
 
-    return ok(await withLostRequestPending(await withRnrProgress(await withCurrentAssigneeName(toEnquiryDTO(updated)))));
+    return ok(await withOpenTasks(await withLostRequestPending(await withRnrProgress(await withCurrentAssigneeName(toEnquiryDTO(updated))))));
   });
 }

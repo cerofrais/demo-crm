@@ -13,6 +13,12 @@ import { reconcileTranscript, type TranscriptAttempt } from "./transcript-transl
 import { asrLanguages } from "./config";
 import { collapseRepetitions, isUsableTranscript } from "./transcript-quality";
 import { logAiDecision } from "./audit";
+import {
+  canTranscribeNow,
+  isTranscribableStatus,
+  MAX_TRANSCRIPT_ATTEMPTS,
+  pendingCallsWhere,
+} from "./call-analysis-queue";
 import { DATA_FENCE_RULES, fence, llmNumber, llmString, llmStringArray, parseLlm } from "./safety";
 
 export interface CallCoaching {
@@ -105,26 +111,24 @@ export async function analyzeCall(
   let transcript = call.transcript;
   let transcriptEnglish = call.transcriptEnglish;
 
-  // A no_answer call still has a recording: Plivo bridges the rep's leg first,
-  // so the file contains the "Connecting your customer now…" announcement and
-  // then ringing. There is no conversation in it to transcribe.
-  //
-  // Measured over 50 recordings >30s: 21 were no_answer, and feeding them to
-  // ASR produced 12 repetition loops ("Hello. Hello. Hello…" for two minutes)
-  // which then went on to the summariser as if they were real calls. Skipping
-  // them removes that whole class of garbage and ~15 minutes of CPU per 50.
-  //
-  // Deliberately only no_answer: `voicemail` recordings do contain speech, and
-  // the call is still analysed from its notes below either way.
-  const answered = call.status !== "no_answer";
-  if (!answered && call.recordingUrl) {
-    logger.info(
-      { callId, status: call.status },
-      "ai: skipping transcription — call was never answered, recording is ringing only",
-    );
+  // Whether this recording can hold a conversation at all — see
+  // TRANSCRIBABLE_STATUSES. A no_answer recording is ringing only, and
+  // records that fact once rather than being re-tried forever.
+  const transcribableAudio = isTranscribableStatus(call.status);
+  if (!transcribableAudio && call.recordingUrl && !call.transcriptError) {
+    await prisma.call.update({
+      where: { id: call.id },
+      data: { transcriptError: "the call was never answered — the recording is ringing only" },
+    }).catch(() => null);
   }
-  if (!transcriptEnglish && call.recordingUrl && answered && transcriptionEnabled()) {
-    const upstream = await fetchRecording(call.recordingUrl);
+  if (!transcriptEnglish && transcriptionEnabled() && canTranscribeNow(call)) {
+    // Counted before the work: a decode that hangs or crashes the process
+    // must still cost an attempt, or the call is retried forever.
+    await prisma.call.update({
+      where: { id: call.id },
+      data: { transcriptAttempts: { increment: 1 }, transcriptAttemptAt: new Date() },
+    });
+    const upstream = await fetchRecording(call.recordingUrl!);
     if (upstream.ok) {
       const audio = await upstream.arrayBuffer();
       const attempts: TranscriptAttempt[] = [];
@@ -155,16 +159,43 @@ export async function analyzeCall(
           transcriptEnglish = collapseRepetitions(reconciled.englishText);
           await prisma.call.update({
             where: { id: call.id },
-            data: { transcript, transcriptEnglish, transcriptLanguage: reconciled.language },
+            data: {
+              transcript,
+              transcriptEnglish,
+              transcriptLanguage: reconciled.language,
+              transcriptError: null,
+            },
           });
         } else {
+          await noteTranscriptFailure(call.id, "the transcript couldn't be recovered from the audio");
           logger.warn({ callId }, "ai: transcript unrecoverable, leaving call untranscribed");
         }
       } else {
+        await noteTranscriptFailure(call.id, "no speech was recognised in the recording");
         logger.warn({ callId }, "ai: all transcription attempts failed");
       }
     } else {
-      logger.warn({ callId, status: upstream.status }, "ai: recording fetch failed");
+      // 401/403 is OUR problem, not this recording's: the Plivo credentials
+      // don't cover the account holding it (recordings from before the 20 Aug
+      // account change live on the old one). The attempt still counts —
+      // refunding it would mean retrying forever, which is the exact loop
+      // this whole change exists to remove. Fixing the credential is an
+      // operator action, and so is the reset that follows it:
+      //   UPDATE "Call" SET "transcriptAttempts" = 0, "transcriptError" = NULL
+      //   WHERE "transcriptError" LIKE '%provider refused%';
+      const systemic = upstream.status === 401 || upstream.status === 403 || upstream.status >= 500;
+      await noteTranscriptFailure(
+        call.id,
+        systemic
+          ? "the recording couldn't be downloaded — the phone provider refused the request"
+          : "the recording couldn't be downloaded",
+      );
+      logger[systemic ? "error" : "warn"](
+        { callId, status: upstream.status },
+        systemic
+          ? "ai: recording fetch refused by the provider — check the Plivo credentials cover this account"
+          : "ai: recording fetch failed",
+      );
     }
   }
   if (!transcript && !call.notes) return "no transcript or notes to analyse";
@@ -232,32 +263,16 @@ export async function analyzeCall(
 /** Batch step for the pipeline: analyse up to `limit` pending calls. */
 export async function runCallAnalysis(limit = 5): Promise<number> {
   const pending = await prisma.call.findMany({
-    where: {
-      status: { in: ["completed", "no_answer", "voicemail"] },
-      OR: [
-        {
-          aiAnalyzedAt: null,
-          OR: [{ recordingUrl: { not: null } }, { notes: { not: null } }],
-        },
-        // Backfill: a call got analysed from notes only (Plivo's recording
-        // callback hadn't landed yet — it's async and can trail the call
-        // ending by anywhere from seconds to a couple minutes) — the
-        // aiAnalyzedAt gate above then hid it from every later tick forever,
-        // so the recording plays fine but the transcript never matches it.
-        // Re-run now that a recording exists but no transcript came of it.
-        {
-          aiAnalyzedAt: { not: null },
-          recordingUrl: { not: null },
-          transcriptEnglish: null,
-        },
-      ],
-    },
+    where: pendingCallsWhere(),
     orderBy: { startedAt: "desc" },
     take: limit,
     select: { id: true, aiAnalyzedAt: true },
   });
 
   let done = 0;
+  // Calls this tick removed from the queue without analysing them (nothing to
+  // analyse). That is progress, not a jam — the queue is shorter afterwards.
+  let retired = 0;
   for (const { id, aiAnalyzedAt } of pending) {
     try {
       const skipped = await analyzeCall(id, aiAnalyzedAt !== null);
@@ -265,10 +280,36 @@ export async function runCallAnalysis(limit = 5): Promise<number> {
       else if (!aiAnalyzedAt) {
         // Nothing usable — stamp it so the pipeline doesn't retry forever.
         await prisma.call.update({ where: { id }, data: { aiAnalyzedAt: new Date() } });
+        retired++;
       }
     } catch (err) {
       logger.error({ err, callId: id }, "ai: call analysis failed");
     }
   }
+
+  // A tick that selects work and completes none of it is how the queue jammed
+  // before: the same calls were picked every five minutes and none could ever
+  // succeed. The attempt cap now bounds that, and this says so out loud if it
+  // ever starts again.
+  if (pending.length && !done && !retired) {
+    logger.warn(
+      { selected: pending.length, callIds: pending.map((c) => c.id) },
+      "ai: call analysis tick made no progress — every selected call was skipped and none retired",
+    );
+  }
+  // The other shape of the same failure is a backlog that grows while each
+  // tick does a little work. One indexed count makes it visible in the log
+  // instead of only in the Calls tab weeks later.
+  if (pending.length === limit) {
+    const backlog = await prisma.call.count({ where: pendingCallsWhere() });
+    if (backlog > limit) logger.info({ backlog, done }, "ai: calls still waiting for analysis");
+  }
   return done;
+}
+
+/** Record why no transcript came out — the Calls tab shows this text. */
+async function noteTranscriptFailure(callId: string, reason: string): Promise<void> {
+  await prisma.call
+    .update({ where: { id: callId }, data: { transcriptError: reason } })
+    .catch(() => null);
 }

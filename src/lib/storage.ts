@@ -117,6 +117,17 @@ const MIME_ALLOWLIST: Record<string, readonly string[]> = {
     "image/webp",
     ...OFFICE_MIME,
   ],
+  // Restricted library files are ordinary business documents that simply
+  // aren't for everyone — same shapes as operational, same stored-XSS rules.
+  private: [
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    ...OFFICE_MIME,
+    ...AUDIO_MIME,
+  ],
 };
 
 // Global ceiling override (env MAX_UPLOAD_MB, default 50MB) — acts as an upper
@@ -127,6 +138,7 @@ const CATEGORY_MAX_MB: Record<string, number> = {
   consent: 25,
   operational: 50,
   marketing: 50,
+  private: 50,
 };
 
 /** Max allowed upload size (bytes) for a document category (F39). */

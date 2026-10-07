@@ -18,7 +18,10 @@ export default async function TasksPage() {
         title="Tasks & Reminders"
         subtitle="Your 6-2-1 follow-ups (call within 6h · 2 days · 1 week). Overdue items are flagged."
       />
-      <TasksList canSeeAll={can(roles, "reports.allStaff")} />
+      <TasksList
+        canSeeAll={can(roles, "reports.allStaff")}
+        canRemoveDoctorTasks={can(roles, "leads.delete")}
+      />
     </div>
   );
 }

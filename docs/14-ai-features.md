@@ -48,6 +48,7 @@ All are **off** unless `AI_ENABLED=true`; each also has its own kill switch
 
 ```bash
 AI_FEATURE_CALL_ANALYSIS=true
+AI_FEATURE_VOICE_NOTES=true
 AI_FEATURE_LEAD_SCORING=true
 AI_FEATURE_GUEST_INSIGHTS=true
 AI_FEATURE_ASSIST=true
@@ -188,7 +189,66 @@ translates, and writes the score/coaching from the **English translation**
 instead of the rep's notes — `Call.transcript` / `transcriptEnglish` /
 `transcriptLanguage` in the DB confirm which path ran.
 
-### 2. Lead conversion scoring (`lead-scoring.ts`)
+### 2. Voice note transcription (`voice-note-transcribe.ts`)
+
+WhatsApp voice notes — sent from the CRM's recorder or received from a guest,
+on either the Baileys or Cloud API numbers — go through the **same** ASR
+endpoint as call recordings and land on the `Message` row
+(`transcript` / `transcriptEnglish` / `transcriptLanguage`, plus
+`transcriptError` / `transcriptAttempts` when a clip won't decode).
+
+Two differences from calls:
+
+- the audio comes from our own object storage, not Plivo;
+- the "is this real speech" floor is far lower (`VOICE_NOTE_TRANSCRIPT_FLOOR`
+  in `transcript-quality.ts`). A real note is often one clause — "haan bhej
+  dijiye" — which the call floor discards as a failed decode. The floor still
+  stops an empty decode reaching the reconciliation LLM, which is what
+  produced invented transcripts on calls. The same gate drops Whisper's stock
+  hallucinations on silence ("Thanks for watching!", subtitle credits) —
+  `isAsrFillerOnly` — which clear the length floors but are not speech.
+
+Transcription starts the moment a note is sent or received
+(`queueVoiceNoteTranscription`, fire-and-forget so the webhook still answers
+immediately); the pipeline sweep re-tries anything missed, up to
+`MAX_TRANSCRIPT_ATTEMPTS` (3) per clip, for notes up to 30 days old —
+`VOICE_NOTE_MAX_AGE_DAYS` raises that window for a one-off backfill of older
+notes.
+
+Where it shows up: a **mic icon** marks the row in the lead drawer's Activity
+tab and in the Activity Log, with the English transcript underneath
+(`Voice note sent` / `Voice note received`), and the transcript also appears
+under the player in the WhatsApp conversation. Until the pass has run the row
+reads "Transcribing…"; once it has given up it says why instead.
+
+**Why a call can have no transcript.** `lib/ai/call-analysis-queue.ts` holds
+the rules, as pure functions with tests:
+
+- `no_answer` calls are never transcribed (ringing only) — and, just as
+  importantly, are never re-queued for transcription. They were, once: the
+  retry branch matched "has a recording, has no English transcript", which is
+  permanently true of every unanswered call. Newest-first with a batch of 5,
+  the same five calls held every slot forever — 72 ticks in six hours,
+  `callsAnalyzed: 0` on all of them, two recordings decoded 144 times each,
+  while ten calls from three weeks earlier had never been looked at.
+- Transcription attempts are counted (`Call.transcriptAttempts`, cap 3) and
+  spaced 30 minutes apart, so audio that will never decode stops.
+- `Call.transcriptError` records why, and the Calls tab shows that instead of
+  a blank cell.
+- A tick that selects work and finishes none of it logs a warning, and a
+  backlog above the batch size is logged too.
+- A 401/403 from Plivo means the credentials don't cover the account holding
+  that recording — recordings made before the 20 Aug account change live on
+  the old account and answer 401 today. It logs at error level naming the
+  cause. The attempt still counts (retrying forever is the failure mode this
+  design removes), so after fixing the credential, reset the affected calls:
+
+  ```sql
+  UPDATE "Call" SET "transcriptAttempts" = 0, "transcriptError" = NULL
+  WHERE "transcriptError" LIKE '%provider refused%';
+  ```
+
+### 3. Lead conversion scoring (`lead-scoring.ts`)
 
 Open enquiries get a 0–100 conversion-likelihood score + one-line reason
 (`Enquiry.aiScore/aiScoreReason`). Re-scored automatically whenever
@@ -196,7 +256,7 @@ Open enquiries get a 0–100 conversion-likelihood score + one-line reason
 badge on Kanban cards (green ≥70, amber ≥40, grey below) with the reason on
 hover, and in the drawer's AI tab.
 
-### 3. Guest insights (`guest-insights.ts`)
+### 4. Guest insights (`guest-insights.ts`)
 
 Guests with a completed/booked stay get a **return-likelihood** score and a
 **next-programme recommendation** grounded in their (decrypted) health profile,
@@ -204,7 +264,7 @@ stay history and memberships (`Guest.aiReturnScore/aiNextProgram`). Scores ≥70
 auto-create a timed **"AI outreach: …"** `Task` assigned to the lead's rep —
 this is the upsell/re-engagement driver. Refreshed on a 30-day TTL.
 
-### 4. Conversation assist (`assistant.ts`)
+### 5. Conversation assist (`assistant.ts`)
 
 The **AI Assist** tab in the lead drawer calls `POST /api/ai/assist` with the
 enquiry id. The agent reads the full context (profile, stage, notes, email
@@ -227,8 +287,8 @@ AI_PIPELINE_ENABLED=true         # only runs when AI_ENABLED=true as well
 AI_PIPELINE_INTERVAL_SEC=300
 ```
 
-Each tick runs call analysis → lead scoring → guest insights in small batches
-(5/8/5) so a slow local model never floods. Admins/managers can force a tick
+Each tick runs call analysis → voice notes → lead scoring → guest insights in
+small batches (5/5/8/5) so a slow local model never floods. Admins/managers can force a tick
 with `POST /api/ai/pipeline` (useful right after seeding or for demos). Watch
 it in the logs: `docker logs tre-nextjs | grep 'ai pipeline'`.
 

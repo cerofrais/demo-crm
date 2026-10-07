@@ -10,7 +10,7 @@ import {
   Trash2,
   Loader2,
 } from "lucide-react";
-import { Button, Select, Badge, Dialog } from "@/components/ui";
+import { Button, Select, Badge, Dialog, Input } from "@/components/ui";
 import { api } from "@/lib/client";
 import { cn, formatIST } from "@/lib/utils";
 
@@ -34,6 +34,7 @@ const CATEGORY_LABEL: Record<string, string> = {
   consent: "Consent",
   operational: "Operational",
   marketing: "Marketing",
+  private: "Private",
 };
 
 function humanSize(bytes: number): string {
@@ -58,6 +59,8 @@ export function DocumentManager({
   const [uploadCategory, setUploadCategory] = useState("");
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
+  // A file of this name is already here — ask before overwriting it.
+  const [clash, setClash] = useState<{ file: File; existing: DocDTO; rename: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<DocDTO | null>(null);
   const [deletingBusy, setDeletingBusy] = useState(false);
@@ -96,46 +99,133 @@ export function DocumentManager({
     load();
   }, [load]);
 
+  /** The scope every request in this component is filed under. */
+  const scopeFields =
+    scope.kind === "guest"
+      ? { guestId: scope.guestId }
+      : scope.kind === "enquiry"
+        ? { enquiryId: scope.enquiryId }
+        : {};
+
+  /** Is a file of this name already filed here? Asked BEFORE uploading, so a
+   *  staff member decides what happens without waiting for the bytes to go up
+   *  first. The server enforces the same rule again on confirm — this is the
+   *  prompt, not the guarantee. */
+  async function findByName(name: string): Promise<DocDTO | null> {
+    const params = new URLSearchParams({ filename: name });
+    if (scope.kind === "general") params.set("scope", "general");
+    if (scope.kind === "guest") params.set("guestId", scope.guestId);
+    if (scope.kind === "enquiry") params.set("enquiryId", scope.enquiryId);
+    const hits = await api.get<DocDTO[]>(`/api/files?${params}`).catch(() => [] as DocDTO[]);
+    return hits.find((d) => d.filename === name) ?? null;
+  }
+
+  /** "Report.pdf" already taken -> "Report (2).pdf", skipping any name that
+   *  is also taken, so the suggested rename is one the staff member can
+   *  accept without hitting the same dialog again. */
+  async function suggestName(name: string): Promise<string> {
+    const dot = name.lastIndexOf(".");
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : "";
+    for (let n = 2; n < 100; n++) {
+      const candidate = `${stem} (${n})${ext}`;
+      if (!(await findByName(candidate))) return candidate;
+    }
+    return name;
+  }
+
+  /** Upload the bytes and file them. `replaceDocumentId` overwrites the file
+   *  already under this name instead of adding a second one. */
+  async function upload(file: File, filename: string, replaceDocumentId?: string) {
+    const mimeType = file.type || "application/octet-stream";
+    const { url, storageKey } = await api.post<{ url: string; storageKey: string }>(
+      "/api/files/upload-url",
+      {
+        filename,
+        mimeType,
+        category: uploadCategory,
+        sizeBytes: file.size, // F39: bind the upload size into the presigned PUT
+        ...scopeFields,
+      },
+    );
+
+    // Direct browser PUT to MinIO/S3.
+    const put = await fetch(url, {
+      method: "PUT",
+      body: file,
+      headers: { "Content-Type": mimeType },
+    });
+    if (!put.ok) throw new Error(`Upload failed (${put.status})`);
+
+    await api.post("/api/files/confirm", {
+      storageKey,
+      filename,
+      mimeType,
+      category: uploadCategory,
+      sizeBytes: file.size,
+      ...scopeFields,
+      ...(replaceDocumentId ? { replaceDocumentId } : {}),
+    });
+    await load();
+  }
+
   async function onFile(file: File) {
     if (!uploadCategory) return;
     setUploading(true);
     setError(null);
     try {
-      const { url, storageKey } = await api.post<{ url: string; storageKey: string }>(
-        "/api/files/upload-url",
-        {
-          filename: file.name,
-          mimeType: file.type || "application/octet-stream",
-          category: uploadCategory,
-          sizeBytes: file.size, // F39: bind the upload size into the presigned PUT
-          ...(scope.kind === "guest" ? { guestId: scope.guestId } : {}),
-          ...(scope.kind === "enquiry" ? { enquiryId: scope.enquiryId } : {}),
-        },
-      );
-
-      // Direct browser PUT to MinIO/S3.
-      const put = await fetch(url, {
-        method: "PUT",
-        body: file,
-        headers: { "Content-Type": file.type || "application/octet-stream" },
-      });
-      if (!put.ok) throw new Error(`Upload failed (${put.status})`);
-
-      await api.post("/api/files/confirm", {
-        storageKey,
-        filename: file.name,
-        mimeType: file.type || "application/octet-stream",
-        category: uploadCategory,
-        sizeBytes: file.size,
-        ...(scope.kind === "guest" ? { guestId: scope.guestId } : {}),
-        ...(scope.kind === "enquiry" ? { enquiryId: scope.enquiryId } : {}),
-      });
-      await load();
+      const existing = await findByName(file.name);
+      if (existing) {
+        // Hand the decision to the staff member rather than guessing. Nothing
+        // has been uploaded yet, so cancelling costs nothing.
+        setClash({ file, existing, rename: await suggestName(file.name) });
+        return;
+      }
+      await upload(file, file.name);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Upload failed");
     } finally {
       setUploading(false);
       if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  /** "Replace" — overwrite the existing file, keeping its place in the
+   *  library so anything already pointing at it now serves the new version. */
+  async function resolveClashByReplacing() {
+    if (!clash) return;
+    const { file, existing } = clash;
+    setClash(null);
+    setUploading(true);
+    setError(null);
+    try {
+      await upload(file, existing.filename, existing.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Upload failed");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  /** "Save as" — keep both, under a name that isn't taken. */
+  async function resolveClashByRenaming() {
+    if (!clash) return;
+    const { file, rename } = clash;
+    const name = rename.trim();
+    if (!name) return;
+    setUploading(true);
+    setError(null);
+    try {
+      if (await findByName(name)) {
+        setError(`"${name}" is taken too. Pick another name.`);
+        return;
+      }
+      setClash(null);
+      await upload(file, name);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Upload failed");
+    } finally {
+      setUploading(false);
     }
   }
 
@@ -155,30 +245,47 @@ export function DocumentManager({
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2">
+        {/* Two category pickers sit on this bar and used to look identical:
+            this one FILTERS the list, the one by the Upload button sets the
+            category the next upload is filed under. Labelling them is the
+            whole fix — an unlabelled pair reads as a duplicate, and picking
+            the wrong one silently files a document in the wrong place. */}
         {readable.length > 1 && (
-          <Select value={filter} onChange={(e) => setFilter(e.target.value)} className="w-40">
-            <option value="">All categories</option>
-            {readable.map((c) => (
-              <option key={c} value={c}>
-                {CATEGORY_LABEL[c] ?? c}
-              </option>
-            ))}
-          </Select>
+          <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            Show
+            <Select
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              className="w-40"
+              aria-label="Filter documents by category"
+            >
+              <option value="">All categories</option>
+              {readable.map((c) => (
+                <option key={c} value={c}>
+                  {CATEGORY_LABEL[c] ?? c}
+                </option>
+              ))}
+            </Select>
+          </label>
         )}
         <div className="ml-auto flex items-center gap-2">
           {uploadable.length > 0 && (
             <>
-              <Select
-                value={uploadCategory}
-                onChange={(e) => setUploadCategory(e.target.value)}
-                className="w-36"
-              >
-                {uploadable.map((c) => (
-                  <option key={c} value={c}>
-                    {CATEGORY_LABEL[c] ?? c}
-                  </option>
-                ))}
-              </Select>
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                Upload as
+                <Select
+                  value={uploadCategory}
+                  onChange={(e) => setUploadCategory(e.target.value)}
+                  className="w-36"
+                  aria-label="Category for the next upload"
+                >
+                  {uploadable.map((c) => (
+                    <option key={c} value={c}>
+                      {CATEGORY_LABEL[c] ?? c}
+                    </option>
+                  ))}
+                </Select>
+              </label>
               <input
                 ref={fileRef}
                 type="file"
@@ -290,6 +397,71 @@ export function DocumentManager({
           </div>
         )}
       </div>
+
+      <Dialog
+        open={!!clash}
+        onClose={() => setClash(null)}
+        title="That name is already taken"
+        className="md:max-w-md"
+      >
+        <div className="p-4 md:p-5">
+          <p className="text-sm text-muted-foreground">
+            <span className="font-medium text-foreground">{clash?.existing.filename}</span> is
+            already here, uploaded {clash ? formatIST(clash.existing.createdAt) : ""}.
+          </p>
+
+          <div className="mt-4 space-y-3">
+            <div className="rounded-md border border-border p-3">
+              <p className="text-sm font-medium">Replace it</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                The new file takes its place. Anything already using this file — auto-replies,
+                broadcasts, sent messages — serves the new version from now on.
+              </p>
+              <Button
+                className="mt-2"
+                onClick={resolveClashByReplacing}
+                disabled={uploading}
+              >
+                Replace
+              </Button>
+            </div>
+
+            <div className="rounded-md border border-border p-3">
+              <p className="text-sm font-medium">Keep both</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Save this upload under a different name.
+              </p>
+              <div className="mt-2 flex gap-2">
+                <Input
+                  value={clash?.rename ?? ""}
+                  onChange={(e) =>
+                    setClash((c) => (c ? { ...c, rename: e.target.value } : c))
+                  }
+                  aria-label="New file name"
+                  className="flex-1"
+                />
+                <Button
+                  variant="outline"
+                  onClick={resolveClashByRenaming}
+                  disabled={uploading || !clash?.rename.trim()}
+                >
+                  Save as
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          {error && (
+            <p className="mt-3 text-sm text-destructive">{error}</p>
+          )}
+
+          <div className="mt-4 flex justify-end">
+            <Button variant="outline" onClick={() => setClash(null)} disabled={uploading}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      </Dialog>
 
       <Dialog
         open={!!deleting}

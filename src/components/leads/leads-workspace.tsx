@@ -24,6 +24,7 @@ import { api } from "@/lib/client";
 import { cn } from "@/lib/utils";
 import { sortTags } from "@/lib/lead-tags";
 import { TagFilterBar } from "./tag-filter-bar";
+import { matchesTags, type TagMatch } from "@/lib/tag-match";
 import type { EnquiryDTO } from "@/lib/types";
 import type { EnquiryStage } from "@prisma/client";
 import type { StageDef } from "@/lib/kanban";
@@ -54,6 +55,7 @@ export function LeadsWorkspace({
   canCreate = true,
   canDoctorDecide = false,
   isAdmin = false,
+  canFilterByPerson = canManage,
   visibleStages,
   currentSub,
 }: {
@@ -72,6 +74,9 @@ export function LeadsWorkspace({
   /** The Staff column/stage is Admin-only, including for Manager — gates the
    *  drawer's Stage dropdown from offering it as a target. */
   isAdmin?: boolean;
+  /** Offers each staff member in the owner filter. Wider than canManage: the
+   *  read-only Viewer can filter by person without being able to reassign. */
+  canFilterByPerson?: boolean;
   /** Kanban columns to render — full pipeline by default, or a role-scoped
    *  subset (e.g. Doctor sees only Doctor Consultation). */
   visibleStages?: StageDef[];
@@ -102,6 +107,8 @@ export function LeadsWorkspace({
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [activeTags, setActiveTags] = useState<string[]>([]);
+  // Any (the board's long-standing default) or All — see lib/tag-match.ts.
+  const [tagMatch, setTagMatch] = useState<TagMatch>("any");
   const [allTags, setAllTags] = useState<string[]>([]);
   const [autoRefresh, setAutoRefresh] = useState(AUTOREFRESH_INTERVAL_SEC > 0);
   const debounce = useRef<ReturnType<typeof setTimeout>>();
@@ -115,14 +122,14 @@ export function LeadsWorkspace({
     );
   }, []);
 
-  // Per-person filter options for Admin/Manager — same audience as leads.manage.
+  // Per-person filter options — Admin/Manager, and the read-only Viewer.
   useEffect(() => {
-    if (!canManage) return;
+    if (!canFilterByPerson) return;
     api
       .get<{ id: string; name: string; role: string | null }[]>("/api/enquiries/assignable-users")
       .then((users) => setAssignableUsers(users.filter((u) => u.id !== currentSub)))
       .catch(() => {});
-  }, [canManage, currentSub]);
+  }, [canFilterByPerson, currentSub]);
 
   // Every tag across ALL active leads, not just whatever's currently loaded
   // on the board — otherwise a real tag (e.g. "revisit") with no carrier in
@@ -259,13 +266,15 @@ export function LeadsWorkspace({
     [allTags, enquiries],
   );
 
-  // Client-side tag filter (AND): a lead must carry every active tag.
+  // Client-side tag filter. "Any" (the default) shows a lead carrying ANY
+  // active tag — "foreign" and "sample-itinerary-ep" means both groups. "All"
+  // narrows to the leads that carry every one of them.
   const visible = useMemo(
     () =>
       activeTags.length
-        ? enquiries.filter((e) => activeTags.every((t) => e.tags.includes(t)))
+        ? enquiries.filter((e) => matchesTags(e.tags, activeTags, tagMatch))
         : enquiries,
-    [enquiries, activeTags],
+    [enquiries, activeTags, tagMatch],
   );
 
   const counts = useMemo(
@@ -597,6 +606,8 @@ export function LeadsWorkspace({
         activeTags={activeTags}
         onToggle={toggleTag}
         onClear={() => setActiveTags([])}
+        match={tagMatch}
+        onMatchChange={setTagMatch}
       />
 
       {/* Board / table */}

@@ -7,7 +7,7 @@ import type { Prisma } from "@prisma/client";
 
 export const dynamic = "force-dynamic";
 
-const TERMINAL_STAGES = new Set(["converted", "lost"]);
+const TERMINAL_STAGES = new Set(["converted", "lost", "non_leads"]);
 
 /**
  * GET /api/enquiries/check-existing?phone=...&email=...

@@ -5,7 +5,7 @@ import { can, type AppRole } from "./rbac";
  *
  * Trē uses a small set of shared mailboxes, not one per user:
  *   • "sales"  — all sales roles (Admin/Manager/Reception/Staff) send & receive here
- *                (dev: harsha@ascent-i-tech.in; prod: hello@trewellness.in)
+ *                (hello@trewellness.in — one Google account, send and receive)
  *   • "doctor" — the doctor's own mailbox; separate conversations
  *
  * Each mailbox is configured via env with a PREFIX (SALES_ / DOCTOR_). A mailbox
@@ -18,7 +18,7 @@ export type MailboxId = "sales" | "doctor";
 export interface MailboxConfig {
   id: MailboxId;
   label: string;
-  /** From/Reply-To header, e.g. "Trē Wellness <harsha@ascent-i-tech.in>" */
+  /** From/Reply-To header, e.g. "Trē Wellness <hello@trewellness.in>" */
   from: string;
   /** bare address parsed from `from` */
   address: string;

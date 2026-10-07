@@ -28,25 +28,10 @@ import { logger } from "./logger";
 import { getObjectBuffer, putObjectBuffer } from "./storage";
 import { sendEmail } from "./mailer";
 import { getMailbox } from "./mailboxes";
-
-// ---------------------------------------------------------------------------
-// CSV serialisation
-// ---------------------------------------------------------------------------
-
-/** RFC-4180 cell: always quoted, embedded quotes doubled. Newlines inside a
- *  cell are legal and preserved — remarks routinely contain them. */
-function csvCell(value: string | number | null | undefined): string {
-  const s = value == null ? "" : String(value);
-  return `"${s.replace(/"/g, '""')}"`;
-}
-
-export function toCsv(headers: string[], rows: (string | number | null)[][]): string {
-  const lines = [headers.map(csvCell).join(",")];
-  for (const row of rows) lines.push(row.map(csvCell).join(","));
-  // CRLF + a UTF-8 BOM: Excel on Windows otherwise mangles the ₹ sign and any
-  // non-ASCII guest name, which is most of them here.
-  return "﻿" + lines.join("\r\n");
-}
+// Lives in lib/csv.ts beside the parser; re-exported because the report
+// modules and their tests have always imported it from here.
+import { toCsv } from "./csv";
+export { toCsv };
 
 // ---------------------------------------------------------------------------
 // intakeNotes parsing
@@ -207,7 +192,11 @@ export function classifyTemperature(input: TemperatureInput): LeadTemperature {
 
   // Explicitly closed out — either lost, or already won. Both are terminal for
   // the marketing funnel and shouldn't sit in the live Hot/Warm/Cold buckets.
-  if (stage === "lost") return "Dead";
+  // Non-leads are classified Dead alongside lost. They are not the same
+  // thing — one never was a lead, the other was and did not convert — but
+  // the marketing funnel has no bucket for "was never in the funnel", and
+  // leaving them in Hot/Warm/Cold would inflate every live count with spam.
+  if (stage === "lost" || stage === "non_leads") return "Dead";
   if (stage === "converted" || stage === "booking_confirmed" || stage === "payment_received") {
     return "Hot";
   }
@@ -339,9 +328,39 @@ function istDate(d: Date | null | undefined): string {
  * by activity, so a day's report is stable: re-running it next week returns
  * the same rows with their follow-up history brought up to date.
  */
-export async function buildReportRows(from: Date, to: Date): Promise<(string | number | null)[][]> {
+/**
+ * Tags, folded into the report's filename so a stack of downloads in
+ * someone's Downloads folder stays tellable apart. Capped at three: the tag
+ * vocabulary includes campaign slugs, and a six-tag filter would otherwise
+ * produce a filename no mail client will show in full.
+ */
+export function tagFilenameSuffix(tags: string[]): string {
+  if (!tags.length) return "";
+  // System tags are namespaced with a colon ("source:instagram"), which
+  // Windows forbids outright in a filename and macOS historically read as a
+  // path separator — these get emailed to the CEO as attachments, so the
+  // colon has to go rather than break the save. Anything else outside
+  // [a-z0-9-] is flattened for the same reason.
+  const safe = (t: string) => t.replace(/[^a-zA-Z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  const shown = tags.slice(0, 3).map(safe).filter(Boolean).join("_");
+  if (!shown) return "";
+  const rest = tags.length - 3;
+  return `-${shown}${rest > 0 ? `_plus${rest}` : ""}`;
+}
+
+export async function buildReportRows(
+  from: Date,
+  to: Date,
+  tags: string[] = [],
+): Promise<(string | number | null)[][]> {
   const leads = await prisma.enquiry.findMany({
-    where: { createdAt: { gte: from, lt: to }, deletedAt: null },
+    where: {
+      createdAt: { gte: from, lt: to },
+      deletedAt: null,
+      // OR, matching the tag filters everywhere else in the app: a lead
+      // carrying any one of the selected tags is included.
+      ...(tags.length ? { tags: { hasSome: tags } } : {}),
+    },
     orderBy: { createdAt: "asc" },
     include: {
       guest: { select: { fullName: true, phone: true, email: true, city: true } },
@@ -447,17 +466,30 @@ export function ceoEmail(): string {
  * after the scheduled run refreshes the numbers rather than creating a second
  * report for the same date.
  */
-export async function generateMarketingReport(day: Date): Promise<{ id: string; rowCount: number }> {
+export async function generateMarketingReport(
+  day: Date,
+  tags: string[] = [],
+): Promise<{ id: string; rowCount: number }> {
   const { from, to } = istDayBounds(day);
   const dateLabel = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(from);
+  const suffix = tagFilenameSuffix(tags);
   return storeReport({
     from,
     to,
-    filename: `marketing-leads-${dateLabel}.csv`,
+    tags,
+    filename: `marketing-leads-${dateLabel}${suffix}.csv`,
     // The DAY the report covers — its unique key, so a re-run replaces the
     // file rather than adding a second report for the same date.
-    reportDate: new Date(`${dateLabel}T00:00:00.000Z`),
+    //
+    // A TAGGED report is a filtered subset, not "the report for that day", so
+    // it must never claim that slot: doing so would overwrite the full
+    // report the scheduled run produces and emails to the CEO, replacing it
+    // with whatever narrow slice someone happened to pull. Tagged runs are
+    // therefore stored as custom reports, keyed on the generation instant.
+    reportDate: tags.length ? null : new Date(`${dateLabel}T00:00:00.000Z`),
     keyPrefix: dateLabel,
+    rangeStart: from,
+    rangeEnd: new Date(to.getTime() - 1),
   });
 }
 
@@ -473,6 +505,7 @@ export async function generateMarketingReport(day: Date): Promise<{ id: string; 
 export async function generateRangeReport(
   fromDay: Date,
   toDay: Date,
+  tags: string[] = [],
 ): Promise<{ id: string; rowCount: number }> {
   const { from } = istDayBounds(fromDay);
   const { to } = istDayBounds(toDay);
@@ -485,12 +518,14 @@ export async function generateRangeReport(
   const endLabel = fmt(new Date(to.getTime() - 1));
   const single = startLabel === endLabel;
 
+  const suffix = tagFilenameSuffix(tags);
   return storeReport({
     from,
     to,
+    tags,
     filename: single
-      ? `marketing-leads-${startLabel}.csv`
-      : `marketing-leads-${startLabel}_to_${endLabel}.csv`,
+      ? `marketing-leads-${startLabel}${suffix}.csv`
+      : `marketing-leads-${startLabel}_to_${endLabel}${suffix}.csv`,
     // A custom range is not "the report for a calendar day", so it must not
     // take that day's unique slot. Null reportDate would need a nullable
     // unique; instead the range gets its own row keyed on the generation
@@ -510,8 +545,9 @@ async function storeReport(opts: {
   keyPrefix: string;
   rangeStart?: Date;
   rangeEnd?: Date;
+  tags?: string[];
 }): Promise<{ id: string; rowCount: number }> {
-  const rows = await buildReportRows(opts.from, opts.to);
+  const rows = await buildReportRows(opts.from, opts.to, opts.tags ?? []);
   const buffer = Buffer.from(toCsv(REPORT_HEADERS, rows), "utf8");
 
   // Generation instant in the key so a regenerated custom range never
@@ -538,7 +574,7 @@ async function storeReport(opts: {
     : await prisma.marketingReport.create({ data });
 
   logger.info(
-    { filename: opts.filename, rowCount: rows.length, custom: !opts.reportDate },
+    { filename: opts.filename, rowCount: rows.length, custom: !opts.reportDate, tags: opts.tags ?? [] },
     "marketing report generated",
   );
   return { id: saved.id, rowCount: rows.length };
@@ -571,6 +607,9 @@ export async function emailMarketingReport(
 
   try {
     await sendEmail(mailbox, {
+      // Internal artefact for the CEO, not correspondence with a guest — a
+      // marketing signature on a CSV of leads would just be noise.
+      skipFooter: true,
       to,
       subject: `Trē Wellness — daily marketing lead report, ${dateLabel}`,
       text: [

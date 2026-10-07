@@ -13,7 +13,7 @@ export async function POST(
 ) {
   return handle(async () => {
     const ctx = await requireSession();
-    const { body, attachmentDocumentId } = addNoteSchema.parse(await req.json());
+    const { body, attachmentDocumentId, kind } = addNoteSchema.parse(await req.json());
 
     const enquiry = await prisma.enquiry.findUnique({ where: { id: params.id } });
     if (!enquiry) throw new ApiError("NOT_FOUND", "Enquiry not found", 404);
@@ -45,6 +45,7 @@ export async function POST(
         authorName: ctx.name,
         authorRole: ctx.roles[0] ?? "STAFF",
         body,
+        kind,
         attachmentDocumentId,
       },
       include: { attachmentDocument: { select: { id: true, filename: true, mimeType: true, sizeBytes: true } } },
@@ -58,7 +59,7 @@ export async function POST(
           actorRole: ctx.roles[0] ?? "STAFF",
           actorName: ctx.name,
           actionType: "note",
-          metadata: { noteId: note.id },
+          metadata: { noteId: note.id, kind },
         },
       }),
       prisma.enquiry.update({
@@ -72,6 +73,7 @@ export async function POST(
         id: note.id,
         authorName: note.authorName,
         body: note.body,
+        kind: note.kind,
         attachment: note.attachmentDocument,
         createdAt: note.createdAt.toISOString(),
       },

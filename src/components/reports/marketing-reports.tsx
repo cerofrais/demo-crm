@@ -4,8 +4,10 @@ import { useCallback, useEffect, useState } from "react";
 import {
   Download, Mail, Loader2, RefreshCw, FileSpreadsheet, Check, AlertTriangle, Info, CalendarRange,
 } from "lucide-react";
-import Link from "next/link";
+import { ReportsTabs } from "./reports-tabs";
 import { Card, Button, Badge, Input } from "@/components/ui";
+import { TagFilterBar } from "@/components/leads/tag-filter-bar";
+import { formatTag, sortTags } from "@/lib/lead-tags";
 import { api } from "@/lib/client";
 import { cn, formatIST } from "@/lib/utils";
 
@@ -101,6 +103,10 @@ export function MarketingReports({ canSend }: { canSend: boolean }) {
   const [showDefs, setShowDefs] = useState(false);
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
+  // Tags a generated report is narrowed to. OR semantics, same as the
+  // leads board — a lead carrying any selected tag appears.
+  const [tags, setTags] = useState<string[]>([]);
+  const [availableTags, setAvailableTags] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -122,8 +128,9 @@ export function MarketingReports({ canSend }: { canSend: boolean }) {
     setBusy("generate");
     setError(null);
     try {
-      const res = await api.post<{ rowCount: number }>("/api/reports/marketing", {});
-      setToast(`Generated yesterday's report — ${res.rowCount} lead${res.rowCount === 1 ? "" : "s"}.`);
+      const res = await api.post<{ rowCount: number }>("/api/reports/marketing", { tags });
+      const scope = tags.length ? ` (${tags.map((t) => formatTag(t).label).join(" or ")})` : "";
+      setToast(`Generated yesterday's report${scope} — ${res.rowCount} lead${res.rowCount === 1 ? "" : "s"}.`);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't generate the report");
@@ -132,13 +139,21 @@ export function MarketingReports({ canSend }: { canSend: boolean }) {
     }
   }
 
+  useEffect(() => {
+    api
+      .get<string[]>("/api/enquiries/tags")
+      .then((t) => setAvailableTags(sortTags(t)))
+      .catch(() => {});
+  }, []);
+
   async function generateRange() {
     if (!from || !to) return;
     setBusy("range");
     setError(null);
     try {
-      const res = await api.post<{ rowCount: number }>("/api/reports/marketing", { from, to });
-      setToast(`Generated ${from} → ${to} — ${res.rowCount} lead${res.rowCount === 1 ? "" : "s"}.`);
+      const res = await api.post<{ rowCount: number }>("/api/reports/marketing", { from, to, tags });
+      const scope = tags.length ? ` (${tags.map((t) => formatTag(t).label).join(" or ")})` : "";
+      setToast(`Generated ${from} → ${to}${scope} — ${res.rowCount} lead${res.rowCount === 1 ? "" : "s"}.`);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't generate that range");
@@ -163,18 +178,7 @@ export function MarketingReports({ canSend }: { canSend: boolean }) {
 
   return (
     <div className="space-y-4 p-4 md:p-6">
-      {/* Sub-navigation between the two report views. */}
-      <div className="flex gap-1 border-b border-border">
-        <Link
-          href="/reports"
-          className="border-b-2 border-transparent px-3 py-2 text-sm text-muted-foreground hover:text-foreground"
-        >
-          Overview
-        </Link>
-        <span className="border-b-2 border-brand-600 px-3 py-2 text-sm font-medium text-foreground">
-          Marketing
-        </span>
-      </div>
+      <ReportsTabs active="marketing" />
 
       {error && <Card className="border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">{error}</Card>}
 
@@ -197,7 +201,30 @@ export function MarketingReports({ canSend }: { canSend: boolean }) {
       </div>
 
       {canSend && (
-        <Card className="flex flex-wrap items-end gap-3 p-3">
+        <Card className="space-y-2 p-3">
+          {availableTags.length > 0 && (
+            <div className="-mx-3 -mt-3">
+              <TagFilterBar
+                availableTags={availableTags}
+                activeTags={tags}
+                onToggle={(t) =>
+                  setTags((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]))
+                }
+                onClear={() => setTags([])}
+              />
+            </div>
+          )}
+          {tags.length > 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              Both buttons below will produce a report of leads carrying{" "}
+              <span className="font-medium text-foreground">
+                {tags.map((t) => formatTag(t).label).join(" or ")}
+              </span>
+              . The tags are written into the filename, and a filtered report is always saved
+              as its own file — it never replaces the full daily report emailed to the CEO.
+            </p>
+          )}
+          <div className="flex flex-wrap items-end gap-3">
           <div>
             <label className="mb-1 block text-[11px] font-medium text-muted-foreground">From</label>
             <Input
@@ -231,6 +258,7 @@ export function MarketingReports({ canSend }: { canSend: boolean }) {
           <p className="text-[11px] text-muted-foreground">
             Both dates included. Pick the same day twice for a single day.
           </p>
+          </div>
         </Card>
       )}
 

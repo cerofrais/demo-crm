@@ -7,6 +7,7 @@ import {
   parseCampaignParts,
   parseIntake,
   toCsv,
+  tagFilenameSuffix,
 } from "./marketing-report";
 
 const DAY = 86_400_000;
@@ -257,5 +258,30 @@ describe("REPORT_HEADERS", () => {
 
   it("has no duplicate column names", () => {
     expect(REPORT_HEADERS.length).toBe(new Set(REPORT_HEADERS).size);
+  });
+});
+
+describe("tagFilenameSuffix", () => {
+  it("adds nothing when the report isn't filtered", () => {
+    expect(tagFilenameSuffix([])).toBe("");
+  });
+
+  it("names the tags so downloads stay tellable apart", () => {
+    expect(tagFilenameSuffix(["mini-detox"])).toBe("-mini-detox");
+    expect(tagFilenameSuffix(["mini-detox", "revisit"])).toBe("-mini-detox_revisit");
+  });
+
+  it("strips the colon from namespaced system tags", () => {
+    // Windows refuses a filename containing ":" and these are emailed as
+    // attachments, so "source:instagram" must not reach the filename intact.
+    expect(tagFilenameSuffix(["source:instagram"])).toBe("-source-instagram");
+    expect(tagFilenameSuffix(["age:25-40", "revisit"])).toBe("-age-25-40_revisit");
+    expect(tagFilenameSuffix(["source:instagram"])).not.toContain(":");
+  });
+
+  it("caps at three and counts the rest", () => {
+    // Campaign slugs are long; six of them would produce a filename no mail
+    // client shows in full.
+    expect(tagFilenameSuffix(["a", "b", "c", "d", "e"])).toBe("-a_b_c_plus2");
   });
 });

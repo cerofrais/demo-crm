@@ -10,7 +10,9 @@
  */
 import { handle, ok, requireAllPermissions } from "@/lib/api";
 import { prisma } from "@/lib/prisma";
+import { canUseWhatsAppIntegration } from "@/lib/rbac";
 import { resolveMyWhatsAppNumberId } from "@/lib/whatsapp";
+import { allowedWhatsAppNumbersFor, isNumberAllowed } from "@/lib/whatsapp-number-access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,14 +20,23 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   return handle(async () => {
     const ctx = await requireAllPermissions(["messaging.send", "guests.view"]);
-    const [numbers, myNumberId] = await Promise.all([
+    const [all, myNumberId, allowed] = await Promise.all([
       prisma.whatsAppNumber.findMany({
         where: { status: "connected", shared: true },
         orderBy: [{ isDefault: "desc" }, { label: "asc" }],
         select: { id: true, label: true, phoneNumber: true, isDefault: true, integration: true },
       }),
       resolveMyWhatsAppNumberId(ctx.sub),
+      allowedWhatsAppNumbersFor(ctx.sub),
     ]);
+    // The official Cloud API number is senior-staff only — see
+    // canUseWhatsAppIntegration. Filtered out for everyone else so it is
+    // neither offered nor discoverable, which is also what the guests.view
+    // gate above was reaching for less precisely.
+    const numbers = all
+      .filter((n) => canUseWhatsAppIntegration(ctx.roles, n.integration))
+      // And only the lines an admin has pinned this person to, if any.
+      .filter((n) => isNumberAllowed(allowed, n.phoneNumber));
     // A rep whose own phone is one of the connected numbers gets it flagged
     // — the picker defaults to it instead of some other line, so they don't
     // send from a number that isn't theirs without noticing.

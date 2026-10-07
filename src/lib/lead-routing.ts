@@ -1,4 +1,5 @@
 import { prisma } from "./prisma";
+import { availableSubsToday } from "./staff-availability";
 
 /**
  * Round-robin cursor over active Sales + Reception staff for automatic
@@ -10,11 +11,15 @@ import { prisma } from "./prisma";
  * no staff exist in either role.
  */
 export async function assignNextRep(): Promise<{ sub: string; name: string } | null> {
-  const reps = await prisma.staffProfile.findMany({
+  const all = await prisma.staffProfile.findMany({
     where: { role: { in: ["SALES", "RECEPTION"] } },
     orderBy: { keycloakId: "asc" },
     select: { keycloakId: true, displayName: true },
   });
+  // Same rule as every other assignment path — see lib/staff-availability.ts.
+  // Null when the whole pool is off today, which leaves the lead unassigned.
+  const availableSubs = new Set(await availableSubsToday(all.map((r) => r.keycloakId)));
+  const reps = all.filter((r) => availableSubs.has(r.keycloakId));
   if (!reps.length) return null;
 
   const state = await prisma.leadRoutingState.upsert({

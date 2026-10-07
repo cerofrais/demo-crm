@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { handle, ok, requireSession, ApiError } from "@/lib/api";
 import { canMutateLeads, canWorkLeadStage } from "@/lib/rbac";
 import { prisma } from "@/lib/prisma";
-import { createDeletionApprovalTask, withRnrProgress, withLostRequestPending } from "@/lib/tasks";
+import { createDeletionApprovalTask, withRnrProgress, withLostRequestPending, withOpenTasks } from "@/lib/tasks";
 import { toEnquiryDTO, withCurrentAssigneeName } from "@/lib/enquiries";
 
 export const dynamic = "force-dynamic";
@@ -46,6 +46,6 @@ export async function POST(
       },
     });
 
-    return ok(await withLostRequestPending(await withRnrProgress(await withCurrentAssigneeName(toEnquiryDTO(current)))));
+    return ok(await withOpenTasks(await withLostRequestPending(await withRnrProgress(await withCurrentAssigneeName(toEnquiryDTO(current))))));
   });
 }

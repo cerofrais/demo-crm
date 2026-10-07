@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { handle, ok, requireSession, ApiError } from "@/lib/api";
-import { can, canWorkLeadStage } from "@/lib/rbac";
+import { can, canViewLeadStage } from "@/lib/rbac";
 import { listEnquiries, type EnquiryFilters } from "@/lib/enquiries";
 import { createEnquiry } from "@/lib/enquiry-service";
 import { createEnquirySchema } from "@/lib/validation";
@@ -41,7 +41,7 @@ export async function GET(req: NextRequest) {
     // Sales additionally loses visibility once a lead reaches Booking
     // Confirmed — it's handed off to Reception at that point (see the
     // auto-unassign in the stage-transition routes).
-    data = data.filter((e) => canWorkLeadStage(ctx.roles, e.stage));
+    data = data.filter((e) => canViewLeadStage(ctx.roles, e.stage));
     return ok(data, { total: data.length });
   });
 }

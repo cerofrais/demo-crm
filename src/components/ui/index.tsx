@@ -145,12 +145,36 @@ export function ScoreBadge({
 }
 
 // ---- Input ----
+/**
+ * Input types whose value is picked, not typed.
+ *
+ * Chrome only opens the picker from the small calendar glyph at the right
+ * edge — clicking the field itself does nothing. In a date field narrow
+ * enough to sit in a toolbar that glyph is a few pixels wide, so the control
+ * reads as broken: people click it, nothing happens, and they assume there is
+ * no picker. Clicking anywhere in the field opens it instead.
+ */
+const PICKER_INPUT_TYPES = new Set(["date", "datetime-local", "time", "month", "week"]);
+
 export const Input = React.forwardRef<
   HTMLInputElement,
   React.InputHTMLAttributes<HTMLInputElement>
->(({ className, ...props }, ref) => (
+>(({ className, onClick, ...props }, ref) => (
   <input
     ref={ref}
+    onClick={(e) => {
+      if (props.type && PICKER_INPUT_TYPES.has(props.type)) {
+        // Not supported everywhere, and it throws when the browser decides
+        // the click was not a real user gesture. Either way the field still
+        // accepts typing, so a failure costs nothing.
+        try {
+          (e.currentTarget as HTMLInputElement & { showPicker?: () => void }).showPicker?.();
+        } catch {
+          /* typing still works */
+        }
+      }
+      onClick?.(e);
+    }}
     className={cn(
       // text-base on phones prevents iOS auto-zoom on focus; h-11 = 44px target.
       "flex h-11 w-full rounded-md border border-input bg-background px-3 py-1 text-base shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 lg:h-9 lg:text-sm",

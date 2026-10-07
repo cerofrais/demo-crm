@@ -248,11 +248,17 @@ async function main() {
 
     const hd = healthData[s.fullName];
     if (hd) {
-      await prisma.healthProfile.upsert({
+      // A guest can hold several records now (one per screening form), so
+      // there is no unique key to upsert on — seed one only if they have none.
+      const seeded = await prisma.healthProfile.findFirst({
         where: { guestId: guest.id },
-        update: {},
-        create: { guestId: guest.id, encryptedData: hd.ciphertext, iv: hd.iv, authTag: hd.authTag },
+        select: { id: true },
       });
+      if (!seeded) {
+        await prisma.healthProfile.create({
+          data: { guestId: guest.id, encryptedData: hd.ciphertext, iv: hd.iv, authTag: hd.authTag },
+        });
+      }
     }
 
     // Memberships for returning guests
@@ -304,7 +310,7 @@ async function main() {
         needsAttention: s.needsAttention ?? false,
         tags: mergeLeadTags(
           s.tags,
-          { dateOfBirth: dob, isReturning: s.isReturning ?? false },
+          { dateOfBirth: dob },
           { source: s.source, isReturningFlag: s.isReturning ?? false },
         ),
         lastActivityAt: new Date(),

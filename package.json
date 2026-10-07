@@ -28,6 +28,7 @@
     "@dnd-kit/sortable": "^8.0.0",
     "@dnd-kit/utilities": "^3.2.2",
     "@prisma/client": "^5.22.0",
+    "archiver": "^7.0.1",
     "clsx": "^2.1.1",
     "date-fns": "^3.6.0",
     "imapflow": "^1.4.2",
@@ -46,6 +47,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/archiver": "^6.0.4",
     "@types/mailparser": "^3.4.6",
     "@types/node": "^22.9.0",
     "@types/nodemailer": "^8.0.1",
